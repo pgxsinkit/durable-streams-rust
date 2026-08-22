@@ -1,0 +1,90 @@
+# cargo build/test/clippy, then the Durable Streams protocol conformance suite
+# across the supported run configurations.
+#
+# Ported from electric-sql/electric's `server_rust_tests.yml`. Differences:
+#   - paths are repo-relative (this repo IS the package, not a monorepo member)
+#   - bun, not pnpm (pgxsinkit standard)
+#   - the toolchain comes from rust-toolchain.toml rather than floating `stable`
+#   - ubuntu-latest, not the blacksmith runners upstream used
+name: ci
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo:
+    name: cargo build + test + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Honours rust-toolchain.toml (pinned 1.96.0) — one source of truth for the
+      # version, shared with the Dockerfile and with electric-circuits.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Clippy
+        run: cargo clippy --release --locked -- -D warnings
+
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: durable-streams-server
+          path: target/release/durable-streams-server
+          retention-days: 1
+
+  conformance:
+    name: conformance (${{ matrix.config.name }})
+    needs: cargo
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with the run-configuration matrix in the README.
+        config:
+          - { name: wal-default, args: '' }
+          - { name: wal-resident-cache, args: '--tail-cache-bytes 65536' }
+          - { name: wal-read-offload-always, args: '--read-offload always' }
+          - { name: memory, args: '--durability memory' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: durable-streams-server
+          path: target/release
+
+      - name: Make binary executable
+        run: chmod +x target/release/durable-streams-server
+
+      - name: Run conformance (${{ matrix.config.name }})
+        env:
+          RUST_SERVER_ARGS: ${{ matrix.config.args }}
+        run: bun run test:conformance
