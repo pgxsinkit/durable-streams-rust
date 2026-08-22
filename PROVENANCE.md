@@ -48,6 +48,13 @@ Only provenance and packaging metadata:
   where the server does not exist.
 - `package.json`: `repository` retargeted from the monorepo + `directory` to this repo.
 - `README.md`: protocol-spec links were monorepo-relative (`../../PROTOCOL.md`); now absolute.
+- `Dockerfile`: `COPY` paths were monorepo-relative and the build context was the monorepo root;
+  both are now repo-relative. Base image pinned to `rust:1.96.0-bookworm` (was `rust:1-bookworm`).
+- Added `rust-toolchain.toml` pinning rustc 1.96.0, matching `pgxsinkit/electric-circuits` so both
+  Rust services build on one toolchain. Circuits pins that version because rustc >= 1.97.0 ICEs on
+  `dbsp`; this crate has no dbsp and a declared MSRV of 1.75, so it is held here only for parity.
+- Added `.github/workflows/ci.yml` and `docker.yml`, ported from the monorepo (see below).
+- `.gitignore` now covers `node_modules`, which the monorepo root used to.
 
 Deliberately **not** changed: crate name, npm package names, and the version. Publish identity is a
 decision, not a mechanical fix — see below.
@@ -55,15 +62,35 @@ decision, not a mechanical fix — see below.
 Known cosmetic breakage carried over: `bench-latency/latency-probe.mjs` imports the client through a
 sibling package's `node_modules`, which never resolved outside the monorepo.
 
+## Conformance status
+
+The protocol conformance suite is this fork's contract. Measured at the fork point (release build,
+rustc 1.96.0):
+
+| suite version | result |
+|---|---|
+| `0.3.5` — the last version upstream ever ran | **326 passed, 0 failed**, 6 skipped |
+| `0.3.6` — current | 329 passed, **3 failed**, 6 skipped |
+
+The extraction is therefore clean: no regressions. `0.3.6` was published 2026-07-16, two days after
+the last upstream commit to this server, and `package.json` carried a caret range, so upstream CI
+never ran the six tests it added. Three of them fail — inherited gaps upstream will not fix:
+
+- **#1** — a close-only `POST` does not slide the TTL window (two tests).
+- **#2** — `OPTIONS` preflight returns no CORS headers at all (one test).
+
+The dependency is now pinned to an exact version rather than a caret range, so moving the contract
+is a visible commit rather than an install-time surprise. **CI is red on conformance until #1 and #2
+are closed**; that is the accurate state, not a broken pipeline.
+
 ## Open decisions
 
 - **Publish identity.** The crate is `durable-streams` on crates.io and the npm packages are
   `@electric-ax/*`; both are upstream's. Publishing from here needs different names, or no registry
-  publishing at all.
-- **Image target.** The intent is `ghcr.io/pgxsinkit/durable-streams-rust`, matching
-  `ghcr.io/pgxsinkit/electric-circuits/engine`, rather than Docker Hub `electricax/*`. The upstream
-  CI workflows (`server_rust_tests.yml`, `server_rust_publish.yml`, `server_rust_dockerhub_image.yml`)
-  live at the monorepo root and were **not** part of the extraction; they need porting.
+  publishing at all. Upstream's publish workflow was deliberately **not** ported for this reason.
+- **Multi-arch images.** Upstream built `linux/amd64` + `linux/arm64` natively per arch. `docker.yml`
+  here builds amd64 only, matching `electric-circuits`. QEMU-emulated arm64 Rust builds are slow
+  enough that upstream avoided them, so adding arm64 wants native runners, not just a `platforms:` line.
 - **Stranded upstream PRs**, all unmerged against `electric-sql/electric` and all by the original
   author: #4667 (serve caught-up long-polls from the epoll reactor), #4709 (io_uring write paths,
   default off, measured as a regression as submitted), #4686 (replicated durability via openraft).
