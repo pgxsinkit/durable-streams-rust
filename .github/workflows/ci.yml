@@ -42,7 +42,7 @@ jobs:
         run: cargo test --release --locked
 
       - name: Clippy
-        run: cargo clippy --release --locked -- -D warnings
+        run: cargo clippy --release --locked --all-targets -- -D warnings
 
       - name: Upload server binary
         uses: actions/upload-artifact@v4

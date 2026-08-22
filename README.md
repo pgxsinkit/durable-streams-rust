@@ -67,7 +67,7 @@ durable, single-node server on `127.0.0.1:4437` with its data dir under `$TMPDIR
 | ------------------------ | ------------------------------ | --------------------------------------------------------------- |
 | `--host`                 | `127.0.0.1`                    | listen address (use `0.0.0.0` to accept remote connections)     |
 | `--port`                 | `4437`                         | listen port (the protocol default, PROTOCOL.md §13.1)           |
-| `--data-dir`             | `$TMPDIR/durable-streams-rust` | storage directory; persists across restarts                     |
+| `--data-dir`             | `$TMPDIR/durable-streams-rust` | storage directory. **Required with `--durability wal`** — the default is a temp dir, so wal would fsync every append and discard it on restart; the server refuses that combination at startup rather than let it look healthy. Optional in `memory` mode, which makes no durability claim. |
 | `--long-poll-timeout-ms` | `30000`                        | how long a `live=long-poll` request blocks before returning 204 |
 
 **Durability** — controls how appends are made durable. See [ARCHITECTURE.md › Durability modes](ARCHITECTURE.md#durability-modes).

@@ -116,6 +116,13 @@ fn main() {
     let mut port: u16 = 4437; // protocol default (PROTOCOL.md §13.1)
     let mut host: std::net::IpAddr = [127, 0, 0, 1].into();
     let mut data_dir = std::env::temp_dir().join("durable-streams-rust");
+    // Whether `--data-dir` was NAMED, not what it resolved to. `--durability wal` requires it
+    // (see the guard below): the default is a temp dir, and wal into a directory that does not
+    // survive a restart is the one durability misconfiguration that leaves no trace — every
+    // fsync is performed and every byte is discarded. Whether a path persists is not knowable
+    // from its spelling (a bind-mounted /tmp does; a tmpfs /var/lib does not), so the question
+    // asked is the answerable one: did an operator choose this directory on purpose.
+    let mut data_dir_explicit = false;
     let mut tier = tier::TierConfig::default();
     // `--wal-shards N` (the WAL shard count). `None` ⇒ on a fresh data dir use the
     // core count; on an existing one reuse the persisted N. A value ≠ the persisted
@@ -144,7 +151,10 @@ fn main() {
         match a.as_str() {
             "--host" => host = parse_val(args.next(), "--host"),
             "--port" => port = parse_val(args.next(), "--port"),
-            "--data-dir" => data_dir = val(args.next(), "--data-dir").into(),
+            "--data-dir" => {
+                data_dir = val(args.next(), "--data-dir").into();
+                data_dir_explicit = true;
+            }
             "--long-poll-timeout-ms" => {
                 handlers::set_long_poll_timeout(parse_val(args.next(), "--long-poll-timeout-ms"));
             }
@@ -319,6 +329,28 @@ fn main() {
             );
             std::process::exit(2);
         }
+    }
+
+    // The symmetric guard on the wal side. The two above refuse memory-mode configurations that
+    // would silently IGNORE durable data; this one refuses a wal-mode configuration that would
+    // silently FAIL TO PRODUCE any — `--durability wal` with a defaulted `--data-dir` writes its
+    // WAL into a temp dir, so every append pays a real fdatasync and every byte is discarded on
+    // the next container or machine restart. Nothing about a running server distinguishes that
+    // from working durability: conformance passes, reads are correct, the acks are honest right
+    // up until the restart. So it is refused at startup rather than discovered afterwards.
+    //
+    // The gate is whether the flag was NAMED, not where it points, so a throwaway directory
+    // stays available to tests and benches that want the wal code path without persistence —
+    // they just have to say so (the conformance harness already passes an explicit mkdtemp dir).
+    if handlers::durability() == handlers::DurabilityMode::Wal && !data_dir_explicit {
+        eprintln!(
+            "error: --durability wal refuses to start without an explicit --data-dir. The default \
+             ({}) is a temporary directory: every append would be fsynced and then discarded on \
+             restart, with nothing to indicate durability was never real. Pass --data-dir <path> \
+             on storage that persists, or use --durability memory if you do not need durability.",
+            data_dir.display()
+        );
+        std::process::exit(2);
     }
 
     // S3 credentials come from env (never CLI flags), matching the OTEL_*/AWS
