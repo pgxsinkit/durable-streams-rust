@@ -136,9 +136,9 @@ not the server. Options, in order of preference:
 
 Every run configuration — durability (`wal` vs `memory`), resident tail cache
 on/off, read-offload — is **protocol-equivalent**, and CI runs the full
-conformance suite once per configuration (the `rust-conformance` matrix in
+conformance suite once per configuration (the `conformance` matrix in
 `.github/workflows/ci.yml`; flags are passed via `RUST_SERVER_ARGS`, e.g.
-`RUST_SERVER_ARGS="--durability memory" pnpm vitest run --project server-rust`).
+`RUST_SERVER_ARGS="--durability memory" bun run test:conformance`).
 
 ## What it implements
 
@@ -171,12 +171,17 @@ The instrumentation is deliberately lean and aimed at finding bottlenecks: a sin
 ## Conformance
 
 ```bash
-# start the server with a short long-poll timeout to match the suite, then:
-RUST_SERVER_URL=http://localhost:4562 pnpm exec vitest run \
-  --config packages/durable-streams-rust/conformance/vitest.config.ts
+bun install
+cargo build --release          # the harness spawns target/release/durable-streams-server
+bun run test:conformance
+
+# or against an already-running server:
+RUST_SERVER_URL=http://localhost:4562 bun run test:conformance
 ```
 
-The core protocol suite passes.
+The core protocol suite passes against conformance `0.3.5` (326 passed, 0 failed). Three tests added
+in `0.3.6` fail — a close-only `POST` does not slide the TTL window, and `OPTIONS` preflight returns
+no CORS headers. Both are inherited from upstream and tracked as issues; see PROVENANCE.md.
 
 ## Releasing
 
