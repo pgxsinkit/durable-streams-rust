@@ -1,0 +1,11 @@
+Durable Streams server (Rust)
+
+Copyright 2026 Electric DB Limited
+Copyright 2026 pgxsinkit contributors
+
+This product includes software developed at Electric DB Limited
+(https://electric-sql.com/), licensed under the Apache License, Version 2.0.
+
+The original work was published as `packages/durable-streams-rust` in
+https://github.com/electric-sql/electric. This repository is a derivative work;
+see PROVENANCE.md for the exact fork point and the changes made.

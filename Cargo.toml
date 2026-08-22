@@ -6,7 +6,7 @@ description = "High-performance Durable Streams server (Rust)"
 license = "Apache-2.0"
 # CI builds on stable; this documents the supported minimum.
 rust-version = "1.75"
-repository = "https://github.com/durable-streams/durable-streams"
+repository = "https://github.com/pgxsinkit/durable-streams-rust"
 homepage = "https://electric-sql.com/primitives/durable-streams"
 readme = "README.md"
 
