@@ -1,0 +1,14 @@
+# Pinned to match the sibling Rust service, pgxsinkit/electric-circuits, so both
+# build on one toolchain in dev, CI, and the image builds.
+#
+# NOTE: this is NOT the same constraint circuits has. Circuits pins 1.96.0 because
+# rustc >= 1.97.0 ICEs compiling dbsp 0.318.0. This crate has no dbsp; its declared
+# MSRV is 1.75 and it builds on anything newer. So when circuits is free to move,
+# this moves with it — there is nothing here holding it back.
+#
+# NOTE for mise users: mise exports RUSTUP_TOOLCHAIN, which rustup ranks ABOVE this
+# file, so a global `rust = "latest"` silently overrides the pin. Either run
+# `mise settings add idiomatic_version_file_enable_tools rust` (mise then honours
+# this file) or unset RUSTUP_TOOLCHAIN in this repo.
+[toolchain]
+channel = "1.96.0"
