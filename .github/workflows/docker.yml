@@ -1,4 +1,4 @@
-# Build the server image and publish it to the GitHub Container Registry.
+# Build the storage and mTLS access-sidecar images and publish them to GitHub Container Registry.
 #
 #   ghcr.io/pgxsinkit/durable-streams-rust
 #
@@ -33,6 +33,16 @@ jobs:
   image:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            dockerfile: Dockerfile
+            suffix: ''
+          - name: access
+            dockerfile: Dockerfile.access
+            suffix: '-access'
     steps:
       - uses: actions/checkout@v4
 
@@ -50,7 +60,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ github.repository }}${{ matrix.suffix }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -60,9 +70,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=durable-streams-rust
-          cache-to: type=gha,mode=max,scope=durable-streams-rust
+          cache-from: type=gha,scope=durable-streams-rust-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=durable-streams-rust-${{ matrix.name }}

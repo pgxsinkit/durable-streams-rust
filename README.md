@@ -56,6 +56,36 @@ curl "$BASE?offset=now&live=long-poll"   # blocks until the next append (or time
 curl -N "$BASE?offset=0&live=sse"        # Server-Sent Events stream
 ```
 
+## Private mTLS access sidecar
+
+The WAL deployment keeps `durable-streams-server` on `127.0.0.1:4437` and exposes a separate
+`durable-streams-access` process on the task's private network. The sidecar requires TLS 1.3 client
+certificates, maps certificate URI SANs to configured service identities, authorizes a canonical
+method/path pair, applies separate data/admin and per-identity capacity, then streams the request
+and response to the loopback server without buffering either body. TLS handshakes are globally
+bounded; after authentication, established connections are bounded per identity so an agent
+workload cannot consume the Circuits or storage-administrator connection budget.
+Admin-capable identities declare explicit reservations whose sum cannot exceed the global admin
+pool, so one admin caller cannot consume another caller's share. Long-poll and SSE have separate
+response deadlines; the example policy allows the server's 60-second SSE session to finish before
+the proxy closes it.
+
+```bash
+durable-streams-access \
+  --listen 0.0.0.0:8443 \
+  --upstream http://127.0.0.1:4437 \
+  --server-cert /run/secrets/server.pem \
+  --server-key /run/secrets/server.key \
+  --client-ca /run/secrets/client-ca.pem \
+  --policy /etc/durable-streams/access-policy.json
+```
+
+[`deploy/access-policy.example.json`](deploy/access-policy.example.json) is the fixed internal-pilot
+capacity and path-policy profile. Unknown fields, duplicate certificate identities, overlapping
+rules, encoded/dot-segment aliases, missing certificate identities, and unavailable capacity all
+fail closed. Build the sidecar image with `Dockerfile.access`; release CI publishes it as the
+`-access` sibling of the storage image.
+
 ## Flags
 
 `durable-streams-server [flags]` — every flag is optional. The defaults give a

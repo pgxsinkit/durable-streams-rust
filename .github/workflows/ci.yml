@@ -44,11 +44,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --release --locked --all-targets -- -D warnings
 
-      - name: Upload server binary
+      - name: Upload server binaries
         uses: actions/upload-artifact@v4
         with:
           name: durable-streams-server
-          path: target/release/durable-streams-server
+          path: |
+            target/release/durable-streams-server
+            target/release/durable-streams-access
           retention-days: 1
 
   conformance:

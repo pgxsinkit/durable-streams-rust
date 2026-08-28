@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "global": {
+    "data_concurrency": 232,
+    "admin_concurrency": 8,
+    "connect_timeout_ms": 1000,
+    "request_timeout_ms": 30000,
+    "long_poll_timeout_ms": 35000,
+    "sse_timeout_ms": 65000,
+    "max_request_body_bytes": 1073741824
+  },
+  "identities": [
+    {
+      "name": "circuits-engine-dev",
+      "uri_sans": ["spiffe://indexed/dev/circuits-engine"],
+      "max_concurrency": 64,
+      "admin_concurrency": 1,
+      "rules": [
+        {
+          "match": "prefix",
+          "path": "/circuits/v1/dev/stores/replace-with-store-generation/",
+          "methods": ["GET", "HEAD", "PUT", "POST", "DELETE"]
+        },
+        {
+          "match": "exact",
+          "path": "/_admin/ready",
+          "methods": ["GET"],
+          "admin": true
+        }
+      ]
+    },
+    {
+      "name": "agent-writer-dev",
+      "uri_sans": ["spiffe://indexed/dev/agent-writer"],
+      "max_concurrency": 32,
+      "append_requests_per_second": 100,
+      "append_bytes_per_second": 8388608,
+      "rules": [
+        {
+          "match": "prefix",
+          "path": "/agent-runs/v1/dev/",
+          "methods": ["PUT", "POST", "DELETE"]
+        }
+      ]
+    },
+    {
+      "name": "stream-gateway-dev",
+      "uri_sans": ["spiffe://indexed/dev/stream-gateway"],
+      "max_concurrency": 128,
+      "rules": [
+        {
+          "match": "prefix",
+          "path": "/circuits/v1/dev/stores/replace-with-store-generation/",
+          "methods": ["GET", "HEAD"]
+        },
+        {
+          "match": "prefix",
+          "path": "/agent-runs/v1/dev/",
+          "methods": ["GET", "HEAD"]
+        }
+      ]
+    },
+    {
+      "name": "storage-administrator-dev",
+      "uri_sans": ["spiffe://indexed/dev/storage-administrator"],
+      "max_concurrency": 8,
+      "admin_concurrency": 5,
+      "rules": [
+        {
+          "match": "exact",
+          "path": "/_admin/ready",
+          "methods": ["GET"],
+          "admin": true
+        },
+        {
+          "match": "exact",
+          "path": "/_admin/inventory",
+          "methods": ["GET"],
+          "admin": true
+        }
+      ]
+    },
+    {
+      "name": "retention-dev",
+      "uri_sans": ["spiffe://indexed/dev/retention"],
+      "max_concurrency": 8,
+      "admin_concurrency": 2,
+      "rules": [
+        {
+          "match": "exact",
+          "path": "/_admin/inventory",
+          "methods": ["GET"],
+          "admin": true
+        }
+      ]
+    }
+  ]
+}

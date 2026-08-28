@@ -27,7 +27,6 @@ COPY --from=build /app/target/release/durable-streams-server /usr/local/bin/dura
 # Protocol default port (PROTOCOL.md §13.1); override with `--port`.
 EXPOSE 4437
 ENTRYPOINT ["/usr/local/bin/durable-streams-server"]
-# Bind all interfaces by default (the binary defaults to 127.0.0.1, unreachable
-# from outside the container). Override by passing your own args. For persistence,
-# mount a volume and add `--data-dir /your/path` (default is an ephemeral tmp dir).
-CMD ["--host", "0.0.0.0"]
+# The WAL pilot intentionally keeps this listener on loopback. The access sidecar is the only
+# external listener; the task definition supplies an explicit persistent --data-dir and store
+# identity arguments.
