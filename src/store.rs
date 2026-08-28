@@ -7,7 +7,7 @@
 // A catch-up read is then a literal byte range of the file (JSON responses
 // wrap the range as `[` + range-minus-trailing-comma + `]`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -495,7 +495,21 @@ pub struct Store {
     /// (`sweep_meta_once`). The `meta_dirty` CAS in `mark_meta_dirty` keeps
     /// each stream in here at most once per sweep cycle (#4691).
     pub meta_sweep: StdMutex<Vec<Arc<StreamState>>>,
+    inventory: RwLock<InventoryProjection>,
 }
+
+/// A read-only stream projection used by the bounded administrative inventory.
+#[derive(Clone, Debug)]
+pub struct InventoryEntry {
+    pub path: String,
+    pub closed: bool,
+    pub deleted: bool,
+    pub durable_bytes: u64,
+}
+
+struct InventoryProjection { generation: u64, entries: BTreeMap<String, InventoryEntry> }
+#[derive(Debug)]
+pub enum InventoryPageError { GenerationChanged }
 
 pub enum CreateResult {
     Created(Arc<StreamState>),
@@ -504,6 +518,36 @@ pub enum CreateResult {
 }
 
 impl Store {
+    fn publish_inventory(&self, st: &StreamState) {
+        let s = st.shared.read().unwrap();
+        let entry = InventoryEntry { path: st.path.clone(), closed: s.closed_durable, deleted: s.soft_deleted, durable_bytes: s.durable_tail };
+        let mut inventory = self.inventory.write().unwrap();
+        inventory.entries.insert(entry.path.clone(), entry);
+        inventory.generation = inventory.generation.wrapping_add(1);
+    }
+    pub fn publish_inventory_tail(&self, st: &StreamState) { self.publish_inventory(st); }
+    pub fn refresh_inventory(&self) {
+        let mut entries = BTreeMap::new();
+        for stream in self.streams.iter() {
+            let stream = stream.value();
+            let shared = stream.shared.read().unwrap();
+            entries.insert(stream.path.clone(), InventoryEntry { path: stream.path.clone(), closed: shared.closed_durable, deleted: shared.soft_deleted, durable_bytes: shared.durable_tail });
+        }
+        let mut inventory = self.inventory.write().unwrap();
+        inventory.entries = entries;
+        inventory.generation = inventory.generation.wrapping_add(1);
+    }
+    fn remove_inventory(&self, path: &str) {
+        let mut inventory = self.inventory.write().unwrap();
+        if inventory.entries.remove(path).is_some() { inventory.generation = inventory.generation.wrapping_add(1); }
+    }
+    pub fn inventory_page(&self, generation: Option<u64>, after: Option<&str>, limit: usize) -> Result<(u64, Vec<InventoryEntry>, bool), InventoryPageError> {
+        let inventory = self.inventory.read().unwrap();
+        if generation.is_some_and(|generation| generation != inventory.generation) { return Err(InventoryPageError::GenerationChanged); }
+        let entries: Vec<_> = inventory.entries.range((match after { Some(after) => std::ops::Bound::Excluded(after.to_owned()), None => std::ops::Bound::Unbounded }, std::ops::Bound::Unbounded)).take(limit + 1).map(|(_, entry)| entry.clone()).collect();
+        let more = entries.len() > limit;
+        Ok((inventory.generation, entries.into_iter().take(limit).collect(), more))
+    }
     /// Build a Store with an explicit tiering configuration. When
     /// `tier.kind == Off` (the default) this is identical to `new`: no
     /// blobstore, no sealing, single contiguous file per stream.
@@ -642,6 +686,7 @@ impl Store {
             blobstore,
             wal: std::sync::OnceLock::new(),
             meta_sweep: StdMutex::new(Vec::new()),
+            inventory: RwLock::new(InventoryProjection { generation: 0, entries: BTreeMap::new() }),
         };
         store.recover(&streams_dir)?;
         Ok(store)
@@ -962,7 +1007,9 @@ impl Store {
             return Some(st);
         }
         if st.is_expired() {
-            self.delete_or_soft_delete(&st);
+            // Expiry is a removal too: retain the inventory projection until
+            // unlink + parent fsync succeeds, just like an acknowledged DELETE.
+            let _ = self.delete_or_soft_delete_durable(&st);
             return None;
         }
         Some(st)
@@ -976,6 +1023,7 @@ impl Store {
     /// access — harmless). The DELETE handler must NOT use this: an acked
     /// DELETE undone by a crash resurrects the stream with all its data — use
     /// [`Store::delete_or_soft_delete_durable`] there.
+    #[allow(dead_code)]
     pub fn delete_or_soft_delete(&self, st: &Arc<StreamState>) {
         let _ = self.delete_impl(st, false);
     }
@@ -1001,7 +1049,13 @@ impl Store {
         };
         if soft {
             if durable {
-                write_meta_sync(st, true)?;
+                #[cfg(test)]
+                if DELETE_FAULT.load(Ordering::Relaxed) == 1 { st.shared.write().unwrap().soft_deleted = false; return Err(std::io::Error::other("injected soft-delete metadata failure")); }
+                if let Err(error) = write_meta_sync(st, true) {
+                    st.shared.write().unwrap().soft_deleted = false;
+                    return Err(error);
+                }
+                self.publish_inventory(st);
             } else {
                 let st2 = st.clone();
                 tokio::task::spawn_blocking(move || {
@@ -1009,24 +1063,28 @@ impl Store {
                 });
             }
         } else {
-            self.streams
-                .remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
             // Reclaim this stream's offloaded segments (remote objects + any
             // staged local chunk files) — safe only here, on a true hard delete
             // with no remaining fork references.
             self.gc_remote_segments(st);
             let fp = st.file_path.clone();
             if durable {
+                #[cfg(test)]
+                if DELETE_FAULT.load(Ordering::Relaxed) == 2 { return Err(std::io::Error::other("injected hard-delete durability failure")); }
                 // Both unlinks live in the same directory; one dir fsync makes
                 // them crash-durable together.
                 let _ = std::fs::remove_file(meta_path(&fp));
                 let _ = std::fs::remove_file(&fp);
                 fsync_parent_dir(&fp)?;
+                self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
+                self.remove_inventory(&st.path);
             } else {
                 tokio::task::spawn_blocking(move || {
                     let _ = std::fs::remove_file(meta_path(&fp));
                     let _ = std::fs::remove_file(fp);
                 });
+                self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
+                self.remove_inventory(&st.path);
             }
             self.release_parent(st);
         }
@@ -1184,11 +1242,15 @@ impl Store {
                     let _ = std::fs::remove_file(&state.file_path);
                     return Err(e);
                 }
+                self.publish_inventory(&state);
                 Ok(CreateResult::Created(state))
             }
         }
     }
 }
+
+#[cfg(test)]
+static DELETE_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 fn config_matches(existing: &StreamState, requested: &StreamConfig) -> bool {
     let ex = &existing.config;
@@ -2639,6 +2701,50 @@ mod meta_sweep_tests {
             "sweep must not resurrect a deleted stream's sidecar"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_delete_faults_preserve_inventory_publication_order() {
+        let dir = tmp_dir("inventory-delete-fault");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let soft = create(&store, "soft");
+        soft.shared.write().unwrap().ref_count = 1;
+        DELETE_FAULT.store(1, Ordering::Relaxed);
+        assert!(store.delete_or_soft_delete_durable(&soft).is_err());
+        DELETE_FAULT.store(0, Ordering::Relaxed);
+        let (_, entries, _) = store.inventory_page(None, None, 10).unwrap();
+        assert!(entries.iter().any(|entry| entry.path == "soft" && !entry.deleted));
+        assert!(!soft.shared.read().unwrap().soft_deleted);
+
+        let hard = create(&store, "hard");
+        DELETE_FAULT.store(2, Ordering::Relaxed);
+        assert!(store.delete_or_soft_delete_durable(&hard).is_err());
+        let (_, entries, _) = store.inventory_page(None, None, 10).unwrap();
+        assert!(entries.iter().any(|entry| entry.path == "hard"));
+        DELETE_FAULT.store(0, Ordering::Relaxed);
+        store.delete_or_soft_delete_durable(&hard).unwrap();
+        let (_, entries, _) = store.inventory_page(None, None, 10).unwrap();
+        assert!(!entries.iter().any(|entry| entry.path == "hard"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expiry_keeps_inventory_until_durable_unlink_succeeds() {
+        let dir = tmp_dir("expiry-delete-fault");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let mut config = octet_cfg();
+        config.ttl_seconds = Some(1);
+        let st = match store.create("expired", config, None, 0).unwrap() { CreateResult::Created(st) => st, _ => panic!() };
+        st.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(2);
+        DELETE_FAULT.store(2, Ordering::Relaxed);
+        assert!(store.get("expired").is_none());
+        let (_, entries, _) = store.inventory_page(None, None, 10).unwrap();
+        assert!(entries.iter().any(|entry| entry.path == "expired"));
+        DELETE_FAULT.store(0, Ordering::Relaxed);
+        assert!(store.get("expired").is_none());
+        let (_, entries, _) = store.inventory_page(None, None, 10).unwrap();
+        assert!(!entries.iter().any(|entry| entry.path == "expired"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -167,6 +167,27 @@ fn stream_file_bytes(store: &Arc<Store>, path: &str) -> Vec<u8> {
     std::fs::read(&st.file_path).unwrap()
 }
 
+#[tokio::test]
+async fn recovery_refreshes_inventory_and_excludes_torn_unacknowledged_tail() {
+    let _guard = DurabilityGuard::wal();
+    let dir = tmp("inventory-recovery");
+    let harness = Harness::boot(&dir, Some(1), 1).unwrap();
+    create_stream(&harness.store, "inventory", "application/octet-stream").await;
+    append_acked(&harness.store, "inventory", "application/octet-stream", b"ack").await;
+    let file_path = harness.store.get("inventory").unwrap().file_path.clone();
+    harness.crash();
+    use std::io::Write;
+    std::fs::OpenOptions::new().append(true).open(&file_path).unwrap().write_all(b"torn").unwrap();
+    let recovered = Harness::boot(&dir, Some(1), 1).unwrap();
+    recovered.store.refresh_inventory();
+    let (_, entries, _) = recovered.store.inventory_page(None, None, 10).unwrap();
+    let entry = entries.iter().find(|entry| entry.path == "inventory").unwrap();
+    assert_eq!(entry.durable_bytes, 3);
+    assert_eq!(stream_file_bytes(&recovered.store, "inventory"), b"ack");
+    recovered.crash();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The shard index a stream name routes to, after creating it (so we can assert
 /// two streams land on different shards). Uses the live store + walset routing.
 fn shard_index_of(store: &Arc<Store>, walset: &Arc<WalSet>, path: &str) -> usize {

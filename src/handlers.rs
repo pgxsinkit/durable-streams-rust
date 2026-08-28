@@ -245,7 +245,12 @@ fn route_label(path: &str) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 pub async fn handle(store: Arc<Store>, req: Req) -> Resp {
+    handle_with_admin(store, req, None).await
+}
+
+pub async fn handle_with_admin(store: Arc<Store>, req: Req, admin: Option<Arc<crate::admin_readiness::AdminReadiness>>) -> Resp {
     let method = method_label(req.method);
     let route = route_label(&req.path);
     // `ds.request` span. Skip everything heavy/unbounded: the store handle, the
@@ -253,7 +258,7 @@ pub async fn handle(store: Arc<Store>, req: Req) -> Resp {
     // recorded. The span is always compiled; it is exported only when the
     // `telemetry` feature is on and a subscriber is installed.
     let span = tracing::info_span!("ds.request", http.method = method, route = route, status_class = tracing::field::Empty);
-    let resp = dispatch(store, req).instrument(span.clone()).await;
+    let resp = dispatch(store, req, admin).instrument(span.clone()).await;
     span.record("status_class", status_class(resp.status));
     crate::telemetry::record_request(method, status_class(resp.status));
     // Constant security headers (nosniff, CORP) are emitted by the engine's
@@ -262,10 +267,28 @@ pub async fn handle(store: Arc<Store>, req: Req) -> Resp {
     resp
 }
 
-async fn dispatch(store: Arc<Store>, req: Req) -> Resp {
+async fn dispatch(store: Arc<Store>, req: Req, admin: Option<Arc<crate::admin_readiness::AdminReadiness>>) -> Resp {
     let path = req.path.clone();
+    if let Ok(normalized) = percent_encoding::percent_decode_str(&path).decode_utf8() {
+        if normalized.starts_with("/_admin/") && normalized.as_ref() != path {
+            return text_response(400, "encoded admin route aliases are forbidden");
+        }
+    }
     if path == "/health" {
         text_response(200, "ok")
+    } else if path.starts_with("/_admin/") {
+        match (path.as_str(), req.method, admin) {
+            ("/_admin/ready", Method::Get, Some(admin)) => {
+                let (status, body) = admin.json(&store.data_dir);
+                let mut response = Resp::new(status);
+                response.headers.push(("content-type", "application/json".to_string()));
+                response.body = full(body);
+                response
+            }
+            ("/_admin/inventory", Method::Get, Some(_)) => inventory_response(&store, req.query.as_deref()),
+            (_, Method::Get, _) => text_response(404, "admin endpoint not found"),
+            _ => text_response(405, "admin endpoints are read-only"),
+        }
     } else {
         match req.method {
             Method::Put => handle_create(store, req, path).await,
@@ -277,6 +300,52 @@ async fn dispatch(store: Arc<Store>, req: Req) -> Resp {
             Method::Other => text_response(405, "method not allowed"),
         }
     }
+}
+
+fn inventory_response(store: &Store, query: Option<&str>) -> Resp {
+    const DEFAULT_LIMIT: usize = 100;
+    const MAX_LIMIT: usize = 1000;
+    let mut cursor: Option<(u64, String)> = None;
+    let mut limit = DEFAULT_LIMIT;
+    if let Some(query) = query {
+        for part in query.split('&') {
+            let Some((key, value)) = part.split_once('=') else { return text_response(400, "invalid inventory query"); };
+            match key {
+                "cursor" => match decode_inventory_cursor(value) {
+                    Some(value) => cursor = Some(value),
+                    None => return text_response(400, "invalid inventory cursor"),
+                },
+                "limit" => match value.parse::<usize>() { Ok(n) if (1..=MAX_LIMIT).contains(&n) => limit = n, _ => return text_response(400, "inventory limit must be 1..=1000") },
+                _ => return text_response(400, "unknown inventory query parameter"),
+            }
+        }
+    }
+    let (generation, entries, more) = match store.inventory_page(cursor.as_ref().map(|(generation, _)| *generation), cursor.as_ref().map(|(_, path)| path.as_str()), limit) {
+        Ok(page) => page,
+        Err(crate::store::InventoryPageError::GenerationChanged) => return text_response(409, "inventory changed; restart pagination"),
+    };
+    let next_cursor = if more { entries.last().map(|entry| encode_inventory_cursor(generation, &entry.path)) } else { None };
+    #[derive(serde::Serialize)] struct Item<'a> { path: &'a str, closed: bool, deleted: bool, durable_bytes: u64 }
+    #[derive(serde::Serialize)] struct Page<'a> { streams: Vec<Item<'a>>, next_cursor: Option<String> }
+    let body = serde_json::to_vec(&Page { streams: entries.iter().map(|entry| Item { path: &entry.path, closed: entry.closed, deleted: entry.deleted, durable_bytes: entry.durable_bytes }).collect(), next_cursor }).expect("inventory serializes");
+    let mut response = Resp::new(200);
+    response.headers.push(("content-type", "application/json".to_string()));
+    response.body = full(body);
+    response
+}
+
+fn encode_inventory_cursor(generation: u64, path: &str) -> String {
+    format!("{generation}.{}", percent_encoding::utf8_percent_encode(path, percent_encoding::NON_ALPHANUMERIC))
+}
+
+fn decode_inventory_cursor(cursor: &str) -> Option<(u64, String)> {
+    let (generation, encoded_path) = cursor.split_once('.')?;
+    if generation.is_empty() || !generation.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    let generation = generation.parse().ok()?;
+    let decoded = percent_encoding::percent_decode_str(encoded_path).decode_utf8().ok()?.into_owned();
+    // Cursor bytes are part of the pagination protocol, so accept exactly one
+    // spelling. This prevents aliases such as raw `&` and lowercase escapes.
+    (encode_inventory_cursor(generation, &decoded) == cursor).then_some((generation, decoded))
 }
 
 // ---------- PUT (create) ----------
@@ -619,7 +688,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                     wait_durable_lsn(&store, &st, lsn).await;
                 }
                 // Durable now (wal) / page-cache written (memory): expose to readers.
-                publish_durable_tail(&st, new_tail, &wire);
+                publish_durable_tail(&store, &st, new_tail, &wire);
             }
             let t = st.tail();
             let mut b = ResponseBuilder::new(201)
@@ -778,7 +847,7 @@ fn write_wire(st: &StreamState, ap: &mut Appender, wire: &Bytes) -> std::io::Res
 /// concurrent appenders (whose group-commit fsyncs may resolve out of order)
 /// safe: a later appender publishing the higher frontier first is fine (all
 /// lower bytes are durable too), and the earlier appender then no-ops.
-fn publish_durable_tail(st: &StreamState, tail: u64, wire: &Bytes) {
+fn publish_durable_tail(store: &Store, st: &StreamState, tail: u64, wire: &Bytes) {
     let closed;
     {
         let mut s = st.shared.write().unwrap();
@@ -796,6 +865,10 @@ fn publish_durable_tail(st: &StreamState, tail: u64, wire: &Bytes) {
     // [tail - wire.len(), tail).
     st.set_last_chunk(tail - wire.len() as u64, wire.clone());
     st.tail_tx.send_replace(Tail { bytes: tail, closed });
+    // Inventory observes the already-published durable tail. This deliberately
+    // adds no fsync to the append hot path; a generation-bound page detects
+    // concurrent change and backup quiescence supplies a stable window.
+    store.publish_inventory_tail(st);
     // Wake any reactor-served subscribers of this stream (no-op when none).
     #[cfg(target_os = "linux")]
     crate::sse_reactor::wake_stream(st);
@@ -1221,7 +1294,7 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
     // Durable now (wal) / page-cache written (memory): expose the new bytes to
     // readers, mirroring the close-visibility ordering below.
     if let Some(t) = new_tail {
-        publish_durable_tail(&st, t, &wire);
+        publish_durable_tail(&store, &st, t, &wire);
     }
 
     // Closure ordering: WAL fsync → durable meta commit → expose the closure to
@@ -1240,6 +1313,7 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
             s.durable_tail
         };
         st.tail_tx.send_replace(Tail { bytes: tail, closed: true });
+        store.publish_inventory_tail(&st);
         #[cfg(target_os = "linux")]
         crate::sse_reactor::wake_stream(&st);
     } else if staged_lsn.is_some() {
@@ -2121,6 +2195,101 @@ async fn handle_delete(store: Arc<Store>, path: String) -> Resp {
 }
 
 #[cfg(test)]
+mod admin_inventory_tests {
+    use super::*;
+    use crate::api::Body;
+    use crate::store::{CreateResult, Store, StreamConfig};
+    use crate::tier::TierConfig;
+
+    fn stream_config() -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    #[test]
+    fn inventory_cursor_is_canonical_and_round_trips_delimiters_and_unicode() {
+        let dir = std::env::temp_dir().join(format!("ds-inventory-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        for path in ["a&equals=one", "é/next"] {
+            assert!(matches!(store.create(path, stream_config(), None, 0).unwrap(), CreateResult::Created(_)));
+        }
+        let first = inventory_response(&store, Some("limit=1"));
+        let Body::Full(first) = first.body else { panic!("inventory must be a fixed JSON response") };
+        let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(first["streams"][0]["path"], "a&equals=one");
+        let cursor = first["next_cursor"].as_str().unwrap();
+        assert_eq!(cursor, "2.a%26equals%3Done");
+        let second = inventory_response(&store, Some(&format!("limit=1&cursor={cursor}")));
+        let Body::Full(second) = second.body else { panic!("inventory must be a fixed JSON response") };
+        let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
+        assert_eq!(second["streams"][0]["path"], "é/next");
+        assert_eq!(inventory_response(&store, Some("cursor=2.a%26equals%3done")).status, 400, "non-canonical escape spelling is rejected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn encoded_admin_alias_is_reserved_for_every_stream_verb() {
+        let dir = std::env::temp_dir().join(format!("ds-admin-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        for method in [Method::Put, Method::Get, Method::Post, Method::Head, Method::Delete] {
+            let response = handle(Arc::clone(&store), Req { method, path: "/_admin%2Fuser-stream".into(), query: None, headers: vec![("stream-closed".into(), "true".into())], body: bytes::Bytes::new() }).await;
+            assert_eq!(response.status, 400, "{method:?}");
+        }
+        let response = handle(Arc::clone(&store), Req { method: Method::Put, path: "/%5Fadmin%2Fuser-stream".into(), query: None, headers: vec![], body: bytes::Bytes::new() }).await;
+        assert_eq!(response.status, 400);
+        assert!(store.get("/_admin/user-stream").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn close_publication_marks_inventory_closed_after_durable_close() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = std::env::temp_dir().join(format!("ds-inventory-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        for path in ["close-only", "append-close"] {
+            let created = handle(Arc::clone(&store), Req { method: Method::Put, path: path.into(), query: None, headers: vec![("content-type".into(), "application/octet-stream".into())], body: bytes::Bytes::new() }).await;
+            assert_eq!(created.status, 201);
+        }
+        let close = handle(Arc::clone(&store), Req { method: Method::Post, path: "close-only".into(), query: None, headers: vec![("stream-closed".into(), "true".into())], body: bytes::Bytes::new() }).await;
+        assert_eq!(close.status, 204);
+        let append_close = handle(Arc::clone(&store), Req { method: Method::Post, path: "append-close".into(), query: None, headers: vec![("content-type".into(), "application/octet-stream".into()), ("stream-closed".into(), "true".into())], body: bytes::Bytes::from_static(b"abc") }).await;
+        assert_eq!(append_close.status, 204);
+        let (_, entries, _) = store.inventory_page(None, None, 10).unwrap();
+        let only = entries.iter().find(|entry| entry.path == "close-only").unwrap();
+        assert!(only.closed && only.durable_bytes == 0);
+        let appended = entries.iter().find(|entry| entry.path == "append-close").unwrap();
+        assert!(appended.closed && appended.durable_bytes == 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inventory_generation_change_requires_pagination_restart() {
+        let dir = std::env::temp_dir().join(format!("ds-inventory-conflict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        store.create("a", stream_config(), None, 0).unwrap();
+        store.create("c", stream_config(), None, 0).unwrap();
+        let first = inventory_response(&store, Some("limit=1"));
+        let Body::Full(first) = first.body else { panic!() };
+        let cursor = serde_json::from_slice::<serde_json::Value>(&first).unwrap()["next_cursor"].as_str().unwrap().to_string();
+        store.create("b", stream_config(), None, 0).unwrap();
+        assert_eq!(inventory_response(&store, Some(&format!("cursor={cursor}"))).status, 409);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod bug1_tests {
     //! Regression for BUG-1: a cold-tier read that errors or returns a truncated
     //! object must set the `StreamBody.failed` abort flag (so engines drop the
@@ -2554,4 +2723,3 @@ mod memory_mode_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

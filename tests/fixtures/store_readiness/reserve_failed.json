@@ -1,0 +1,18 @@
+{
+  "contract_version": "durable-streams-store-ready-v1",
+  "status": "starting",
+  "artifact_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "manifest": {
+    "store_id": "2bc96d0b-9740-4f50-97c6-754b2b27d6b0",
+    "store_generation": "ff8b5fa6-e786-4994-8da0-f14e9e79f318",
+    "protocol_version": 1,
+    "layout_version": 1,
+    "durability_mode": "wal",
+    "wal_shard_count": 2,
+    "stream_lane_count": 1,
+    "filesystem_uuid": "253f14d5-cbee-4df8-9e3c-e44c6e41501b",
+    "creation_time": "2026-08-27T19:00:00Z"
+  },
+  "recovery": { "completed": true, "wal_shards": [{ "shard": 0, "durable_lsn": 0, "checkpoint_lsn": 0 }, { "shard": 1, "durable_lsn": 0, "checkpoint_lsn": 0 }] },
+  "reserve": { "free_bytes": 1, "free_inodes": 1, "minimum_free_bytes": 21474836480, "minimum_free_inodes": 10000, "satisfied": false }
+}

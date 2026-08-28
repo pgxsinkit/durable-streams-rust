@@ -1,5 +1,7 @@
+mod admin_readiness;
 mod api;
 mod blobstore;
+mod data_dir_lock;
 mod engine_raw;
 mod handlers;
 mod http1;
@@ -7,6 +9,7 @@ mod srvstats;
 #[cfg(target_os = "linux")]
 mod sse_reactor;
 mod store;
+mod store_manifest;
 mod telemetry;
 mod tier;
 mod wal;
@@ -17,6 +20,83 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use store::Store;
+
+const DEFAULT_MINIMUM_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+const DEFAULT_MINIMUM_FREE_INODES: u64 = 10_000;
+
+fn exit_usage(message: impl std::fmt::Display) -> ! {
+    eprintln!("error: {message}");
+    std::process::exit(2)
+}
+
+fn bootstrap_store(args: &[String]) -> ! {
+    let mut values = std::collections::HashMap::<&str, String>::new();
+    let allowed = [
+        "--data-dir",
+        "--store-id",
+        "--store-generation",
+        "--protocol-version",
+        "--layout-version",
+        "--durability-mode",
+        "--wal-shards",
+        "--stream-lanes",
+        "--filesystem-uuid",
+        "--creation-time",
+    ];
+    let mut index = 0;
+    while index < args.len() {
+        let flag = &args[index];
+        if !allowed.contains(&flag.as_str()) {
+            exit_usage(format!("bootstrap-store unknown argument: {flag}"));
+        }
+        index += 1;
+        let Some(value) = args.get(index) else {
+            exit_usage(format!("{flag} requires a value"));
+        };
+        if values.insert(flag, value.clone()).is_some() {
+            exit_usage(format!("bootstrap-store duplicate argument: {flag}"));
+        }
+        index += 1;
+    }
+    let required = |flag: &str| {
+        values
+            .get(flag)
+            .cloned()
+            .unwrap_or_else(|| exit_usage(format!("bootstrap-store requires {flag}")))
+    };
+    let data_dir: std::path::PathBuf = required("--data-dir").into();
+    let parse = |flag: &str| {
+        required(flag)
+            .parse::<u32>()
+            .unwrap_or_else(|_| exit_usage(format!("{flag} must be an unsigned 32-bit integer")))
+    };
+    let manifest = store_manifest::StoreManifestV1 {
+        store_id: required("--store-id"),
+        store_generation: required("--store-generation"),
+        protocol_version: parse("--protocol-version"),
+        layout_version: parse("--layout-version"),
+        durability_mode: required("--durability-mode"),
+        wal_shard_count: parse("--wal-shards"),
+        stream_lane_count: parse("--stream-lanes"),
+        filesystem_uuid: required("--filesystem-uuid"),
+        creation_time: required("--creation-time"),
+    };
+    let _lock = data_dir_lock::DataDirLock::acquire(&data_dir).unwrap_or_else(|e| exit_usage(e));
+    store_manifest::create_atomically(&data_dir, &manifest).unwrap_or_else(|e| exit_usage(e));
+    println!(
+        "bootstrapped Durable Streams store at {}",
+        data_dir.display()
+    );
+    std::process::exit(0)
+}
+
+fn valid_artifact_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// Take a flag's value or exit(2) with a clean usage error (not a panic).
 fn val(o: Option<String>, flag: &str) -> String {
@@ -113,6 +193,13 @@ fn raise_nofile_limit() {
 fn main() {
     #[cfg(unix)]
     raise_nofile_limit();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args
+        .first()
+        .is_some_and(|argument| argument == "bootstrap-store")
+    {
+        bootstrap_store(&raw_args[1..]);
+    }
     let mut port: u16 = 4437; // protocol default (PROTOCOL.md §13.1)
     let mut host: std::net::IpAddr = [127, 0, 0, 1].into();
     let mut data_dir = std::env::temp_dir().join("durable-streams-rust");
@@ -146,7 +233,16 @@ fn main() {
     // investigation, independent of the heavy `telemetry` OTLP feature.
     let mut wal_stats_secs: Option<u64> = None;
     let mut server_stats_secs: Option<u64> = None;
-    let mut args = std::env::args().skip(1);
+    let mut expected_store_id: Option<String> = None;
+    let mut expected_store_generation: Option<String> = None;
+    let mut expected_protocol_version: Option<u32> = None;
+    let mut expected_layout_version: Option<u32> = None;
+    let mut expected_filesystem_uuid: Option<String> = None;
+    let mut artifact_digest: Option<String> = None;
+    let mut minimum_free_bytes = DEFAULT_MINIMUM_FREE_BYTES;
+    let mut minimum_free_inodes = DEFAULT_MINIMUM_FREE_INODES;
+    let mut stream_lanes: Option<u32> = None;
+    let mut args = raw_args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--host" => host = parse_val(args.next(), "--host"),
@@ -154,6 +250,26 @@ fn main() {
             "--data-dir" => {
                 data_dir = val(args.next(), "--data-dir").into();
                 data_dir_explicit = true;
+            }
+            "--store-id" => expected_store_id = Some(val(args.next(), "--store-id")),
+            "--store-generation" => {
+                expected_store_generation = Some(val(args.next(), "--store-generation"))
+            }
+            "--protocol-version" => {
+                expected_protocol_version = Some(parse_val(args.next(), "--protocol-version"))
+            }
+            "--layout-version" => {
+                expected_layout_version = Some(parse_val(args.next(), "--layout-version"))
+            }
+            "--filesystem-uuid" => {
+                expected_filesystem_uuid = Some(val(args.next(), "--filesystem-uuid"))
+            }
+            "--artifact-digest" => artifact_digest = Some(val(args.next(), "--artifact-digest")),
+            "--minimum-free-bytes" => {
+                minimum_free_bytes = parse_val(args.next(), "--minimum-free-bytes")
+            }
+            "--minimum-free-inodes" => {
+                minimum_free_inodes = parse_val(args.next(), "--minimum-free-inodes")
             }
             "--long-poll-timeout-ms" => {
                 handlers::set_long_poll_timeout(parse_val(args.next(), "--long-poll-timeout-ms"));
@@ -274,7 +390,10 @@ fn main() {
             "--stream-lanes" => {
                 let v = val(args.next(), "--stream-lanes");
                 match v.parse::<usize>() {
-                    Ok(n) if n >= 1 => store::set_stream_lanes(n),
+                    Ok(n) if n >= 1 && u32::try_from(n).is_ok() => {
+                        store::set_stream_lanes(n);
+                        stream_lanes = Some(n as u32);
+                    }
                     _ => {
                         eprintln!("--stream-lanes must be a positive integer");
                         std::process::exit(2);
@@ -289,7 +408,9 @@ fn main() {
                 match v.parse::<u64>() {
                     Ok(bytes) => wal::shard::set_checkpoint_wal_bytes(bytes),
                     _ => {
-                        eprintln!("--wal-checkpoint-wal-bytes must be a non-negative integer (bytes)");
+                        eprintln!(
+                            "--wal-checkpoint-wal-bytes must be a non-negative integer (bytes)"
+                        );
                         std::process::exit(2);
                     }
                 }
@@ -353,6 +474,73 @@ fn main() {
         std::process::exit(2);
     }
 
+    // WAL owns persistent state and therefore needs lifetime-exclusive access.
+    // Memory mode intentionally retains its original shared/default-dir behavior.
+    let data_dir_lock = if handlers::durability() == handlers::DurabilityMode::Wal {
+        Some(data_dir_lock::DataDirLock::acquire(&data_dir).unwrap_or_else(|e| exit_usage(e)))
+    } else {
+        None
+    };
+
+    let manifest = if handlers::durability() == handlers::DurabilityMode::Wal {
+        if minimum_free_bytes < DEFAULT_MINIMUM_FREE_BYTES || minimum_free_inodes < DEFAULT_MINIMUM_FREE_INODES {
+            exit_usage(format!(
+                "WAL pilot reserve cannot be lowered below {DEFAULT_MINIMUM_FREE_BYTES} bytes and {DEFAULT_MINIMUM_FREE_INODES} inodes"
+            ));
+        }
+        if !host.is_loopback() {
+            exit_usage("WAL pilot mode requires a loopback --host; DS-02 owns external access");
+        }
+        let expected = store_manifest::ExpectedStoreIdentityV1 {
+            store_id: expected_store_id
+                .unwrap_or_else(|| exit_usage("--store-id is required in WAL mode")),
+            store_generation: expected_store_generation
+                .unwrap_or_else(|| exit_usage("--store-generation is required in WAL mode")),
+            protocol_version: expected_protocol_version
+                .unwrap_or_else(|| exit_usage("--protocol-version is required in WAL mode")),
+            layout_version: expected_layout_version
+                .unwrap_or_else(|| exit_usage("--layout-version is required in WAL mode")),
+            durability_mode: "wal".to_string(),
+            wal_shard_count: u32::try_from(
+                wal_shards.unwrap_or_else(|| exit_usage("--wal-shards is required in WAL mode")),
+            )
+            .unwrap_or_else(|_| exit_usage("--wal-shards exceeds u32")),
+            stream_lane_count: stream_lanes
+                .unwrap_or_else(|| exit_usage("--stream-lanes is required in WAL mode")),
+            filesystem_uuid: expected_filesystem_uuid
+                .unwrap_or_else(|| exit_usage("--filesystem-uuid is required in WAL mode")),
+        };
+        store_manifest::canonical_uuid("--store-id", &expected.store_id)
+            .unwrap_or_else(|error| exit_usage(error));
+        store_manifest::canonical_uuid("--store-generation", &expected.store_generation)
+            .unwrap_or_else(|error| exit_usage(error));
+        store_manifest::canonical_uuid("--filesystem-uuid", &expected.filesystem_uuid)
+            .unwrap_or_else(|error| exit_usage(error));
+        let manifest = store_manifest::read(&data_dir).unwrap_or_else(|error| exit_usage(error));
+        manifest
+            .compare_expected(&expected)
+            .unwrap_or_else(|error| exit_usage(error));
+        let digest = artifact_digest
+            .as_deref()
+            .unwrap_or_else(|| exit_usage("--artifact-digest is required in WAL mode"));
+        if !valid_artifact_digest(digest) {
+            exit_usage(
+                "--artifact-digest must be lowercase sha256: followed by 64 hexadecimal digits",
+            );
+        }
+        Some(manifest)
+    } else {
+        None
+    };
+    let readiness = manifest.map(|manifest| {
+        Arc::new(admin_readiness::AdminReadiness::new(
+            manifest,
+            artifact_digest.expect("artifact digest required with a WAL manifest"),
+            minimum_free_bytes,
+            minimum_free_inodes,
+        ))
+    });
+
     // S3 credentials come from env (never CLI flags), matching the OTEL_*/AWS
     // convention. Honour both the DS_* names and the standard AWS_* fallbacks.
     if tier.kind == tier::TierKind::S3 {
@@ -364,9 +552,11 @@ fn main() {
             .ok();
     }
 
-    let workers = worker_threads.unwrap_or_else(|| std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4));
+    let workers = worker_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
@@ -374,6 +564,9 @@ fn main() {
         .expect("failed to build runtime");
 
     rt.block_on(async move {
+        // Hold the advisory lock until all runtime-owned store and WAL state is
+        // drained.  Its drop at the end of this block is the release point.
+        let _data_dir_lock = data_dir_lock;
         // Telemetry is OFF by default (feature-gated); a no-op unless built with
         // `--features telemetry`. Held across the run and flushed on Ctrl-C —
         // `serve()` never returns on its own.
@@ -381,6 +574,9 @@ fn main() {
         let store = Arc::new(
             Store::new_with_tier(data_dir.clone(), tier.clone()).expect("failed to init store"),
         );
+        if handlers::durability() == handlers::DurabilityMode::Memory {
+            store.refresh_inventory();
+        }
         // Batched meta-sidecar sweeper (#4691): flushes every stream queued by
         // `Store::mark_meta_dirty` (memory-mode appends, TTL read touches) in
         // one pass per tick, replacing the per-stream 100 ms debounce timer.
@@ -427,16 +623,23 @@ fn main() {
         let mut wal_for_shutdown: Option<Arc<wal::walset::WalSet>> = None;
         if handlers::durability() == handlers::DurabilityMode::Wal {
             let open_res = match wal_segment_bytes {
-                Some(sz) => wal::walset::WalSet::open_with_segment_size(
-                    &data_dir, wal_shards, workers, sz,
-                ),
+                Some(sz) => {
+                    wal::walset::WalSet::open_with_segment_size(&data_dir, wal_shards, workers, sz)
+                }
                 None => wal::walset::WalSet::open(&data_dir, wal_shards, workers),
             };
             let walset = open_res.unwrap_or_else(|e| {
                 eprintln!("error: {e}");
                 std::process::exit(2);
             });
+            if let Some(readiness) = &readiness {
+                readiness.attach_wal(Arc::clone(&walset));
+                readiness.recovering();
+            }
             wal::recovery::recover(&store, &walset).expect("WAL recovery failed");
+            // Recovery can advance/torn-tail-truncate reader-visible frontiers.
+            // Publish the inventory only after that authoritative reconciliation.
+            store.refresh_inventory();
             walset
                 .reset_after_recovery()
                 .expect("WAL reset after recovery failed");
@@ -466,6 +669,9 @@ fn main() {
             // `--features telemetry`; off the hot commit/append path.
             wal::telemetry::spawn_emitter(Arc::clone(&walset));
             wal_for_shutdown = Some(walset);
+            if let Some(readiness) = &readiness {
+                readiness.ready();
+            }
         }
 
         let addr: SocketAddr = (host, port).into();
@@ -475,8 +681,13 @@ fn main() {
             data_dir.display()
         );
         tokio::select! {
-            _ = engine_raw::serve(store, listener) => {}
+            _ = engine_raw::serve(store, listener, readiness.clone()) => {}
             _ = shutdown_signal() => {
+                if let Some(readiness) = &readiness {
+                    // Stop advertising readiness before accepting drain work or
+                    // touching the committer/lock shutdown sequence.
+                    readiness.stopping();
+                }
                 // Stop accepting (the serve future is dropped here), let in-flight
                 // requests — including their group-commit fsync — finish, then flush
                 // telemetry. Bounded so a stuck request can't block shutdown forever.
@@ -521,8 +732,7 @@ const CHECKPOINT_POLL: std::time::Duration = std::time::Duration::from_millis(25
 /// checkpoints for that shard only.
 fn spawn_checkpoint_ticker(walset: Arc<wal::walset::WalSet>) {
     tokio::spawn(async move {
-        let interval =
-            std::time::Duration::from_millis(wal::shard::checkpoint_interval_ms());
+        let interval = std::time::Duration::from_millis(wal::shard::checkpoint_interval_ms());
         let wal_bytes = wal::shard::checkpoint_wal_bytes();
         let n = walset.shards().len();
         let mut last_done: Vec<std::time::Instant> = vec![std::time::Instant::now(); n];

@@ -93,7 +93,7 @@ pub async fn drain(grace: std::time::Duration) {
     let _ = tokio::time::timeout(grace, sema.acquire_many(MAX_CONNECTIONS as u32)).await;
 }
 
-pub async fn serve(store: Arc<Store>, listener: TcpListener) {
+pub async fn serve(store: Arc<Store>, listener: TcpListener, admin: Option<Arc<crate::admin_readiness::AdminReadiness>>) {
     let conns = conn_limiter().clone();
     loop {
         let (stream, _) = match listener.accept().await {
@@ -152,12 +152,13 @@ pub async fn serve(store: Arc<Store>, listener: TcpListener) {
             continue;
         };
         let store = store.clone();
+        let admin = admin.clone();
         tokio::spawn(async move {
             // The permit is moved INTO conn_loop so it can hand it on to a
             // detached SSE streaming task (keeping the connection counted while
             // the big conn_loop future is freed); otherwise it is released when
             // conn_loop returns.
-            let _ = conn_loop(store, stream, permit).await;
+            let _ = conn_loop(store, stream, permit, admin).await;
         });
     }
 }
@@ -166,6 +167,7 @@ async fn conn_loop(
     store: Arc<Store>,
     mut stream: TcpStream,
     permit: tokio::sync::OwnedSemaphorePermit,
+    admin: Option<Arc<crate::admin_readiness::AdminReadiness>>,
 ) -> std::io::Result<()> {
     const BAD_REQUEST: &[u8] =
         b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
@@ -230,7 +232,7 @@ async fn conn_loop(
             headers: head.headers,
             body,
         };
-        let resp = handlers::handle(store.clone(), req).await;
+        let resp = handlers::handle_with_admin(store.clone(), req, admin.clone()).await;
         // SSE: hand the connection off to a DETACHED, minimal streaming task and
         // return. An SSE subscriber parks for up to SSE_MAX_DURATION; driving it
         // inline would keep this whole `conn_loop` future (sized to the largest
