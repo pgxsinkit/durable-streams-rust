@@ -104,7 +104,12 @@ struct Slot {
 /// (and the connection-limiter permit, so the connection stays counted) — the
 /// tokio task returns immediately afterward. Best-effort: a fd-extraction failure
 /// just drops the connection.
-pub fn register(stream: tokio::net::TcpStream, head: Vec<u8>, reg: SseReg, permit: tokio::sync::OwnedSemaphorePermit) {
+pub fn register(
+    stream: tokio::net::TcpStream,
+    head: Vec<u8>,
+    reg: SseReg,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
     let std_stream = match stream.into_std() {
         Ok(s) => s,
         Err(_) => return,
@@ -152,7 +157,11 @@ pub fn wake_stream(st: &StreamState) {
         // Subscribers exist only because `register` ran, so the pool is live.
         let pool = pool();
         for h in &list.subs {
-            pool[h.shard as usize].wake.lock().unwrap().push((h.key, h.gen));
+            pool[h.shard as usize]
+                .wake
+                .lock()
+                .unwrap()
+                .push((h.key, h.gen));
             if !to_signal.contains(&h.shard) {
                 to_signal.push(h.shard);
             }
@@ -373,7 +382,12 @@ impl Reactor {
         loop {
             let (file, file_base, tail, closed) = {
                 let s = sub.st.shared.read().unwrap();
-                (s.file.clone(), s.file_base, s.durable_tail, s.closed_durable)
+                (
+                    s.file.clone(),
+                    s.file_base,
+                    s.durable_tail,
+                    s.closed_durable,
+                )
             };
             if tail > sub.write_off {
                 if sub.write_off < file_base {
@@ -433,11 +447,7 @@ impl Reactor {
             }
             // Caught up at the live tail with nothing pending: emit the one-shot
             // initial control (parity with the inline path) then go idle.
-            if !sub.sent_initial
-                && sub.write_off == sub.start
-                && tail == sub.start
-                && !closed
-            {
+            if !sub.sent_initial && sub.write_off == sub.start && tail == sub.start && !closed {
                 let mut ev = String::new();
                 crate::handlers::sse_control_event(
                     &mut ev,
@@ -464,9 +474,7 @@ impl Reactor {
         };
         while sub.sent < sub.pending.len() {
             let buf = &sub.pending[sub.sent..];
-            let n = unsafe {
-                libc::write(sub.fd, buf.as_ptr() as *const libc::c_void, buf.len())
-            };
+            let n = unsafe { libc::write(sub.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
             if n > 0 {
                 sub.sent += n as usize;
                 continue;
@@ -557,10 +565,7 @@ impl Reactor {
                 self.flush(key);
                 continue;
             }
-            if backlog(sub) == 0
-                && !sub.done
-                && now.duration_since(sub.last_event) >= KEEPALIVE
-            {
+            if backlog(sub) == 0 && !sub.done && now.duration_since(sub.last_event) >= KEEPALIVE {
                 let sub = self.slab[key as usize].sub.as_mut().unwrap();
                 let mut ev = String::new();
                 crate::handlers::sse_control_event(
@@ -592,7 +597,8 @@ impl Reactor {
         {
             let mut g = sub.st.sse_subs.lock().unwrap();
             if let Some(list) = g.as_mut() {
-                list.subs.retain(|h| !(h.shard == shard_idx && h.key == key));
+                list.subs
+                    .retain(|h| !(h.shard == shard_idx && h.key == key));
                 if list.subs.is_empty() {
                     *g = None;
                 }

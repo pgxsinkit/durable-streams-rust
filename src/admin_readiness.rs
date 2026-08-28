@@ -164,12 +164,27 @@ static TEST_FILESYSTEM_FREE: std::sync::Mutex<Option<(u64, u64)>> = std::sync::M
 mod tests {
     use super::*;
     fn manifest() -> StoreManifestV1 {
-        StoreManifestV1 { store_id: "2bc96d0b-9740-4f50-97c6-754b2b27d6b0".into(), store_generation: "ff8b5fa6-e786-4994-8da0-f14e9e79f318".into(), protocol_version: 1, layout_version: 1, durability_mode: "wal".into(), wal_shard_count: 1, stream_lane_count: 1, filesystem_uuid: "253f14d5-cbee-4df8-9e3c-e44c6e41501b".into(), creation_time: "2026-08-27T19:00:00Z".into() }
+        StoreManifestV1 {
+            store_id: "2bc96d0b-9740-4f50-97c6-754b2b27d6b0".into(),
+            store_generation: "ff8b5fa6-e786-4994-8da0-f14e9e79f318".into(),
+            protocol_version: 1,
+            layout_version: 1,
+            durability_mode: "wal".into(),
+            wal_shard_count: 1,
+            stream_lane_count: 1,
+            filesystem_uuid: "253f14d5-cbee-4df8-9e3c-e44c6e41501b".into(),
+            creation_time: "2026-08-27T19:00:00Z".into(),
+        }
     }
     #[test]
     fn reserve_failed_readiness_is_503_and_never_ready() {
         *TEST_FILESYSTEM_FREE.lock().unwrap() = Some((1, 1));
-        let readiness = AdminReadiness::new(manifest(), "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(), 2, 2);
+        let readiness = AdminReadiness::new(
+            manifest(),
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            2,
+            2,
+        );
         readiness.ready();
         let (status, body) = readiness.json(std::path::Path::new("."));
         *TEST_FILESYSTEM_FREE.lock().unwrap() = None;

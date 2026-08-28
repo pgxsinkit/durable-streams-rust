@@ -24,7 +24,9 @@ mod imp {
     use opentelemetry::metrics::{Counter, Histogram, Meter};
     use opentelemetry::{global, KeyValue};
     use opentelemetry_otlp::{MetricExporter, SpanExporter};
-    use opentelemetry_sdk::metrics::{Instrument, PeriodicReader, SdkMeterProvider, Stream, Temporality};
+    use opentelemetry_sdk::metrics::{
+        Instrument, PeriodicReader, SdkMeterProvider, Stream, Temporality,
+    };
     use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
     use opentelemetry_sdk::Resource;
     use tracing_subscriber::layer::SubscriberExt;
@@ -162,7 +164,10 @@ mod imp {
     }
 
     /// Explicit-bucket view for the named instrument (boundaries in `buckets`).
-    fn bucket_view(name: &'static str, buckets: &'static [f64]) -> impl Fn(&Instrument) -> Option<Stream> {
+    fn bucket_view(
+        name: &'static str,
+        buckets: &'static [f64],
+    ) -> impl Fn(&Instrument) -> Option<Stream> {
         move |i: &Instrument| {
             if i.name() == name {
                 Some(

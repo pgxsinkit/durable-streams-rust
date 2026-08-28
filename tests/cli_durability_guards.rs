@@ -87,7 +87,10 @@ fn wal_args(dir: &std::path::Path, port: &str) -> Vec<String> {
 }
 
 fn replace_arg(args: &mut [String], flag: &str, value: &str) {
-    let index = args.iter().position(|argument| argument == flag).expect("flag present");
+    let index = args
+        .iter()
+        .position(|argument| argument == flag)
+        .expect("flag present");
     args[index + 1] = value.to_string();
 }
 
@@ -241,8 +244,37 @@ fn bootstrap_refuses_every_preexisting_store_state_class() {
         } else {
             std::fs::create_dir(dir.join(class)).unwrap();
         }
-        let out = server().args(["bootstrap-store", "--data-dir"]).arg(&dir).args(["--store-id", STORE_ID, "--store-generation", STORE_GENERATION, "--protocol-version", "1", "--layout-version", "1", "--durability-mode", "wal", "--wal-shards", "1", "--stream-lanes", "1", "--filesystem-uuid", FILESYSTEM_UUID, "--creation-time", "2026-08-27T19:00:00Z"]).output().expect("bootstrap refusal");
-        assert_eq!(out.status.code(), Some(2), "{class}: {}", String::from_utf8_lossy(&out.stderr));
+        let out = server()
+            .args(["bootstrap-store", "--data-dir"])
+            .arg(&dir)
+            .args([
+                "--store-id",
+                STORE_ID,
+                "--store-generation",
+                STORE_GENERATION,
+                "--protocol-version",
+                "1",
+                "--layout-version",
+                "1",
+                "--durability-mode",
+                "wal",
+                "--wal-shards",
+                "1",
+                "--stream-lanes",
+                "1",
+                "--filesystem-uuid",
+                FILESYSTEM_UUID,
+                "--creation-time",
+                "2026-08-27T19:00:00Z",
+            ])
+            .output()
+            .expect("bootstrap refusal");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{class}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -252,15 +284,28 @@ fn acknowledged_append_survives_kill_and_real_cli_restart() {
     let dir = std::env::temp_dir().join("ds-rust-cli-ack-recovery");
     let _ = std::fs::remove_dir_all(&dir);
     bootstrap(&dir);
-    let mut first = server().args(wal_args(&dir, "14980")).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("first server");
+    let mut first = server()
+        .args(wal_args(&dir, "14980"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("first server");
     let created = http_response(14980, "PUT /recovery HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: 0\r\n\r\n");
     assert!(created.starts_with("HTTP/1.1 201"), "{created}");
     let appended = http_response(14980, "POST /recovery HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\n\r\nack");
     assert!(appended.starts_with("HTTP/1.1 204"), "{appended}");
     let _ = first.kill();
     let _ = first.wait();
-    let mut second = server().args(wal_args(&dir, "14981")).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("restarted server");
-    let recovered = http_response(14981, "GET /recovery HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let mut second = server()
+        .args(wal_args(&dir, "14981"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("restarted server");
+    let recovered = http_response(
+        14981,
+        "GET /recovery HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
     assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
     assert!(recovered.ends_with("ack"), "{recovered}");
     let _ = second.kill();

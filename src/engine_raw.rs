@@ -93,7 +93,11 @@ pub async fn drain(grace: std::time::Duration) {
     let _ = tokio::time::timeout(grace, sema.acquire_many(MAX_CONNECTIONS as u32)).await;
 }
 
-pub async fn serve(store: Arc<Store>, listener: TcpListener, admin: Option<Arc<crate::admin_readiness::AdminReadiness>>) {
+pub async fn serve(
+    store: Arc<Store>,
+    listener: TcpListener,
+    admin: Option<Arc<crate::admin_readiness::AdminReadiness>>,
+) {
     let conns = conn_limiter().clone();
     loop {
         let (stream, _) = match listener.accept().await {
@@ -192,7 +196,10 @@ async fn conn_loop(
 
         // Reject an over-limit declared body before sending 100-continue or
         // reading anything (RFC 9110 §10.1.1 permits a 4xx instead of 100).
-        if head.content_length.is_some_and(|n| n > crate::api::MAX_BODY_BYTES) {
+        if head
+            .content_length
+            .is_some_and(|n| n > crate::api::MAX_BODY_BYTES)
+        {
             let _ = stream.write_all(TOO_LARGE).await;
             return Ok(());
         }
@@ -261,11 +268,11 @@ async fn conn_loop(
         if matches!(resp.body, Body::Sse(_)) {
             tokio::spawn(async move {
                 let _permit = permit; // keep the connection counted until it ends
-                // Pass the request's `keep_alive` (true for a normal SSE GET) so
-                // the framing matches the inline path: `handle_sse` already sets
-                // `Connection: keep-alive`, and `write_head` must not also emit a
-                // `Connection: close`. The socket is closed when this task ends
-                // (it never loops back), so the stream still terminates cleanly.
+                                      // Pass the request's `keep_alive` (true for a normal SSE GET) so
+                                      // the framing matches the inline path: `handle_sse` already sets
+                                      // `Connection: keep-alive`, and `write_head` must not also emit a
+                                      // `Connection: close`. The socket is closed when this task ends
+                                      // (it never loops back), so the stream still terminates cleanly.
                 let _ = write_response(&mut stream, resp, is_head, keep_alive).await;
             });
             return Ok(());
@@ -514,8 +521,7 @@ async fn write_segment(stream: &mut TcpStream, seg: &Segment) -> std::io::Result
         stream.writable().await?;
         let count = (end - offset) as usize;
         let res = stream.try_io(tokio::io::Interest::WRITABLE, || {
-            let sent =
-                unsafe { libc::sendfile(stream.as_raw_fd(), file_fd, &mut offset, count) };
+            let sent = unsafe { libc::sendfile(stream.as_raw_fd(), file_fd, &mut offset, count) };
             if sent < 0 {
                 Err(std::io::Error::last_os_error())
             } else {

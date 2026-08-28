@@ -483,7 +483,9 @@ fn main() {
     };
 
     let manifest = if handlers::durability() == handlers::DurabilityMode::Wal {
-        if minimum_free_bytes < DEFAULT_MINIMUM_FREE_BYTES || minimum_free_inodes < DEFAULT_MINIMUM_FREE_INODES {
+        if minimum_free_bytes < DEFAULT_MINIMUM_FREE_BYTES
+            || minimum_free_inodes < DEFAULT_MINIMUM_FREE_INODES
+        {
             exit_usage(format!(
                 "WAL pilot reserve cannot be lowered below {DEFAULT_MINIMUM_FREE_BYTES} bytes and {DEFAULT_MINIMUM_FREE_INODES} inodes"
             ));
