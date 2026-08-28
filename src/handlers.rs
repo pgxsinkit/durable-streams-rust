@@ -288,7 +288,9 @@ async fn dispatch(
             return text_response(400, "encoded admin route aliases are forbidden");
         }
     }
-    if path == "/health" {
+    if req.method == Method::Options {
+        cors_preflight()
+    } else if path == "/health" {
         text_response(200, "ok")
     } else if path.starts_with("/_admin/") {
         match (path.as_str(), req.method, admin) {
@@ -307,6 +309,8 @@ async fn dispatch(
             (_, Method::Get, _) => text_response(404, "admin endpoint not found"),
             _ => text_response(405, "admin endpoints are read-only"),
         }
+    } else if crate::subscriptions::is_control_path(&path) {
+        store.subscriptions.clone().handle(store, req).await
     } else {
         match req.method {
             Method::Put => handle_create(store, req, path).await,
@@ -314,9 +318,49 @@ async fn dispatch(
             Method::Get => handle_read(store, req, path).await,
             Method::Head => handle_head(store, path),
             Method::Delete => handle_delete(store, path).await,
-            Method::Options => ResponseBuilder::new(204).body(empty()),
+            Method::Options => unreachable!("OPTIONS handled before route dispatch"),
             Method::Other => text_response(405, "method not allowed"),
         }
+    }
+}
+
+/// Advertise the request headers understood by the protocol without granting
+/// cross-origin access. An operator that intentionally exposes browser access
+/// can add an origin policy at the authenticated edge; the storage process must
+/// not make every stream and control route readable with `allow-origin: *`.
+fn cors_preflight() -> Resp {
+    ResponseBuilder::new(204)
+        .hs(
+            "access-control-allow-methods",
+            "GET, POST, PUT, DELETE, HEAD, OPTIONS",
+        )
+        .hs(
+            "access-control-allow-headers",
+            "content-type, authorization, If-None-Match, Stream-Seq, Stream-TTL, Stream-Expires-At, Stream-Closed, Producer-Id, Producer-Epoch, Producer-Seq, Stream-Forked-From, Stream-Fork-Offset, Stream-Fork-Sub-Offset",
+        )
+        .body(empty())
+}
+
+#[cfg(test)]
+mod cors_policy_tests {
+    use super::*;
+
+    #[test]
+    fn preflight_advertises_headers_without_granting_cross_origin_reads() {
+        let response = cors_preflight();
+        assert_eq!(response.status, 204);
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| *name == "access-control-allow-headers"
+                && value.to_ascii_lowercase().contains("if-none-match")));
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(name, _)| *name == "access-control-allow-origin"));
+        assert!(!crate::api::SECURITY_HEADERS
+            .iter()
+            .any(|(name, _)| *name == "access-control-allow-origin"));
     }
 }
 
@@ -698,6 +742,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             b.body(empty())
         }
         CreateResult::Created(st) => {
+            let notify_subscription = wire.is_some();
             if let Some(wire) = wire {
                 let lock_t0 = crate::telemetry::Timer::start();
                 let mut ap = st.appender.lock().await;
@@ -737,6 +782,13 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                 }
                 // Durable now (wal) / page-cache written (memory): expose to readers.
                 publish_durable_tail(&store, &st, new_tail, &wire);
+            }
+            if notify_subscription {
+                store
+                    .subscriptions
+                    .clone()
+                    .on_stream_append(store.clone(), &st.path)
+                    .await;
             }
             let t = st.tail();
             let mut b = ResponseBuilder::new(201)
@@ -1051,7 +1103,7 @@ async fn handle_append(store: Arc<Store>, req: Req, path: String) -> Resp {
     // is_json comes back from the inner handler (false on the not-found path) so
     // the metric label doesn't cost a SECOND registry lookup per append — at high
     // stream cardinality each lookup is a cold walk of a million-key map.
-    let (resp, outcome, is_json) = handle_append_inner(store, req, path).await;
+    let (resp, outcome, is_json) = handle_append_inner(store, req, path, true).await;
     crate::telemetry::record_append(t0.elapsed_secs(), outcome.label(), is_json);
     resp
 }
@@ -1060,6 +1112,7 @@ async fn handle_append_inner(
     store: Arc<Store>,
     req: Req,
     path: String,
+    notify_subscriptions: bool,
 ) -> (Resp, AppendOutcome, bool) {
     use AppendOutcome::*;
     // Load-telemetry probe: bumps the in-flight gauge and records service time on
@@ -1280,6 +1333,12 @@ async fn handle_append_inner(
         producer.is_some() || seq_header.is_some() || st.config.ttl_seconds.is_some();
     {
         let mut s = st.shared.write().unwrap();
+        // A body append refreshes last_access in write_wire. A close-only POST
+        // has no wire bytes, but it is still a successful write operation and
+        // therefore MUST slide a Stream-TTL window as well.
+        if close_req && wire.is_empty() {
+            s.last_access = SystemTime::now();
+        }
         if let Some(p) = &producer {
             s.producers.insert(
                 p.id.clone(),
@@ -1432,6 +1491,13 @@ async fn handle_append_inner(
     if !wire.is_empty() {
         maybe_seal_bg(&store, &st);
     }
+    if notify_subscriptions && new_tail.is_some() {
+        store
+            .subscriptions
+            .clone()
+            .on_stream_append(store.clone(), &st.path)
+            .await;
+    }
 
     let tail = st.tail();
     let status = if producer.is_some() && !body.is_empty() {
@@ -1449,6 +1515,26 @@ async fn handle_append_inner(
         b = b.hs(H_CLOSED, "true");
     }
     (b.body(empty()), Accept, is_json)
+}
+
+/// Append one pull-wake control event through the ordinary JSON append path.
+/// The caller deliberately owns subscription notification: wake streams are
+/// regular streams, but this internal write must not recursively re-enter the
+/// subscription manager while it is delivering a wake.
+pub(crate) async fn append_subscription_wake(
+    store: Arc<Store>,
+    path: String,
+    event: serde_json::Value,
+) -> bool {
+    let req = Req {
+        method: Method::Post,
+        path: path.clone(),
+        query: None,
+        headers: vec![("content-type".to_string(), "application/json".to_string())],
+        body: Bytes::from(event.to_string()),
+    };
+    let (response, _, _) = handle_append_inner(store, req, path, false).await;
+    (200..300).contains(&response.status)
 }
 
 fn closed_conflict(tail: u64) -> Resp {
@@ -2283,7 +2369,14 @@ async fn handle_delete(store: Arc<Store>, path: String) -> Resp {
     let store2 = Arc::clone(&store);
     let st2 = Arc::clone(&st);
     match tokio::task::spawn_blocking(move || store2.delete_or_soft_delete_durable(&st2)).await {
-        Ok(Ok(())) => ResponseBuilder::new(204).body(empty()),
+        Ok(Ok(())) => {
+            store
+                .subscriptions
+                .clone()
+                .on_stream_deleted(store.clone(), &path)
+                .await;
+            ResponseBuilder::new(204).body(empty())
+        }
         _ => text_response(500, "delete not durable"),
     }
 }
@@ -2479,8 +2572,10 @@ mod bug1_tests {
     use crate::blobstore::{BlobStore, BoxFuture};
     use crate::store::{CreateResult, ResolvedSlice, Store, StreamConfig};
     use crate::tier::TierConfig;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Clone, Copy)]
     enum Mode {
@@ -2537,13 +2632,15 @@ mod bug1_tests {
     /// Drive `stream_resolved_body` over a single 100-byte Remote slice backed by
     /// a `TestBlob` in `mode`; return (bytes delivered, failed-flag).
     async fn run(mode: Mode) -> (usize, bool) {
+        // Store layout/durability knobs are process-global startup settings.
+        // Serialize with the lane-layout WAL tests that temporarily change
+        // them, otherwise a parallel Store::new can observe the wrong lane
+        // count and fail nondeterministically.
+        let _guard = test_support::DurabilityGuard::wal();
         let dir = std::env::temp_dir().join(format!(
             "ds-bug1-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let mut store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
@@ -2607,13 +2704,11 @@ mod bug1_tests {
     /// truncated/errored cold read as `Err` — not silently return short bytes
     /// that a caller would treat as a complete (advanced) read.
     async fn run_buffered(mode: Mode) -> std::io::Result<bytes::Bytes> {
+        let _guard = test_support::DurabilityGuard::wal();
         let dir = std::env::temp_dir().join(format!(
             "ds-h4-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let mut store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();

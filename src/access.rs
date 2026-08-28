@@ -105,6 +105,11 @@ pub struct Rule {
     pub methods: Vec<String>,
     #[serde(default)]
     pub admin: bool,
+    /// Control rules are the only rules allowed to match a reserved `__ds`
+    /// route. This keeps an existing broad data prefix from silently gaining
+    /// subscription-management authority when the server is upgraded.
+    #[serde(default)]
+    pub control: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -250,8 +255,10 @@ impl AccessPolicy {
         method: &str,
         path: &str,
     ) -> Result<Authorization, PolicyError> {
+        let is_control = crate::reserved_paths::is_control_path(path);
         let mut matching_rules = identity.rules.iter().filter(|rule| {
-            rule.methods.iter().any(|allowed| allowed == method)
+            rule.control == is_control
+                && rule.methods.iter().any(|allowed| allowed == method)
                 && match rule.match_kind {
                     MatchKind::Exact => rule.path == path,
                     MatchKind::Prefix => path.starts_with(&rule.path),
@@ -1083,6 +1090,12 @@ fn validate_identity(identity: &mut IdentityPolicy) -> Result<(), PolicyError> {
                 rule.path
             )));
         }
+        if rule.control && rule.admin {
+            return Err(PolicyError(format!(
+                "control rules are data-capacity rules and must not be admin: {:?}",
+                rule.path
+            )));
+        }
         if !rule.admin && rule.match_kind == MatchKind::Prefix && "/_admin/".starts_with(&rule.path)
         {
             return Err(PolicyError(format!(
@@ -1117,6 +1130,11 @@ fn validate_identity(identity: &mut IdentityPolicy) -> Result<(), PolicyError> {
     }
     for (index, left) in identity.rules.iter().enumerate() {
         for right in identity.rules.iter().skip(index + 1) {
+            // Control and ordinary data rules occupy disjoint route spaces, so
+            // they may deliberately use the same root prefix.
+            if left.control != right.control {
+                continue;
+            }
             let methods_overlap = left
                 .methods
                 .iter()
@@ -1226,6 +1244,44 @@ mod tests {
                 "/circuits/v1/dev/stores/generation-a/catalog",
             )
             .is_err());
+        assert!(policy
+            .authorize(
+                &["spiffe://indexed/dev/agent-writer"],
+                "POST",
+                "/agent-runs/v1/dev/__ds/subscriptions/sub-1/claim",
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn control_routes_require_an_explicit_control_rule() {
+        let policy = AccessPolicy::from_json(
+            br#"{
+              "version": 1,
+              "global": {"data_concurrency": 2, "admin_concurrency": 1},
+              "identities": [{
+                "name":"worker",
+                "uri_sans":["spiffe://worker"],
+                "max_concurrency":2,
+                "rules":[
+                  {"match":"prefix","path":"/root/","methods":["GET","POST"]},
+                  {"match":"prefix","path":"/root/","methods":["GET","POST"],"control":true}
+                ]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(policy
+            .authorize(&["spiffe://worker"], "GET", "/root/events/a")
+            .is_ok());
+        assert!(policy
+            .authorize(
+                &["spiffe://worker"],
+                "POST",
+                "/root/__ds/subscriptions/sub-1/claim",
+            )
+            .is_ok());
     }
 
     #[test]

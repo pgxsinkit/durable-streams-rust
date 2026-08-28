@@ -495,6 +495,7 @@ pub struct Store {
     /// (`sweep_meta_once`). The `meta_dirty` CAS in `mark_meta_dirty` keeps
     /// each stream in here at most once per sweep cycle (#4691).
     pub meta_sweep: StdMutex<Vec<Arc<StreamState>>>,
+    pub subscriptions: Arc<crate::subscriptions::SubscriptionManager>,
     inventory: RwLock<InventoryProjection>,
 }
 
@@ -730,6 +731,7 @@ impl Store {
             blobstore,
             wal: std::sync::OnceLock::new(),
             meta_sweep: StdMutex::new(Vec::new()),
+            subscriptions: Arc::new(crate::subscriptions::SubscriptionManager::new()?),
             inventory: RwLock::new(InventoryProjection {
                 generation: 0,
                 entries: BTreeMap::new(),

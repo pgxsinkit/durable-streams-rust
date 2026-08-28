@@ -367,13 +367,29 @@ fn readiness_is_attested_and_admin_paths_are_reserved() {
         14977,
         "GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
-    assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
+    assert!(
+        ready.starts_with("HTTP/1.1 200") || ready.starts_with("HTTP/1.1 503"),
+        "{ready}"
+    );
     assert!(
         ready.contains("\"contract_version\":\"durable-streams-store-ready-v1\""),
         "{ready}"
     );
     assert!(ready.contains(DIGEST), "{ready}");
-    assert!(ready.contains("\"status\":\"ready\""), "{ready}");
+    if ready.starts_with("HTTP/1.1 200") {
+        assert!(ready.contains("\"status\":\"ready\""), "{ready}");
+    } else {
+        // Readiness is intentionally 503 when the test filesystem has less
+        // than the production 20 GiB reserve. The attestation must still be
+        // complete, recovery must have finished, and only the reserve check may
+        // keep the server non-ready.
+        assert!(ready.contains("\"status\":\"starting\""), "{ready}");
+        assert!(
+            ready.contains("\"recovery\":{\"completed\":true"),
+            "{ready}"
+        );
+        assert!(ready.contains("\"satisfied\":false"), "{ready}");
+    }
     let reserved = http_response(14977, "PUT /_admin/a-user-stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
     assert!(reserved.starts_with("HTTP/1.1 405"), "{reserved}");
     let _ = child.kill();

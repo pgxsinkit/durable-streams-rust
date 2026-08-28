@@ -5,11 +5,13 @@ mod data_dir_lock;
 mod engine_raw;
 mod handlers;
 mod http1;
+mod reserved_paths;
 mod srvstats;
 #[cfg(target_os = "linux")]
 mod sse_reactor;
 mod store;
 mod store_manifest;
+mod subscriptions;
 mod telemetry;
 mod tier;
 mod wal;

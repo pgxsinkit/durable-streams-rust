@@ -79,9 +79,13 @@ never ran the six tests it added. Three of them fail — inherited gaps upstream
 - **#1** — a close-only `POST` does not slide the TTL window (two tests).
 - **#2** — `OPTIONS` preflight returns no CORS headers at all (one test).
 
-The dependency is now pinned to an exact version rather than a caret range, so moving the contract
-is a visible commit rather than an install-time surprise. **CI is red on conformance until #1 and #2
-are closed**; that is the accurate state, not a broken pipeline.
+The dependency is pinned to an exact version rather than a caret range, so moving the contract is a
+visible commit rather than an install-time surprise. The later protocol-alignment pass closed both
+inherited gaps, enabled the reserved-subscription suite, and brought the current result to **338
+passed, 0 failed, 0 skipped**. See `docs/protocol-alignment.md`; the table above remains the measured
+fork-point baseline. That pass also moved `reqwest` from a test-only dependency to a runtime
+dependency for outbound webhook delivery and added direct `ring` use for Ed25519 signatures and
+fenced callback tokens; these are intentional production dependency-surface changes.
 
 ## Open decisions
 

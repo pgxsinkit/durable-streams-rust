@@ -30,6 +30,8 @@ serde_json = { version = "1", features = ["raw_value"] }
 httparse = "1"
 libc = "0.2"
 percent-encoding = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ring = "0.17"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "tokio"] }
@@ -39,7 +41,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 x509-parser = "0.17"
 # x509-parser accepts the whole 0.3 line; pin its time dependency to the last release supporting
 # this crate's documented Rust 1.75 minimum instead of letting a lock refresh silently raise it.
-time = "=0.3.36"
+time = { version = "=0.3.36", features = ["formatting"] }
 
 # CRC32C (hardware-accelerated where available) for WAL record header framing.
 # Header-only checksum — see the durable-wal-v2 design spec §4 (B-light framing).
@@ -86,7 +88,6 @@ tier = ["dep:object_store"]
 
 [dev-dependencies]
 rcgen = "0.13"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tempfile = "3"
 
 [profile.release]

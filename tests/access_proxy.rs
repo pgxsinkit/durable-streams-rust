@@ -388,17 +388,25 @@ async fn mtls_proxy_streams_enforces_scope_rotates_certificates_and_surfaces_ups
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     let administrator = client(&ca.pem(), Some(&storage_administrator));
-    let administrator_status = administrator
+    let administrator_response = administrator
         .get(format!("https://{proxy_address}/_admin/ready"))
         .send()
         .await
-        .unwrap()
-        .status();
-    assert_eq!(
-        administrator_status,
-        200,
-        "an agent identity at its connection limit must not consume administrator capacity; got {administrator_status}"
+        .unwrap();
+    let administrator_status = administrator_response.status();
+    let administrator_body = administrator_response.text().await.unwrap();
+    assert!(
+        administrator_status == 200 || administrator_status == 503,
+        "the administrator request must reach the readiness endpoint rather than be capacity-rejected; got {administrator_status}: {administrator_body}"
     );
+    if administrator_status == 503 {
+        assert!(
+            administrator_body.contains("\"status\":\"starting\"")
+                && administrator_body.contains("\"recovery\":{\"completed\":true")
+                && administrator_body.contains("\"satisfied\":false"),
+            "a 503 is acceptable here only when the local test filesystem is below the production reserve: {administrator_body}"
+        );
+    }
     for request in agent_long_polls {
         request.abort();
     }

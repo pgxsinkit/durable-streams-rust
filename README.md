@@ -174,6 +174,26 @@ conformance suite once per configuration (the `conformance` matrix in
 
 Core protocol: create / append / read (catch-up, long-poll, SSE), HEAD, DELETE, JSON mode, idempotent producers (`Producer-Id` / `Producer-Epoch` / `Stream-Seq`), close, TTL / expiry, cursors, ETags / 304, security headers, and stream forks.
 
+Reserved subscription APIs: webhook and pull-wake subscriptions, glob/explicit membership, Ed25519/JWKS webhook signing, callback fencing, and claim/ack/release leases. Pull-wake lets a worker tail one wake stream and fetch only source streams with pending work; it does not multiplex the source payloads themselves onto that connection. The current subscription metadata is process-local, so this surface is conformance-complete but not yet production-durable across restarts. See [protocol alignment and remaining gaps](docs/protocol-alignment.md).
+
+Webhook subscriptions require `DS_PUBLIC_BASE_URL` to be set to the trusted
+external origin, for example `https://streams.internal.example`. Pull-wake
+subscriptions require an existing open `application/json` wake stream. When
+using `durable-streams-access`, subscription routes are denied by ordinary data
+rules and require an explicit rule such as:
+
+```json
+{
+  "match": "prefix",
+  "path": "/circuits/v1/dev/stores/replace-with-store-generation/",
+  "methods": ["GET", "PUT", "POST", "DELETE"],
+  "control": true
+}
+```
+
+Do not grant that rule until the identity is intended to manage subscriptions;
+service-JWT validation on `claim` remains an explicitly documented gap.
+
 Durable: in `wal` mode (the default), an append returns only after its record is durable in the sharded write-ahead log (WAL). The WAL acks on a group-commit `fdatasync` and recovers cleanly on restart: every WAL record carries both a header CRC32C (torn-header detector — a partially-written header fails immediately) and a payload CRC32C verified on recovery, so no torn or zeroed record is ever replayed. State survives restarts — on boot the store rebuilds every stream from its data file plus a `.meta` sidecar, re-links fork chains, and replays the WAL to reconcile any un-checkpointed tail. (Crash window per [PROTOCOL.md](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md): producer dedup state may lag the data file, so producers should bump their epoch on restart.)
 
 In `memory` mode there is no WAL and no WAL replay. Recovery is a sidecar pass: each stream is rebuilt from its per-stream data file and `.meta` sidecar; durability is delegated to (future) replication.
@@ -209,9 +229,7 @@ bun run test:conformance
 RUST_SERVER_URL=http://localhost:4562 bun run test:conformance
 ```
 
-The core protocol suite passes against conformance `0.3.5` (326 passed, 0 failed). Three tests added
-in `0.3.6` fail — a close-only `POST` does not slide the TTL window, and `OPTIONS` preflight returns
-no CORS headers. Both are inherited from upstream and tracked as issues; see PROVENANCE.md.
+The complete published conformance `0.3.6` contract passes: **338 passed, 0 failed, 0 skipped**, including all six reserved-subscription tests. The exact upstream revision, covered behavior, and protocol requirements not exercised by that suite are recorded in [docs/protocol-alignment.md](docs/protocol-alignment.md).
 
 ## Releasing
 
