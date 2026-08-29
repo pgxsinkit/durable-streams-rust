@@ -389,6 +389,8 @@ fn status_class(status: u16) -> &'static str {
 fn route_label(path: &str) -> &'static str {
     if path == "/health" {
         "/health"
+    } else if path == "/_admin/expiry" {
+        "/_admin/expiry"
     } else {
         "/<stream>"
     }
@@ -453,6 +455,14 @@ async fn dispatch(
             }
             ("/_admin/inventory", Method::Get, Some(_)) => {
                 inventory_response(&store, req.query.as_deref())
+            }
+            ("/_admin/expiry", Method::Get, Some(admin)) => {
+                let mut response = Resp::new(200);
+                response
+                    .headers
+                    .push(("content-type", "application/json".to_string()));
+                response.body = full(admin.expiry_json(&store));
+                response
             }
             (_, Method::Get, _) => text_response(404, "admin endpoint not found"),
             _ => text_response(405, "admin endpoints are read-only"),
@@ -4564,6 +4574,7 @@ mod admin_inventory_tests {
     use super::*;
     use crate::api::Body;
     use crate::store::{CreateResult, Store, StreamConfig};
+    use crate::store_manifest::StoreManifestV1;
     use crate::tier::TierConfig;
 
     fn stream_config() -> StreamConfig {
@@ -4577,6 +4588,101 @@ mod admin_inventory_tests {
             fork_offset_raw: None,
             fork_sub_offset: None,
         }
+    }
+
+    fn admin() -> Arc<crate::admin_readiness::AdminReadiness> {
+        Arc::new(crate::admin_readiness::AdminReadiness::new(
+            StoreManifestV1 {
+                store_id: "test-store".into(),
+                store_generation: "test-generation".into(),
+                protocol_version: 1,
+                layout_version: 1,
+                durability_mode: "memory".into(),
+                wal_shard_count: 0,
+                stream_lane_count: 1,
+                filesystem_uuid: "test-filesystem".into(),
+                creation_time: "1970-01-01T00:00:00Z".into(),
+            },
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            0,
+            0,
+        ))
+    }
+
+    fn admin_request(method: Method, path: &str) -> Req {
+        Req {
+            method,
+            path: path.into(),
+            query: None,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_admin_route_is_read_only_versioned_and_hidden_without_admin_context() {
+        let dir = std::env::temp_dir().join(format!("ds-admin-expiry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let response = handle_with_admin(
+            Arc::clone(&store),
+            admin_request(Method::Get, "/_admin/expiry"),
+            Some(admin()),
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| *name == "content-type" && value == "application/json"));
+        let Body::Full(body) = response.body else {
+            panic!("expiry response must be bounded JSON")
+        };
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["contract_version"], "durable-streams-expiry-status-v1");
+        assert!(body["scanner"].is_null());
+        assert!(body["retirement"].is_null());
+
+        assert_eq!(
+            handle_with_admin(
+                Arc::clone(&store),
+                admin_request(Method::Post, "/_admin/expiry"),
+                Some(admin()),
+            )
+            .await
+            .status,
+            405
+        );
+        assert_eq!(
+            handle_with_admin(
+                Arc::clone(&store),
+                admin_request(Method::Get, "/_admin/not-a-route"),
+                Some(admin()),
+            )
+            .await
+            .status,
+            404
+        );
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                admin_request(Method::Get, "/_admin/expiry")
+            )
+            .await
+            .status,
+            404
+        );
+        assert_eq!(
+            handle_with_admin(
+                Arc::clone(&store),
+                admin_request(Method::Get, "/_admin%2Fexpiry"),
+                Some(admin()),
+            )
+            .await
+            .status,
+            400
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

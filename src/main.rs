@@ -718,6 +718,9 @@ fn main() {
         // in this slice; 8dy is the sole future activation point for cleanup.
         let expiration_scanner =
             expiration::ExpirationScanner::start(&store, expiration_reaper_config);
+        if let Some(readiness) = &readiness {
+            readiness.attach_expiration_scanner(Arc::clone(expiration_scanner.status()));
+        }
         let retirement_for_shutdown = Arc::clone(
             store
                 .retirement_executor()
