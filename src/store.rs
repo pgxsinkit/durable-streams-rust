@@ -350,6 +350,23 @@ pub(crate) struct InflightAppendGuard {
     stream: Arc<StreamState>,
 }
 
+/// Holds a fork source live after appender-serialized liveness has won. It
+/// shares retirement's drain counter with append guards so a retirement fence
+/// cannot decide hard versus soft until the child has durably taken (or rolled
+/// back) its parent reference.
+pub(crate) struct ForkSourceLease {
+    _append: InflightAppendGuard,
+}
+
+impl ForkSourceLease {
+    pub(crate) fn begin(
+        stream: &Arc<StreamState>,
+        appender: &tokio::sync::MutexGuard<'_, Appender>,
+    ) -> Option<Self> {
+        InflightAppendGuard::begin(stream, appender).map(|append| Self { _append: append })
+    }
+}
+
 #[allow(dead_code)]
 impl InflightAppendGuard {
     pub(crate) fn begin(

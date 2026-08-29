@@ -171,6 +171,87 @@ mod append_fence_test_support {
     }
 }
 
+#[cfg(test)]
+mod fork_source_lease_test_support {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use tokio::sync::Barrier;
+
+    struct PauseState {
+        reached: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    static PAUSES: LazyLock<Mutex<HashMap<String, PauseState>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) struct ForkSourceLeasePause {
+        path: String,
+        reached: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    pub(super) fn pause_after_lease(path: &str) -> ForkSourceLeasePause {
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        PAUSES.lock().unwrap().insert(
+            path.to_string(),
+            PauseState {
+                reached: reached.clone(),
+                release: release.clone(),
+            },
+        );
+        ForkSourceLeasePause {
+            path: path.to_string(),
+            reached,
+            release,
+        }
+    }
+
+    impl ForkSourceLeasePause {
+        pub(super) async fn wait_until_held(&self) {
+            tokio::time::timeout(Duration::from_secs(5), self.reached.wait())
+                .await
+                .expect("fork source lease was not acquired");
+        }
+
+        pub(super) async fn release(&self) {
+            tokio::time::timeout(Duration::from_secs(5), self.release.wait())
+                .await
+                .expect("fork source lease did not resume");
+        }
+    }
+
+    impl Drop for ForkSourceLeasePause {
+        fn drop(&mut self) {
+            let mut pauses = PAUSES.lock().unwrap();
+            if pauses
+                .get(&self.path)
+                .is_some_and(|pause| Arc::ptr_eq(&pause.reached, &self.reached))
+            {
+                pauses.remove(&self.path);
+            }
+        }
+    }
+
+    pub(super) async fn wait_after_lease(stream: &StreamState) {
+        let barriers = PAUSES
+            .lock()
+            .unwrap()
+            .get(&stream.path)
+            .map(|pause| (pause.reached.clone(), pause.release.clone()));
+        if let Some((reached, release)) = barriers {
+            tokio::time::timeout(Duration::from_secs(5), reached.wait())
+                .await
+                .expect("fork source lease handler did not reach pause");
+            tokio::time::timeout(Duration::from_secs(5), release.wait())
+                .await
+                .expect("fork source lease handler was not released");
+        }
+    }
+}
+
 fn long_poll_timeout_dur() -> Duration {
     Duration::from_millis(LONG_POLL_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -676,14 +757,31 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
     let mut ttl_seconds = ttl_seconds;
     let mut expires_at = expires_at;
     let mut exp_raw = exp_raw;
+    let mut source_lease: Option<ForkSourceLease> = None;
     if let Some(src_path) = &forked_from {
-        let src = match store.get(src_path) {
+        let src = match store.registered_stream(src_path) {
             Some(s) => s,
             None => return text_response(404, "fork source not found"),
         };
-        if src.shared.read().unwrap().soft_deleted {
-            return text_response(409, "fork source is deleted");
+        let appender = src.appender.lock().await;
+        match store.liveness_while_appender_locked(&src, SystemTime::now()) {
+            AppenderLiveness::Missing => return text_response(404, "fork source not found"),
+            AppenderLiveness::Gone => return text_response(409, "fork source is deleted"),
+            AppenderLiveness::Expired => {
+                drop(appender);
+                let _ = store.retire_expiry(src).await;
+                return text_response(404, "fork source not found");
+            }
+            AppenderLiveness::Live => {
+                source_lease = ForkSourceLease::begin(&src, &appender);
+                drop(appender);
+                if source_lease.is_none() {
+                    return text_response(404, "fork source not found");
+                }
+            }
         }
+        #[cfg(test)]
+        fork_source_lease_test_support::wait_after_lease(&src).await;
         match &content_type_hdr {
             None => content_type = src.config.content_type.clone(),
             Some(ct) => {
@@ -789,32 +887,43 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             return text_response(409, "stream exists with different configuration")
         }
         PutTargetAdmission::Retryable => return retirement_retry_after("1"),
-        PutTargetAdmission::Expired(stream) => match store.retire_expiry(stream).await {
-            ExplicitRetirementResult::Owner(_) => {
-                match store.put_target_admission(&path, &config).await {
-                    PutTargetAdmission::Vacant => {}
-                    PutTargetAdmission::Compatible(st) => return existing_create_response(&st),
-                    PutTargetAdmission::Conflict => {
-                        return text_response(409, "stream exists with different configuration")
-                    }
-                    // This PUT has already performed its one expiry retirement;
-                    // do not adopt another incumbent or loop on a moving target.
-                    PutTargetAdmission::Expired(_) | PutTargetAdmission::Retryable => {
-                        return retirement_retry_after("1")
+        PutTargetAdmission::Expired(stream) => {
+            // A self-fork holds this exact source's lease. Retiring it here
+            // would fence and wait for the lease we still own, so leave it for
+            // the next request's source-liveness path instead.
+            if parent
+                .as_ref()
+                .is_some_and(|source| Arc::ptr_eq(source, &stream))
+            {
+                return retirement_retry_after("1");
+            }
+            match store.retire_expiry(stream).await {
+                ExplicitRetirementResult::Owner(_) => {
+                    match store.put_target_admission(&path, &config).await {
+                        PutTargetAdmission::Vacant => {}
+                        PutTargetAdmission::Compatible(st) => return existing_create_response(&st),
+                        PutTargetAdmission::Conflict => {
+                            return text_response(409, "stream exists with different configuration")
+                        }
+                        // This PUT has already performed its one expiry retirement;
+                        // do not adopt another incumbent or loop on a moving target.
+                        PutTargetAdmission::Expired(_) | PutTargetAdmission::Retryable => {
+                            return retirement_retry_after("1")
+                        }
                     }
                 }
+                // A retained fork tombstone is stable but cannot be re-created.
+                ExplicitRetirementResult::Gone => {
+                    return text_response(409, "stream exists with different configuration")
+                }
+                ExplicitRetirementResult::Existing(_)
+                | ExplicitRetirementResult::Missing
+                | ExplicitRetirementResult::Stale
+                | ExplicitRetirementResult::Rejected(_)
+                | ExplicitRetirementResult::Unavailable
+                | ExplicitRetirementResult::Cancelled(_) => return retirement_retry_after("1"),
             }
-            // A retained fork tombstone is stable but cannot be re-created.
-            ExplicitRetirementResult::Gone => {
-                return text_response(409, "stream exists with different configuration")
-            }
-            ExplicitRetirementResult::Existing(_)
-            | ExplicitRetirementResult::Missing
-            | ExplicitRetirementResult::Stale
-            | ExplicitRetirementResult::Rejected(_)
-            | ExplicitRetirementResult::Unavailable
-            | ExplicitRetirementResult::Cancelled(_) => return retirement_retry_after("1"),
-        },
+        }
     }
 
     // Run the one vacant create attempt on the blocking pool: it opens the data
@@ -838,6 +947,10 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             Err(_) => return text_response(500, "create task failed"),
         }
     };
+    // The source lease spans parent selection, target admission, and the full
+    // blocking create transaction. A Created result has durably incremented
+    // the parent refcount; every other result has completed its rollback.
+    drop(source_lease);
     match result {
         // An entry may have won the final DashMap race after the preflight.
         // Classify that exact winner under its appender lock; never write this
@@ -3356,6 +3469,328 @@ mod explicit_delete_handler_tests {
         );
         assert_eq!(stream.shared.read().unwrap().last_access, before);
         assert!(!stream.meta_dirty.load(Ordering::Acquire));
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod fork_source_liveness_tests {
+    use super::*;
+    use crate::retirement::RetirementConfig;
+    use crate::store::{CreateResult, InflightAppendGuard, Store, StreamConfig};
+    use crate::tier::TierConfig;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::UNIX_EPOCH;
+    use tokio::time::timeout;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn directory(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ds-fork-source-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn config(ttl_seconds: Option<u64>) -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    fn store(tag: &str) -> (std::path::PathBuf, Arc<Store>) {
+        let directory = directory(tag);
+        let _ = std::fs::remove_dir_all(&directory);
+        (
+            directory.clone(),
+            Arc::new(Store::new_with_tier(directory, TierConfig::default()).unwrap()),
+        )
+    }
+
+    fn create(store: &Store, path: &str, ttl_seconds: Option<u64>) -> Arc<StreamState> {
+        match store.create(path, config(ttl_seconds), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected fresh stream"),
+        }
+    }
+
+    fn fork_put(source: &str, target: &str) -> Req {
+        Req {
+            method: Method::Put,
+            path: target.into(),
+            query: None,
+            headers: vec![
+                ("content-type".into(), "application/octet-stream".into()),
+                (H_FORKED_FROM.into(), source.into()),
+            ],
+            body: Bytes::new(),
+        }
+    }
+
+    async fn wait_fenced(stream: &StreamState) {
+        timeout(Duration::from_secs(5), async {
+            while !stream.fenced.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement must fence the exact source");
+    }
+
+    async fn wait_removed(stream: &StreamState) {
+        timeout(Duration::from_secs(5), async {
+            while stream.file_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded cleanup must remove the source");
+    }
+
+    async fn shutdown(store: &Store) {
+        if let Some(executor) = store.retirement_executor() {
+            executor.shutdown().await;
+        }
+    }
+
+    fn retry_after(response: &Resp) -> Option<&str> {
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "retry-after")
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_expired_source_retires_boundedly_and_saturation_has_no_fallback() {
+        let (directory, store) = store("expiry");
+        store
+            .init_retirement_executor_for_test(RetirementConfig {
+                queue_capacity: 1,
+                ..RetirementConfig::default()
+            })
+            .unwrap();
+        let first = create(&store, "first", Some(1));
+        let second = create(&store, "second", Some(1));
+        first.shared.write().unwrap().last_access = UNIX_EPOCH;
+        second.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let appender = first.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&first, &appender).unwrap();
+        drop(appender);
+        let owner_store = store.clone();
+        let owner =
+            tokio::spawn(async move { handle(owner_store, fork_put("first", "child-a")).await });
+        wait_fenced(&first).await;
+
+        assert_eq!(
+            handle(store.clone(), fork_put("second", "child-b"))
+                .await
+                .status,
+            404
+        );
+        assert!(!second.fenced.load(Ordering::Acquire));
+        assert!(second.file_path.exists());
+        assert!(store.registered_stream("child-b").is_none());
+        drop(guard);
+        assert_eq!(
+            timeout(Duration::from_secs(5), owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            404
+        );
+        wait_removed(&first).await;
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_soft_source_is_conflict_and_source_ttl_is_never_touched() {
+        let (directory, store) = store("soft-and-ttl");
+        store.init_retirement_executor().unwrap();
+        let source = create(&store, "source", Some(3_600));
+        let before = SystemTime::now() - Duration::from_secs(10);
+        source.shared.write().unwrap().last_access = before;
+        assert_eq!(
+            handle(store.clone(), fork_put("source", "child"))
+                .await
+                .status,
+            201
+        );
+        assert_eq!(source.shared.read().unwrap().last_access, before);
+        assert_eq!(source.shared.read().unwrap().ref_count, 1);
+
+        assert!(matches!(
+            store.retire_explicit(source.clone()).await,
+            ExplicitRetirementResult::Owner(_)
+        ));
+        assert!(source.shared.read().unwrap().soft_deleted);
+        assert_eq!(
+            handle(store.clone(), fork_put("source", "child-2"))
+                .await
+                .status,
+            409
+        );
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_waiting_for_source_appender_loses_to_fence_without_creating() {
+        let (directory, store) = store("fence");
+        let source = create(&store, "source", None);
+        let appender = source.appender.lock().await;
+        let waiting_store = store.clone();
+        let waiting =
+            tokio::spawn(async move { handle(waiting_store, fork_put("source", "child")).await });
+        tokio::task::yield_now().await;
+        source.fence_while_holding_appender(&appender);
+        drop(appender);
+
+        assert_eq!(
+            timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            404
+        );
+        assert_eq!(source.shared.read().unwrap().ref_count, 0);
+        assert!(store.registered_stream("child").is_none());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_self_target_expiry_returns_retry_without_waiting_on_its_lease() {
+        let (directory, store) = store("self-expiry");
+        store.init_retirement_executor().unwrap();
+        let source = create(&store, "self-source", Some(3_600));
+        let pause = fork_source_lease_test_support::pause_after_lease("self-source");
+        let fork_store = store.clone();
+        let self_fork = tokio::spawn(async move {
+            handle(fork_store, fork_put("self-source", "self-source")).await
+        });
+        pause.wait_until_held().await;
+        source.shared.write().unwrap().last_access = UNIX_EPOCH;
+        pause.release().await;
+
+        let response = timeout(Duration::from_secs(5), self_fork)
+            .await
+            .expect("self-fork must not wait on its own source lease")
+            .unwrap();
+        assert_eq!(response.status, 503);
+        assert_eq!(retry_after(&response), Some("1"));
+        assert!(!source.fenced.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(
+            &store.registered_stream("self-source").unwrap(),
+            &source
+        ));
+        assert_eq!(source.shared.read().unwrap().ref_count, 0);
+
+        assert_eq!(
+            handle(store.clone(), fork_put("self-source", "child"))
+                .await
+                .status,
+            404
+        );
+        wait_removed(&source).await;
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_source_lease_makes_retirement_observe_the_durable_parent_reference() {
+        let (directory, store) = store("lease");
+        store.init_retirement_executor().unwrap();
+        let source = create(&store, "source-lease", None);
+        let pause = fork_source_lease_test_support::pause_after_lease("source-lease");
+        let fork_store = store.clone();
+        let fork = tokio::spawn(async move {
+            handle(fork_store, fork_put("source-lease", "child-lease")).await
+        });
+        pause.wait_until_held().await;
+
+        let delete_store = store.clone();
+        let deleting =
+            tokio::spawn(async move { handle_delete(delete_store, "source-lease".into()).await });
+        wait_fenced(&source).await;
+        assert_eq!(source.shared.read().unwrap().ref_count, 0);
+        assert!(store.registered_stream("child-lease").is_none());
+        pause.release().await;
+
+        assert_eq!(
+            timeout(Duration::from_secs(5), fork)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            201
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(5), deleting)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            204
+        );
+        assert_eq!(source.shared.read().unwrap().ref_count, 1);
+        assert!(source.shared.read().unwrap().soft_deleted);
+        assert!(source.file_path.exists());
+        let child = store.registered_stream("child-lease").unwrap();
+        assert!(Arc::ptr_eq(child.parent.as_ref().unwrap(), &source));
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_target_conflict_drops_lease_and_allows_hard_source_cleanup() {
+        let (directory, store) = store("target-conflict");
+        store.init_retirement_executor().unwrap();
+        let source = create(&store, "source-conflict", None);
+        let _target = create(&store, "child-conflict", None);
+        let pause = fork_source_lease_test_support::pause_after_lease("source-conflict");
+        let fork_store = store.clone();
+        let fork = tokio::spawn(async move {
+            handle(fork_store, fork_put("source-conflict", "child-conflict")).await
+        });
+        pause.wait_until_held().await;
+        let delete_store = store.clone();
+        let deleting =
+            tokio::spawn(
+                async move { handle_delete(delete_store, "source-conflict".into()).await },
+            );
+        wait_fenced(&source).await;
+        pause.release().await;
+
+        assert_eq!(
+            timeout(Duration::from_secs(5), fork)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            409
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(5), deleting)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            204
+        );
+        assert_eq!(source.shared.read().unwrap().ref_count, 0);
+        wait_removed(&source).await;
         shutdown(&store).await;
         let _ = std::fs::remove_dir_all(directory);
     }
