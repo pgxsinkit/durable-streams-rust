@@ -273,6 +273,37 @@ impl Drop for CommitterHandle {
     }
 }
 
+#[cfg(test)]
+impl CheckpointMaintenancePause {
+    pub(crate) async fn wait_until_held(&self) {
+        let reached = self
+            .reached
+            .lock()
+            .unwrap()
+            .take()
+            .expect("wait_until_held may be called only once");
+        tokio::task::spawn_blocking(move || {
+            reached.recv_timeout(std::time::Duration::from_secs(5))
+        })
+        .await
+        .expect("checkpoint pause waiter should not panic")
+        .expect("checkpoint must acquire maintenance within five seconds");
+    }
+
+    pub(crate) fn release(&self) {
+        self.release
+            .send(())
+            .expect("checkpoint must still be waiting for maintenance release");
+    }
+}
+
+#[cfg(test)]
+impl Drop for CheckpointMaintenancePause {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+    }
+}
+
 /// One WAL shard: a segmented append-only log with its own committer.
 pub struct Shard {
     inner: Mutex<ShardInner>,
@@ -363,6 +394,26 @@ pub struct Shard {
     /// (propagates a `Result::Err`) rather than panicking the process.
     #[cfg(test)]
     fail_next_write: std::sync::atomic::AtomicBool,
+    /// Test-only: fail one retirement forget before mutating shard residency.
+    #[cfg(test)]
+    fail_next_forget: std::sync::atomic::AtomicBool,
+    /// Test-only checkpoint pause after its owned maintenance guard moved into
+    /// the blocking body, used to prove Store retirement waits without exposing
+    /// physical work.
+    #[cfg(test)]
+    checkpoint_pause: Mutex<Option<CheckpointPauseState>>,
+}
+
+#[cfg(test)]
+struct CheckpointPauseState {
+    reached: std::sync::mpsc::Sender<()>,
+    release: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+pub(crate) struct CheckpointMaintenancePause {
+    reached: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    release: std::sync::mpsc::Sender<()>,
 }
 
 /// Name of the per-shard checkpoint-lsn file: `<shard_dir>/checkpoint` (plain
@@ -521,6 +572,10 @@ impl Shard {
             on_stage: Mutex::new(None),
             #[cfg(test)]
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_forget: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            checkpoint_pause: Mutex::new(None),
         }))
     }
 
@@ -918,6 +973,8 @@ impl Shard {
             // awaiting checkpoint future is cancelled, it cannot release this
             // guard while the body still owns dirty/tails/meta maintenance.
             let _maintenance = maintenance;
+            #[cfg(test)]
+            this.wait_after_checkpoint_maintenance();
             let result = Self::checkpoint_blocking(&this, &drained, checkpoint_lsn);
             if result.is_err() {
                 // A failed checkpoint must NOT drop the drained dirty set: these
@@ -943,7 +1000,6 @@ impl Shard {
     /// checkpoint/recovery retains ownership of those bytes. It removes only
     /// the stable stream ID from the pending dirty collection and cumulative
     /// tail proof, so a completed earlier checkpoint cannot reintroduce it.
-    #[allow(dead_code)] // wired into Store retirement by x82l-b2
     pub async fn forget_stream(self: &Arc<Self>, stream_id: u64) -> io::Result<()> {
         let maintenance = Arc::clone(&self.checkpoint_maintenance).lock_owned().await;
         let this = Arc::clone(self);
@@ -957,8 +1013,11 @@ impl Shard {
         .expect("forget_stream task panicked")
     }
 
-    #[allow(dead_code)] // reached from the deferred public hand-off above
     fn forget_stream_blocking(&self, stream_id: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_forget.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("injected retirement forget failure"));
+        }
         self.dirty
             .lock()
             .unwrap()
@@ -1132,7 +1191,6 @@ impl Shard {
     /// a retryable in-memory entry. A crash with an older unknown entry is safe:
     /// recovery ignores IDs absent from its exact Store index, then boot reset
     /// clears the entire recovered tail map.
-    #[allow(dead_code)] // reached from the deferred public hand-off above
     fn forget_durable_tail(&self, stream_id: u64) -> io::Result<()> {
         let snapshot = {
             let cache = self.tails_cache.lock().unwrap();
@@ -1733,6 +1791,55 @@ impl Shard {
     pub fn fail_next_write(&self) {
         self.fail_next_write
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: fail the next pre-logical retirement forget before it changes
+    /// dirty or tails residency.
+    #[cfg(test)]
+    pub(crate) fn fail_next_forget(&self) {
+        self.fail_next_forget.store(true, Ordering::SeqCst);
+    }
+
+    /// Test-only: pause the next checkpoint after it owns maintenance in its
+    /// blocking body. The returned controller uses bounded waits so a bad
+    /// pairing fails rather than hanging the suite.
+    #[cfg(test)]
+    pub(crate) fn pause_checkpoint_after_maintenance(&self) -> CheckpointMaintenancePause {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut pause = self.checkpoint_pause.lock().unwrap();
+        assert!(
+            pause.is_none(),
+            "checkpoint maintenance pause already installed"
+        );
+        *pause = Some(CheckpointPauseState {
+            reached: reached_tx,
+            release: Some(release_rx),
+        });
+        CheckpointMaintenancePause {
+            reached: Mutex::new(Some(reached_rx)),
+            release: release_tx,
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_after_checkpoint_maintenance(&self) {
+        let (reached, release) = {
+            let mut pause = self.checkpoint_pause.lock().unwrap();
+            let Some(state) = pause.as_mut() else {
+                return;
+            };
+            let Some(release) = state.release.take() else {
+                return;
+            };
+            (state.reached.clone(), release)
+        };
+        reached
+            .send(())
+            .expect("checkpoint pause controller must wait for maintenance");
+        release
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("checkpoint pause controller must release maintenance within five seconds");
     }
 
     /// Test-only: install the `reserve_and_stage` ordering seam (see `on_stage`).

@@ -153,9 +153,8 @@ impl WalSet {
     }
 
     /// Remove one retired stable stream ID from its routed shard's checkpoint
-    /// maintenance residency. Store retirement wires this in a later slice;
-    /// this primitive intentionally does not alter WAL records or segments.
-    #[allow(dead_code)] // wired into Store retirement by x82l-b2
+    /// maintenance residency. This primitive intentionally does not alter WAL
+    /// records or segments.
     pub async fn forget_stream(&self, stream_id: u64) -> io::Result<()> {
         self.shard_for(stream_id).forget_stream(stream_id).await
     }

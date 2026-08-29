@@ -468,6 +468,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_reset_removes_stale_unknown_durable_tail_ids() {
+        let dir = tmp("unknown-tail-reset");
+        let wal = WalSet::open(&dir, Some(1), 1).unwrap();
+        let store =
+            std::sync::Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert!(store.wal.set(std::sync::Arc::clone(&wal)).is_ok());
+
+        let stale_id = 9_999_999u64;
+        let tails_path = dir.join("wal").join("0").join("tails");
+        std::fs::write(&tails_path, format!("{stale_id} 42\n")).unwrap();
+        assert!(wal
+            .shard_for(stale_id)
+            .read_durable_tails()
+            .contains_key(&stale_id));
+
+        // Recovery ignores IDs absent from the exact recovered Store index, then
+        // the successful boot reset discards the whole consumed checkpoint proof.
+        recover(&store, &wal).unwrap();
+        wal.reset_after_recovery().unwrap();
+        assert!(
+            !wal.shard_for(stale_id)
+                .read_durable_tails()
+                .contains_key(&stale_id),
+            "a fresh post-recovery WAL has no historical unknown tail residency"
+        );
+
+        drop(store);
+        drop(wal);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn wal_recovery_repairs_tail_no_torn_no_loss() {
         let dir = tmp("repair");

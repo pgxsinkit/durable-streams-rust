@@ -1175,15 +1175,25 @@ impl Store {
 
         {
             let appender = stream.appender.lock().await;
-            if !self.is_exact_live(&stream) || stream.fenced.load(Ordering::Acquire) {
+            if !self.is_exact_live(&stream) {
                 drop(appender);
                 return self.cancel_retirement(&executor, &stream, ticket);
             }
-            if mode == LocalCleanupMode::Expiry && !stream.is_expired_at(SystemTime::now()) {
+            // A prior WAL-forget failure cancels only its pre-logical ticket.
+            // Either expiry or explicit retirement may adopt that exact fenced
+            // identity later: the fence is authoritative, so liveness cannot
+            // advance while the idempotent hand-off is retried.
+            let already_fenced = stream.fenced.load(Ordering::Acquire);
+            if !already_fenced
+                && mode == LocalCleanupMode::Expiry
+                && !stream.is_expired_at(SystemTime::now())
+            {
                 drop(appender);
                 return self.cancel_retirement(&executor, &stream, ticket);
             }
-            stream.fence_while_holding_appender(&appender);
+            if !already_fenced {
+                stream.fence_while_holding_appender(&appender);
+            }
         }
         stream.wait_for_inflight_appends_zero().await;
         // A pre-fence accepted append may have dirtied metadata after the
@@ -1192,6 +1202,23 @@ impl Store {
         // authoritative durable sidecar write in the physical finalizer).
         stream.meta_dirty.store(false, Ordering::Release);
 
+        if !self.is_exact_live(&stream) {
+            return self.cancel_retirement(&executor, &stream, ticket);
+        }
+        // The bounded coordinator retains only this unreleased pre-logical job
+        // while a WAL checkpoint may be in flight. No coordinator active slot,
+        // physical queue slot, or cleanup worker is exposed until release below.
+        // On error cancel the ticket but deliberately keep the exact fence: a
+        // later owner retries this idempotent hand-off without reopening writes.
+        if let Some(wal) = self.wal.get() {
+            if let Err(error) = wal.forget_stream(stream.id).await {
+                eprintln!(
+                    "retirement WAL forget failed for stream id={} path={:?}: {error}",
+                    stream.id, stream.path
+                );
+                return self.cancel_retirement(&executor, &stream, ticket);
+            }
+        }
         if !self.is_exact_live(&stream) {
             return self.cancel_retirement(&executor, &stream, ticket);
         }
@@ -2357,6 +2384,19 @@ mod retirement_executor_lifecycle_tests {
         .expect("explicit retirement should fence the admitted stream");
     }
 
+    fn attach_test_wal(
+        store: &Arc<Store>,
+        directory: &std::path::Path,
+    ) -> Arc<crate::wal::walset::WalSet> {
+        let wal = crate::wal::walset::WalSet::open(directory, Some(1), 1)
+            .expect("open one-shard test WAL");
+        assert!(
+            store.wal.set(Arc::clone(&wal)).is_ok(),
+            "attach WAL exactly once before serving"
+        );
+        wal
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn retirement_executor_lifecycle_initializes_once_and_shuts_down_workers() {
         let (directory, store) = temporary_store("once");
@@ -2628,6 +2668,224 @@ mod retirement_executor_lifecycle_tests {
         store.retirement_executor().unwrap().shutdown().await;
 
         drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_forgets_wal_residency_before_releasing_logical_cleanup() {
+        let (directory, store) = temporary_store("wal-forget");
+        let wal = attach_test_wal(&store, &directory);
+        store.init_retirement_executor().unwrap();
+        let retired = match store.create("retired", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected retired stream creation"),
+        };
+        let survivor = match store.create("survivor", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected survivor stream creation"),
+        };
+        let shard = Arc::clone(wal.shard_for(retired.id));
+        shard.register_dirty(retired.id, Arc::clone(&retired));
+        shard.register_dirty(survivor.id, Arc::clone(&survivor));
+        assert!(shard.is_dirty(retired.id));
+        shard.checkpoint().await.unwrap();
+        assert!(shard.read_durable_tails().contains_key(&retired.id));
+        assert!(shard.read_durable_tails().contains_key(&survivor.id));
+
+        let ticket = match store.retire_explicit(Arc::clone(&retired)).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("retirement should own its exact WAL hand-off"),
+        };
+        assert_eq!(ticket.wait_logical().await, LogicalCompletion::Completed);
+        assert!(retired.fenced.load(Ordering::Acquire));
+        assert!(!shard.read_durable_tails().contains_key(&retired.id));
+        assert!(shard.read_durable_tails().contains_key(&survivor.id));
+        shard.register_dirty(retired.id, Arc::clone(&retired));
+        assert!(
+            !shard.is_dirty(retired.id),
+            "a fenced retired identity cannot re-register after forget"
+        );
+
+        let replacement = match store.create("retired", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("hard retirement frees the path for a distinct identity"),
+        };
+        assert_ne!(replacement.id, retired.id);
+        shard.register_dirty(replacement.id, Arc::clone(&replacement));
+        shard.checkpoint().await.unwrap();
+        let tails = shard.read_durable_tails();
+        assert!(!tails.contains_key(&retired.id));
+        assert!(tails.contains_key(&survivor.id));
+        assert!(tails.contains_key(&replacement.id));
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(replacement);
+        drop(survivor);
+        drop(retired);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_waits_for_checkpoint_before_forget_and_logical_release() {
+        let (directory, store) = temporary_store("wal-checkpoint-gate");
+        let wal = attach_test_wal(&store, &directory);
+        store.init_retirement_executor().unwrap();
+        let stream = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected stream creation"),
+        };
+        let shard = Arc::clone(wal.shard_for(stream.id));
+        shard.register_dirty(stream.id, Arc::clone(&stream));
+        std::fs::remove_file(meta_path(&stream.file_path)).unwrap();
+        let pause = shard.pause_checkpoint_after_maintenance();
+        let checkpoint_shard = Arc::clone(&shard);
+        let checkpoint = tokio::spawn(async move { checkpoint_shard.checkpoint().await });
+        pause.wait_until_held().await;
+
+        let retirement_store = Arc::clone(&store);
+        let retirement_stream = Arc::clone(&stream);
+        let mut retirement =
+            tokio::spawn(async move { retirement_store.retire_explicit(retirement_stream).await });
+        wait_until_fenced(&stream).await;
+        stream.meta_dirty.store(true, Ordering::Release);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut retirement)
+                .await
+                .is_err(),
+            "the pre-logical owner must wait for checkpoint maintenance"
+        );
+        assert!(stream.file_path.exists());
+        assert!(store.is_exact_registered(&stream));
+
+        pause.release();
+        checkpoint
+            .await
+            .expect("checkpoint task should not panic")
+            .expect("checkpoint succeeds");
+        let ticket = match tokio::time::timeout(Duration::from_secs(5), &mut retirement)
+            .await
+            .expect("retirement resumes after checkpoint")
+            .expect("retirement task should not panic")
+        {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("retirement owns the logical hand-off after checkpoint"),
+        };
+        assert_eq!(ticket.wait_logical().await, LogicalCompletion::Completed);
+        assert!(!shard.read_durable_tails().contains_key(&stream.id));
+        assert!(
+            !meta_path(&stream.file_path).exists(),
+            "the delayed checkpoint meta flush rechecks fence and cannot resurrect a sidecar"
+        );
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_forget_failure_cancels_ticket_and_retries_the_fenced_identity() {
+        let (directory, store) = temporary_store("wal-forget-retry");
+        let wal = attach_test_wal(&store, &directory);
+        store.init_retirement_executor().unwrap();
+        let stream = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected stream creation"),
+        };
+        let shard = Arc::clone(wal.shard_for(stream.id));
+        shard.register_dirty(stream.id, Arc::clone(&stream));
+        shard.checkpoint().await.unwrap();
+        assert!(shard.read_durable_tails().contains_key(&stream.id));
+        shard.fail_next_forget();
+
+        let cancelled = match store.retire_explicit(Arc::clone(&stream)).await {
+            ExplicitRetirementResult::Cancelled(ticket) => ticket,
+            _ => panic!("forget I/O failure must cancel the pre-logical ticket"),
+        };
+        assert_eq!(cancelled.wait_logical().await, LogicalCompletion::Cancelled);
+        assert_eq!(
+            cancelled.wait_terminal().await,
+            TerminalCleanupCompletion::Cancelled
+        );
+        assert!(stream.fenced.load(Ordering::Acquire));
+        assert!(store.is_exact_registered(&stream));
+        assert!(stream.file_path.exists());
+        let appender = stream.appender.lock().await;
+        assert!(
+            InflightAppendGuard::begin(&stream, &appender).is_none(),
+            "a failed WAL hand-off leaves the exact identity fenced"
+        );
+        drop(appender);
+        assert!(shard.read_durable_tails().contains_key(&stream.id));
+
+        let retry = match store.retire_explicit(Arc::clone(&stream)).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("a later exact owner retries the fenced WAL hand-off"),
+        };
+        assert_eq!(retry.wait_logical().await, LogicalCompletion::Completed);
+        assert!(!shard.read_durable_tails().contains_key(&stream.id));
+        assert!(matches!(
+            retry.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_cycles_leave_wal_tails_only_for_live_streams() {
+        let (directory, store) = temporary_store("wal-cycles");
+        let wal = attach_test_wal(&store, &directory);
+        store.init_retirement_executor().unwrap();
+
+        for cycle in 0..3 {
+            let stream = match store
+                .create(&format!("retired-{cycle}"), stream_config(), None, 0)
+                .unwrap()
+            {
+                CreateResult::Created(stream) => stream,
+                _ => panic!("expected cycle stream creation"),
+            };
+            let shard = Arc::clone(wal.shard_for(stream.id));
+            shard.register_dirty(stream.id, Arc::clone(&stream));
+            shard.checkpoint().await.unwrap();
+            let ticket = match store.retire_explicit(Arc::clone(&stream)).await {
+                ExplicitRetirementResult::Owner(ticket) => ticket,
+                _ => panic!("cycle retirement owns exact stream"),
+            };
+            assert!(matches!(
+                ticket.wait_terminal().await,
+                TerminalCleanupCompletion::Succeeded { .. }
+            ));
+            assert!(!shard.read_durable_tails().contains_key(&stream.id));
+        }
+
+        let live = match store.create("live", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected live stream creation"),
+        };
+        let shard = Arc::clone(wal.shard_for(live.id));
+        shard.register_dirty(live.id, Arc::clone(&live));
+        shard.checkpoint().await.unwrap();
+        let tails = shard.read_durable_tails();
+        assert_eq!(tails.len(), 1);
+        assert!(tails.contains_key(&live.id));
+
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(live);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }
