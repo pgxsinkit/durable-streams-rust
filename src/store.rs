@@ -449,19 +449,34 @@ impl StreamState {
     }
 
     pub fn is_expired(&self) -> bool {
-        let now = SystemTime::now();
-        if let Some(exp) = self.config.expires_at {
-            if now > exp {
-                return true;
-            }
+        self.is_expired_at(SystemTime::now())
+    }
+
+    /// Returns the earliest finite expiry deadline, or `None` when none exists.
+    ///
+    /// This acquires `shared.read()` internally; callers must not already hold
+    /// the shared lock.
+    pub fn expiry_deadline(&self) -> Option<SystemTime> {
+        let ttl_deadline = self.config.ttl_seconds.and_then(|ttl_seconds| {
+            self.shared
+                .read()
+                .unwrap()
+                .last_access
+                .checked_add(Duration::from_secs(ttl_seconds))
+        });
+
+        match (self.config.expires_at, ttl_deadline) {
+            (Some(absolute), Some(ttl)) => Some(absolute.min(ttl)),
+            (Some(absolute), None) => Some(absolute),
+            (None, Some(ttl)) => Some(ttl),
+            (None, None) => None,
         }
-        if let Some(ttl) = self.config.ttl_seconds {
-            let last = self.shared.read().unwrap().last_access;
-            if now > last + Duration::from_secs(ttl) {
-                return true;
-            }
-        }
-        false
+    }
+
+    /// Applies the protocol's strict expiration boundary: `now > deadline`.
+    pub fn is_expired_at(&self, now: SystemTime) -> bool {
+        self.expiry_deadline()
+            .is_some_and(|deadline| now > deadline)
     }
 
     pub fn etag(&self, start: u64, end: u64, closed: bool) -> String {
@@ -1328,6 +1343,134 @@ fn config_matches(existing: &StreamState, requested: &StreamConfig) -> bool {
         && ex.fork_sub_offset.unwrap_or(0) == requested.fork_sub_offset.unwrap_or(0)
         // PUT without Stream-Closed against a closed stream is a conflict.
         && (requested.create_closed == closed_now)
+}
+
+#[cfg(test)]
+mod expiry_deadline_tests {
+    use super::*;
+
+    fn config(ttl_seconds: Option<u64>, expires_at: Option<SystemTime>) -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds,
+            expires_at,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    fn state(config: StreamConfig) -> (PathBuf, Arc<StreamState>) {
+        let directory = std::env::temp_dir().join(format!(
+            "ds-expiry-deadline-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store =
+            Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap();
+        let state = match store.create("stream", config, None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        (directory, state)
+    }
+
+    fn set_last_access(state: &StreamState, last_access: SystemTime) {
+        state.shared.write().unwrap().last_access = last_access;
+    }
+
+    #[test]
+    fn expiry_deadline_no_policy() {
+        let (directory, state) = state(config(None, None));
+
+        assert_eq!(state.expiry_deadline(), None);
+        assert!(!state.is_expired_at(UNIX_EPOCH));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn expiry_deadline_absolute_before_exact_after() {
+        let deadline = UNIX_EPOCH + Duration::from_secs(100);
+        let (directory, state) = state(config(None, Some(deadline)));
+
+        assert_eq!(state.expiry_deadline(), Some(deadline));
+        assert!(!state.is_expired_at(deadline - Duration::from_secs(1)));
+        assert!(!state.is_expired_at(deadline));
+        assert!(state.is_expired_at(deadline + Duration::from_secs(1)));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn expiry_deadline_ttl_before_exact_after() {
+        let last_access = UNIX_EPOCH + Duration::from_secs(100);
+        let deadline = last_access + Duration::from_secs(10);
+        let (directory, state) = state(config(Some(10), None));
+        set_last_access(&state, last_access);
+
+        assert_eq!(state.expiry_deadline(), Some(deadline));
+        assert!(!state.is_expired_at(deadline - Duration::from_secs(1)));
+        assert!(!state.is_expired_at(deadline));
+        assert!(state.is_expired_at(deadline + Duration::from_secs(1)));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn expiry_deadline_pre_epoch_last_access() {
+        let last_access = UNIX_EPOCH.checked_sub(Duration::from_secs(10)).unwrap();
+        let deadline = UNIX_EPOCH.checked_sub(Duration::from_secs(5)).unwrap();
+        let (directory, state) = state(config(Some(5), None));
+        set_last_access(&state, last_access);
+
+        assert_eq!(state.expiry_deadline(), Some(deadline));
+        assert!(!state.is_expired_at(deadline));
+        assert!(state.is_expired_at(UNIX_EPOCH));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn expiry_deadline_ttl_overflow_is_not_finite() {
+        let (directory, state) = state(config(Some(u64::MAX), None));
+        set_last_access(&state, UNIX_EPOCH);
+
+        assert_eq!(state.expiry_deadline(), None);
+        assert!(!state.is_expired_at(UNIX_EPOCH));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn expiry_deadline_earlier_ttl_wins_when_config_contains_both_policies() {
+        let absolute = UNIX_EPOCH + Duration::from_secs(100);
+        let ttl_deadline = UNIX_EPOCH + Duration::from_secs(1);
+        let (directory, state) = state(config(Some(1), Some(absolute)));
+        set_last_access(&state, UNIX_EPOCH);
+
+        assert_eq!(state.expiry_deadline(), Some(ttl_deadline));
+        assert!(state.is_expired_at(UNIX_EPOCH + Duration::from_secs(2)));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn expiry_deadline_earlier_absolute_wins_when_config_contains_both_policies() {
+        let absolute = UNIX_EPOCH + Duration::from_secs(1);
+        let (directory, state) = state(config(Some(100), Some(absolute)));
+        set_last_access(&state, UNIX_EPOCH);
+
+        assert_eq!(state.expiry_deadline(), Some(absolute));
+        assert!(state.is_expired_at(UNIX_EPOCH + Duration::from_secs(2)));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }
 
 pub fn media_type(ct: &str) -> String {
