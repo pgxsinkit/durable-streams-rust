@@ -59,7 +59,7 @@ pub(crate) struct ExpirationScannerConfig {
     scan_rate_candidates_per_second: u64,
     delete_rate_deletions_per_second: u64,
     startup_grace_duration: Duration,
-    bulk_fraction: f64,
+    bulk_fraction: BulkFraction,
     clock_jump_threshold_duration: Duration,
 }
 
@@ -70,7 +70,7 @@ impl Default for ExpirationScannerConfig {
             scan_rate_candidates_per_second: 10_000,
             delete_rate_deletions_per_second: 100,
             startup_grace_duration: Duration::from_secs(60),
-            bulk_fraction: 0.25,
+            bulk_fraction: BulkFraction::QUARTER,
             clock_jump_threshold_duration: Duration::from_secs(300),
         }
     }
@@ -130,8 +130,10 @@ impl ExpirationScannerConfig {
         self.startup_grace_duration
     }
 
-    pub(crate) const fn bulk_fraction(&self) -> f64 {
-        self.bulk_fraction
+    /// A display-only projection for future status/telemetry. Safety decisions
+    /// retain the exact decimal representation below.
+    pub(crate) fn bulk_fraction(&self) -> f64 {
+        self.bulk_fraction.as_f64()
     }
 
     pub(crate) const fn clock_jump_threshold_duration(&self) -> Duration {
@@ -171,11 +173,86 @@ fn parse_seconds(flag: &str, value: &str) -> Result<u64, String> {
         .map_err(|_| format!("{flag} must be a non-negative integer (seconds)"))
 }
 
-fn parse_bulk_fraction(flag: &str, value: &str) -> Result<f64, String> {
-    match value.parse::<f64>() {
-        Ok(fraction) if fraction.is_finite() && fraction > 0.0 && fraction <= 1.0 => Ok(fraction),
-        _ => Err(format!("{flag} must be a finite number in (0, 1]")),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BulkFraction {
+    numerator: u64,
+    denominator: u64,
+}
+
+impl BulkFraction {
+    const QUARTER: Self = Self {
+        numerator: 1,
+        denominator: 4,
+    };
+
+    fn as_f64(self) -> f64 {
+        self.numerator as f64 / self.denominator as f64
     }
+
+    /// `due / checked > self`, using `u128` products. The operands are at
+    /// most `u64::MAX`, and decimal denominators are capped at 10^18, so both
+    /// products are strictly below `u128::MAX`.
+    fn exceeded_by(self, due: u64, checked: u64) -> bool {
+        checked != 0
+            && u128::from(due) * u128::from(self.denominator)
+                > u128::from(self.numerator) * u128::from(checked)
+    }
+}
+
+fn parse_bulk_fraction(flag: &str, value: &str) -> Result<BulkFraction, String> {
+    const MAX_DECIMAL_PLACES: usize = 18;
+    let invalid = || {
+        format!(
+            "{flag} must be a decimal in (0, 1] with at most {MAX_DECIMAL_PLACES} digits after the decimal point (exponents are not supported)"
+        )
+    };
+
+    let (whole, fractional) = match value.split_once('.') {
+        Some((whole, fractional)) => (whole, Some(fractional)),
+        None => (value, None),
+    };
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fractional.is_some_and(|digits| {
+            digits.is_empty()
+                || digits.len() > MAX_DECIMAL_PLACES
+                || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return Err(invalid());
+    }
+
+    let whole = whole.parse::<u64>().map_err(|_| invalid())?;
+    let (numerator, denominator) = match fractional {
+        Some(digits) => {
+            let denominator =
+                10_u64.pow(u32::try_from(digits.len()).expect("precision is bounded"));
+            let fractional = digits.parse::<u64>().map_err(|_| invalid())?;
+            let numerator = whole
+                .checked_mul(denominator)
+                .and_then(|value| value.checked_add(fractional))
+                .ok_or_else(invalid)?;
+            (numerator, denominator)
+        }
+        None => (whole, 1),
+    };
+    if numerator == 0 || numerator > denominator {
+        return Err(invalid());
+    }
+    let divisor = greatest_common_divisor(numerator, denominator);
+    Ok(BulkFraction {
+        numerator: numerator / divisor,
+        denominator: denominator / divisor,
+    })
+}
+
+fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 /// Read-only result from validating one weak expiration-index candidate.
@@ -194,7 +271,7 @@ pub(crate) struct ExpirationScannerStatus {
     started_at: Instant,
     startup_grace_duration: Duration,
     delete_requested: bool,
-    bulk_fraction: f64,
+    bulk_fraction: BulkFraction,
     clock_jump_threshold_duration: Duration,
     safety: Mutex<DeleteSafetyState>,
 }
@@ -211,7 +288,7 @@ impl ExpirationScannerStatus {
             started_at,
             startup_grace_duration: config.startup_grace_duration(),
             delete_requested: config.mode() == ExpirationReaperMode::Delete,
-            bulk_fraction: config.bulk_fraction(),
+            bulk_fraction: config.bulk_fraction,
             clock_jump_threshold_duration: config.clock_jump_threshold_duration(),
             safety: Mutex::new(DeleteSafetyState::default()),
         }
@@ -262,11 +339,10 @@ impl ExpirationScannerStatus {
                 .unwrap_or_else(|error| error.into_inner());
             safety.current_checked = safety.current_checked.saturating_add(checked);
             safety.current_due = safety.current_due.saturating_add(due);
-            if bulk_fraction_exceeded(
-                safety.current_due,
-                safety.current_checked,
-                self.bulk_fraction,
-            ) {
+            if self
+                .bulk_fraction
+                .exceeded_by(safety.current_due, safety.current_checked)
+            {
                 safety.bulk_paused = true;
             }
             if pass_complete {
@@ -381,10 +457,6 @@ impl DeleteSafetySnapshot {
     pub(crate) fn completed_due_fraction(&self) -> f64 {
         due_fraction(self.completed_due, self.completed_checked)
     }
-}
-
-fn bulk_fraction_exceeded(due: u64, checked: u64, bulk_fraction: f64) -> bool {
-    checked != 0 && (due as f64) > bulk_fraction * (checked as f64)
 }
 
 fn due_fraction(due: u64, checked: u64) -> f64 {
@@ -804,6 +876,7 @@ mod tests {
         assert_eq!(config.delete_rate_deletions_per_second(), 100);
         assert_eq!(config.startup_grace_duration(), Duration::from_secs(60));
         assert_eq!(config.bulk_fraction(), 0.25);
+        assert_eq!(config.bulk_fraction, BulkFraction::QUARTER);
         assert_eq!(
             config.clock_jump_threshold_duration(),
             Duration::from_secs(300)
@@ -824,6 +897,13 @@ mod tests {
         assert_eq!(config.delete_rate_deletions_per_second(), 99);
         assert_eq!(config.startup_grace_duration(), Duration::ZERO);
         assert_eq!(config.bulk_fraction(), 1.0);
+        assert_eq!(
+            config.bulk_fraction,
+            BulkFraction {
+                numerator: 1,
+                denominator: 1
+            }
+        );
         assert_eq!(
             config.clock_jump_threshold_duration(),
             Duration::from_secs(1)
@@ -862,6 +942,10 @@ mod tests {
             ("--expiry-bulk-fraction", "1.01"),
             ("--expiry-bulk-fraction", "NaN"),
             ("--expiry-bulk-fraction", "inf"),
+            ("--expiry-bulk-fraction", "1e-1"),
+            ("--expiry-bulk-fraction", "0."),
+            ("--expiry-bulk-fraction", ".1"),
+            ("--expiry-bulk-fraction", "0.0000000000000000001"),
             ("--expiry-clock-jump-seconds", "0"),
             ("--expiry-clock-jump-seconds", "-1"),
             ("--expiry-clock-jump-seconds", "18446744073709551616"),
@@ -882,6 +966,62 @@ mod tests {
         config.set_cli_value("--expiry-reaper-mode", "off").unwrap();
         assert_eq!(config.scan_rate_candidates_per_second(), 2);
         assert_eq!(config.mode(), ExpirationReaperMode::Off);
+    }
+
+    #[test]
+    fn bulk_fraction_parser_is_exact_bounded_decimal_and_last_value_wins() {
+        for (input, expected) in [
+            (
+                "0.1",
+                BulkFraction {
+                    numerator: 1,
+                    denominator: 10,
+                },
+            ),
+            (
+                "0.333",
+                BulkFraction {
+                    numerator: 333,
+                    denominator: 1_000,
+                },
+            ),
+            (
+                "1.0",
+                BulkFraction {
+                    numerator: 1,
+                    denominator: 1,
+                },
+            ),
+            (
+                "0.000000000000000001",
+                BulkFraction {
+                    numerator: 1,
+                    denominator: 1_000_000_000_000_000_000,
+                },
+            ),
+        ] {
+            assert_eq!(
+                parse_bulk_fraction("--expiry-bulk-fraction", input).unwrap(),
+                expected,
+                "{input}"
+            );
+        }
+
+        let mut config = ExpirationScannerConfig::default();
+        config
+            .set_cli_value("--expiry-bulk-fraction", "0.1")
+            .unwrap();
+        config
+            .set_cli_value("--expiry-bulk-fraction", "0.333")
+            .unwrap();
+        assert_eq!(
+            config.bulk_fraction,
+            BulkFraction {
+                numerator: 333,
+                denominator: 1_000,
+            }
+        );
+        assert!((config.bulk_fraction() - 0.333).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -930,13 +1070,13 @@ mod tests {
 
     fn delete_safety_config(
         startup_grace_duration: Duration,
-        bulk_fraction: f64,
+        bulk_fraction: &str,
         clock_jump_threshold_duration: Duration,
     ) -> ExpirationScannerConfig {
         ExpirationScannerConfig {
             mode: ExpirationReaperMode::Delete,
             startup_grace_duration,
-            bulk_fraction,
+            bulk_fraction: parse_bulk_fraction("--expiry-bulk-fraction", bulk_fraction).unwrap(),
             clock_jump_threshold_duration,
             ..ExpirationScannerConfig::default()
         }
@@ -946,7 +1086,7 @@ mod tests {
     fn delete_safety_requires_grace_and_an_observe_pass_including_empty() {
         let start = Instant::now();
         let status = ExpirationScannerStatus::new_at(
-            &delete_safety_config(Duration::from_secs(5), 1.0, Duration::from_secs(5)),
+            &delete_safety_config(Duration::from_secs(5), "1.0", Duration::from_secs(5)),
             start,
         );
         assert_eq!(
@@ -972,7 +1112,7 @@ mod tests {
         assert_eq!(at_grace.completed_due_fraction(), 0.0);
 
         let zero_grace = ExpirationScannerStatus::new_at(
-            &delete_safety_config(Duration::ZERO, 1.0, Duration::from_secs(5)),
+            &delete_safety_config(Duration::ZERO, "1.0", Duration::from_secs(5)),
             start,
         );
         assert!(zero_grace.safety_snapshot_at(start).startup_grace_elapsed);
@@ -985,7 +1125,7 @@ mod tests {
     fn delete_safety_bulk_guard_is_strict_cumulative_and_sticky() {
         let start = Instant::now();
         let status = ExpirationScannerStatus::new_at(
-            &delete_safety_config(Duration::ZERO, 0.25, Duration::from_secs(5)),
+            &delete_safety_config(Duration::ZERO, "0.25", Duration::from_secs(5)),
             start,
         );
         status.record_observe_page(4, 1, false);
@@ -1015,10 +1155,36 @@ mod tests {
     }
 
     #[test]
+    fn bulk_guard_compares_operator_decimals_exactly_without_u64_overflow() {
+        let tenth = parse_bulk_fraction("--expiry-bulk-fraction", "0.1").unwrap();
+        assert!(!tenth.exceeded_by(1, 10));
+        assert!(tenth.exceeded_by(2, 10));
+
+        // This is an exact large-scale tenth: `checked` is divisible by ten,
+        // while one extra due candidate crosses it. Both cross-products still
+        // fit the documented u128 proof.
+        let checked = (u64::MAX / 10) * 10;
+        assert!(!tenth.exceeded_by(checked / 10, checked));
+        assert!(tenth.exceeded_by(checked / 10 + 1, checked));
+
+        let thirds = parse_bulk_fraction("--expiry-bulk-fraction", "0.333").unwrap();
+        assert!(!thirds.exceeded_by(333, 1_000));
+        assert!(thirds.exceeded_by(334, 1_000));
+
+        let whole = parse_bulk_fraction("--expiry-bulk-fraction", "1.0").unwrap();
+        assert!(!whole.exceeded_by(u64::MAX, u64::MAX));
+
+        let smallest =
+            parse_bulk_fraction("--expiry-bulk-fraction", "0.000000000000000001").unwrap();
+        assert!(!smallest.exceeded_by(1, 1_000_000_000_000_000_000));
+        assert!(smallest.exceeded_by(2, 1_000_000_000_000_000_000));
+    }
+
+    #[test]
     fn delete_safety_counts_saturate_and_reset_only_after_completion() {
         let start = Instant::now();
         let status = ExpirationScannerStatus::new_at(
-            &delete_safety_config(Duration::ZERO, 1.0, Duration::from_secs(5)),
+            &delete_safety_config(Duration::ZERO, "1.0", Duration::from_secs(5)),
             start,
         );
         status.record_observe_page(u64::MAX, 0, false);
@@ -1036,7 +1202,7 @@ mod tests {
     #[test]
     fn delete_safety_clock_guard_handles_threshold_forward_backward_and_monotonic_anomaly() {
         let start = Instant::now();
-        let config = delete_safety_config(Duration::ZERO, 1.0, Duration::from_secs(5));
+        let config = delete_safety_config(Duration::ZERO, "1.0", Duration::from_secs(5));
 
         let threshold = ExpirationScannerStatus::new_at(&config, start);
         threshold.record_observe_page(0, 0, true);
@@ -1143,7 +1309,7 @@ mod tests {
         stream.shared.write().unwrap().last_access = UNIX_EPOCH;
         let scanner = ExpirationScanner::start(
             &store,
-            delete_safety_config(Duration::ZERO, 1.0, Duration::from_secs(5)),
+            delete_safety_config(Duration::ZERO, "1.0", Duration::from_secs(5)),
         );
         assert!(scanner.task.is_some());
         wait_for_initial_pass(&scanner).await;
