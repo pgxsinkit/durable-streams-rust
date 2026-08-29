@@ -538,6 +538,7 @@ impl StreamState {
         }
     }
 
+    #[allow(dead_code)] // retained for Store primitive callers outside target PUT.
     pub fn touch(&self) {
         self.touch_at(SystemTime::now());
     }
@@ -641,6 +642,16 @@ pub enum CreateResult {
     Created(Arc<StreamState>),
     Exists(Arc<StreamState>),
     Conflict,
+}
+
+/// Appender-serialized admission for a target-path PUT. An expired incumbent is
+/// returned by identity so the handler can retire exactly that incarnation.
+pub(crate) enum PutTargetAdmission {
+    Vacant,
+    Compatible(Arc<StreamState>),
+    Conflict,
+    Expired(Arc<StreamState>),
+    Retryable,
 }
 
 /// Local cleanup durability requested by the caller.
@@ -991,6 +1002,56 @@ impl Store {
     /// Clone the currently registered stream without triggering lazy expiry.
     pub(crate) fn registered_stream(&self, path: &str) -> Option<Arc<StreamState>> {
         self.streams.get(path).map(|stream| stream.clone())
+    }
+
+    /// Decide a target PUT under the appender lifecycle lock. This is separate
+    /// from request liveness because a compatible PUT refreshes sliding TTL,
+    /// whereas an expired target must be retired through the bounded executor.
+    pub(crate) async fn put_target_admission(
+        self: &Arc<Self>,
+        path: &str,
+        config: &StreamConfig,
+    ) -> PutTargetAdmission {
+        let Some(stream) = self.registered_stream(path) else {
+            return PutTargetAdmission::Vacant;
+        };
+        self.put_target_admission_for(stream, config).await
+    }
+
+    /// Classify one already-observed exact target identity. Losing that identity
+    /// while waiting for its appender is retryable, not a fresh vacancy.
+    pub(crate) async fn put_target_admission_for(
+        self: &Arc<Self>,
+        stream: Arc<StreamState>,
+        config: &StreamConfig,
+    ) -> PutTargetAdmission {
+        let appender = stream.appender.lock().await;
+        let current = self.registered_stream(&stream.path);
+        let exact = current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &stream));
+        if !exact {
+            drop(appender);
+            return PutTargetAdmission::Retryable;
+        }
+        if stream.shared.read().unwrap().soft_deleted {
+            return PutTargetAdmission::Conflict;
+        }
+        if stream.fenced.load(Ordering::Acquire) {
+            return PutTargetAdmission::Retryable;
+        }
+        let now = SystemTime::now();
+        if stream.is_expired_at(now) {
+            return PutTargetAdmission::Expired(stream.clone());
+        }
+        if !config_matches(&stream, config) {
+            return PutTargetAdmission::Conflict;
+        }
+        if stream.config.ttl_seconds.is_some() {
+            stream.touch_at(now);
+            self.mark_meta_dirty(&stream);
+        }
+        PutTargetAdmission::Compatible(stream.clone())
     }
 
     /// Serialize GET/HEAD liveness against an explicit retirement fence. A GET
@@ -1752,8 +1813,10 @@ impl Store {
         base_offset: u64,
     ) -> std::io::Result<CreateResult> {
         use dashmap::mapref::entry::Entry;
-        // Fast path: existing stream → config comparison.
-        if let Some(existing) = self.get(path) {
+        // This synchronous primitive deliberately makes no expiry decision.
+        // Public target PUT classifies expiry under the appender lock and routes
+        // it through bounded retirement before attempting vacant creation.
+        if let Some(existing) = self.registered_stream(path) {
             if existing.shared.read().unwrap().soft_deleted {
                 return Ok(CreateResult::Conflict);
             }

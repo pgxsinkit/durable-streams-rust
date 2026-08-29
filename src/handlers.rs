@@ -779,7 +779,46 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
         }
     };
 
-    // Run create on the blocking pool: it opens the data file and does a durable
+    // Classify an occupied target under its appender lifecycle lock before any
+    // provisional-file work. An expiry owner may make exactly one vacant-create
+    // attempt after the bounded logical phase completes.
+    match store.put_target_admission(&path, &config).await {
+        PutTargetAdmission::Vacant => {}
+        PutTargetAdmission::Compatible(st) => return existing_create_response(&st),
+        PutTargetAdmission::Conflict => {
+            return text_response(409, "stream exists with different configuration")
+        }
+        PutTargetAdmission::Retryable => return retirement_retry_after("1"),
+        PutTargetAdmission::Expired(stream) => match store.retire_expiry(stream).await {
+            ExplicitRetirementResult::Owner(_) => {
+                match store.put_target_admission(&path, &config).await {
+                    PutTargetAdmission::Vacant => {}
+                    PutTargetAdmission::Compatible(st) => return existing_create_response(&st),
+                    PutTargetAdmission::Conflict => {
+                        return text_response(409, "stream exists with different configuration")
+                    }
+                    // This PUT has already performed its one expiry retirement;
+                    // do not adopt another incumbent or loop on a moving target.
+                    PutTargetAdmission::Expired(_) | PutTargetAdmission::Retryable => {
+                        return retirement_retry_after("1")
+                    }
+                }
+            }
+            // A retained fork tombstone is stable but cannot be re-created.
+            ExplicitRetirementResult::Gone => {
+                return text_response(409, "stream exists with different configuration")
+            }
+            ExplicitRetirementResult::Existing(_)
+            | ExplicitRetirementResult::Missing
+            | ExplicitRetirementResult::Stale
+            | ExplicitRetirementResult::Rejected(_)
+            | ExplicitRetirementResult::Unavailable
+            | ExplicitRetirementResult::Cancelled(_) => return retirement_retry_after("1"),
+        },
+    }
+
+    // Run the one vacant create attempt on the blocking pool: it opens the data
+    // file and does a durable
     // (fsync) `.meta` write, which would otherwise block an async worker for the
     // whole fsync. Under concurrent stream creation that throttles creates to
     // ~(worker_count / fsync_latency) and times them out (the "stream creation
@@ -787,8 +826,12 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
     // fsync concurrently and the async workers stay free to dispatch.
     let result = {
         let store = store.clone();
-        match tokio::task::spawn_blocking(move || store.create(&path, config, parent, base_offset))
-            .await
+        let create_path = path.clone();
+        let create_config = config.clone();
+        match tokio::task::spawn_blocking(move || {
+            store.create(&create_path, create_config, parent, base_offset)
+        })
+        .await
         {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return text_response(500, &e.to_string()),
@@ -796,17 +839,14 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
         }
     };
     match result {
-        CreateResult::Conflict => text_response(409, "stream exists with different configuration"),
-        CreateResult::Exists(st) => {
-            st.touch();
-            let t = st.tail();
-            let mut b = ResponseBuilder::new(200)
-                .h("content-type", st.config.content_type.clone())
-                .h(H_NEXT_OFFSET, format_offset(t.bytes));
-            if t.closed {
-                b = b.hs(H_CLOSED, "true");
-            }
-            b.body(empty())
+        // An entry may have won the final DashMap race after the preflight.
+        // Classify that exact winner under its appender lock; never write this
+        // request's initial body into a winner it did not create.
+        CreateResult::Conflict => classify_occupied_create_race(&store, &path, None, &config).await,
+        CreateResult::Exists(existing) => {
+            // Classify this exact winner, so a concurrent retirement cannot
+            // make an identity-less occupied race look vacant.
+            classify_occupied_create_race(&store, &path, Some(existing), &config).await
         }
         CreateResult::Created(st) => {
             let notify_subscription = wire.is_some();
@@ -892,6 +932,38 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             }
             b.body(empty())
         }
+    }
+}
+
+fn existing_create_response(st: &StreamState) -> Resp {
+    let t = st.tail();
+    let mut response = ResponseBuilder::new(200)
+        .h("content-type", st.config.content_type.clone())
+        .h(H_NEXT_OFFSET, format_offset(t.bytes));
+    if t.closed {
+        response = response.hs(H_CLOSED, "true");
+    }
+    response.body(empty())
+}
+
+async fn classify_occupied_create_race(
+    store: &Arc<Store>,
+    path: &str,
+    winner: Option<Arc<StreamState>>,
+    config: &StreamConfig,
+) -> Resp {
+    let admission = match winner {
+        Some(winner) => store.put_target_admission_for(winner, config).await,
+        None => store.put_target_admission(path, config).await,
+    };
+    match admission {
+        PutTargetAdmission::Compatible(st) => existing_create_response(&st),
+        PutTargetAdmission::Conflict => {
+            text_response(409, "stream exists with different configuration")
+        }
+        PutTargetAdmission::Vacant
+        | PutTargetAdmission::Expired(_)
+        | PutTargetAdmission::Retryable => retirement_retry_after("1"),
     }
 }
 
@@ -3285,6 +3357,258 @@ mod explicit_delete_handler_tests {
         assert_eq!(stream.shared.read().unwrap().last_access, before);
         assert!(!stream.meta_dirty.load(Ordering::Acquire));
         shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod target_put_tests {
+    use super::*;
+    use crate::retirement::RetirementConfig;
+    use crate::store::{
+        set_delete_fault_for, CreateResult, InflightAppendGuard, Store, StreamConfig,
+        DELETE_FAULT_LOCK,
+    };
+    use crate::tier::TierConfig;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::UNIX_EPOCH;
+    use tokio::time::timeout;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn directory(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ds-target-put-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn config(ttl_seconds: Option<u64>) -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    fn put(path: &str, ttl_seconds: Option<u64>, body: &'static [u8]) -> Req {
+        let mut headers = vec![("content-type".into(), "application/octet-stream".into())];
+        if let Some(ttl_seconds) = ttl_seconds {
+            headers.push((H_TTL.into(), ttl_seconds.to_string()));
+        }
+        Req {
+            method: Method::Put,
+            path: path.into(),
+            query: None,
+            headers,
+            body: Bytes::from_static(body),
+        }
+    }
+
+    fn store(tag: &str) -> (std::path::PathBuf, Arc<Store>) {
+        let directory = directory(tag);
+        let _ = std::fs::remove_dir_all(&directory);
+        (
+            directory.clone(),
+            Arc::new(Store::new_with_tier(directory, TierConfig::default()).unwrap()),
+        )
+    }
+
+    fn create(store: &Store, path: &str, ttl_seconds: Option<u64>) -> Arc<StreamState> {
+        match store.create(path, config(ttl_seconds), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected fresh stream"),
+        }
+    }
+
+    fn retry_after(response: &Resp) -> Option<&str> {
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "retry-after")
+            .map(|(_, value)| value.as_str())
+    }
+
+    async fn wait_fenced(stream: &StreamState) {
+        timeout(Duration::from_secs(5), async {
+            while !stream.fenced.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement must fence its exact stream");
+    }
+
+    async fn wait_removed(stream: &StreamState) {
+        timeout(Duration::from_secs(5), async {
+            while stream.file_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical cleanup must finish");
+    }
+
+    async fn shutdown(store: &Store) {
+        if let Some(executor) = store.retirement_executor() {
+            executor.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn target_put_compatible_ttl_touches_but_conflict_does_not() {
+        let (directory, store) = store("compatible-touch");
+        let stream = create(&store, "stream", Some(3_600));
+        let before = SystemTime::now() - Duration::from_secs(10);
+        stream.shared.write().unwrap().last_access = before;
+
+        assert_eq!(
+            handle(store.clone(), put("stream", Some(3_600), b""))
+                .await
+                .status,
+            200
+        );
+        let touched = stream.shared.read().unwrap().last_access;
+        assert!(touched > before);
+        assert!(stream.meta_dirty.load(Ordering::Acquire));
+        stream.meta_dirty.store(false, Ordering::Release);
+
+        assert_eq!(
+            handle(store.clone(), put("stream", None, b"")).await.status,
+            409
+        );
+        assert_eq!(stream.shared.read().unwrap().last_access, touched);
+        assert!(!stream.meta_dirty.load(Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn target_put_expiry_recreates_before_failed_old_cleanup_can_touch_new_identity() {
+        let _fault = DELETE_FAULT_LOCK.lock().await;
+        let _durability = test_support::DurabilityGuard::memory();
+        let (directory, store) = store("expiry-recreate");
+        store
+            .init_retirement_executor_for_test(RetirementConfig {
+                retry_base: Duration::from_millis(1),
+                ..RetirementConfig::default()
+            })
+            .unwrap();
+        let old = create(&store, "stream", Some(1));
+        old.shared.write().unwrap().last_access = UNIX_EPOCH;
+        set_delete_fault_for(&old, 2);
+
+        let response = handle(store.clone(), put("stream", None, b"new")).await;
+        assert_eq!(response.status, 201);
+        let new = store.registered_stream("stream").unwrap();
+        assert_ne!(new.id, old.id);
+        assert!(new.file_path.exists());
+        assert_eq!(new.tail().bytes, 3);
+        assert!(old.fenced.load(Ordering::Acquire));
+        set_delete_fault_for(&old, 0);
+        wait_removed(&old).await;
+        assert!(Arc::ptr_eq(
+            &store.registered_stream("stream").unwrap(),
+            &new
+        ));
+        assert!(new.file_path.exists());
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn target_put_duplicate_and_queue_full_are_retryable_without_fallback() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let (directory, store) = store("duplicate-queue");
+        store
+            .init_retirement_executor_for_test(RetirementConfig {
+                queue_capacity: 1,
+                ..RetirementConfig::default()
+            })
+            .unwrap();
+        let first = create(&store, "first", Some(1));
+        let second = create(&store, "second", Some(1));
+        first.shared.write().unwrap().last_access = UNIX_EPOCH;
+        second.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let appender = first.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&first, &appender).unwrap();
+        drop(appender);
+        let owner_store = store.clone();
+        let owner = tokio::spawn(async move { handle(owner_store, put("first", None, b"")).await });
+        wait_fenced(&first).await;
+
+        let duplicate = handle(store.clone(), put("first", None, b"")).await;
+        assert_eq!(duplicate.status, 503);
+        assert_eq!(retry_after(&duplicate), Some("1"));
+        let saturated = handle(store.clone(), put("second", None, b"")).await;
+        assert_eq!(saturated.status, 503);
+        assert_eq!(retry_after(&saturated), Some("1"));
+        assert!(!second.fenced.load(Ordering::Acquire));
+        assert!(second.file_path.exists());
+        drop(guard);
+        assert_eq!(
+            timeout(Duration::from_secs(5), owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            201
+        );
+        wait_removed(&first).await;
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn target_put_retained_soft_tombstone_is_conflict() {
+        let (directory, store) = store("soft-tombstone");
+        store.init_retirement_executor().unwrap();
+        let stream = create(&store, "stream", None);
+        stream.shared.write().unwrap().ref_count = 1;
+        assert!(matches!(
+            store.retire_explicit(stream.clone()).await,
+            ExplicitRetirementResult::Owner(_)
+        ));
+        assert!(stream.shared.read().unwrap().soft_deleted);
+        assert_eq!(
+            handle(store.clone(), put("stream", None, b"")).await.status,
+            409
+        );
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn target_put_waiting_for_appender_loses_to_fence_without_touching() {
+        let (directory, store) = store("fence-race");
+        let stream = create(&store, "stream", Some(3_600));
+        let before = SystemTime::now() - Duration::from_secs(1);
+        stream.shared.write().unwrap().last_access = before;
+        let appender = stream.appender.lock().await;
+        let waiting_store = store.clone();
+        let waiting =
+            tokio::spawn(
+                async move { handle(waiting_store, put("stream", Some(3_600), b"")).await },
+            );
+        tokio::task::yield_now().await;
+        stream.fence_while_holding_appender(&appender);
+        drop(appender);
+
+        assert_eq!(
+            timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            503
+        );
+        assert_eq!(stream.shared.read().unwrap().last_access, before);
+        assert!(!stream.meta_dirty.load(Ordering::Acquire));
         let _ = std::fs::remove_dir_all(directory);
     }
 }
