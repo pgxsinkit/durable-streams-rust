@@ -3,6 +3,8 @@ mod api;
 mod blobstore;
 mod data_dir_lock;
 mod engine_raw;
+#[allow(dead_code)] // ehu-b wires the standalone index into Store/scanner paths.
+mod expiration;
 mod handlers;
 mod http1;
 mod reserved_paths;
