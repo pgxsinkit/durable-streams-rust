@@ -2199,10 +2199,9 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        (
-            Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap()),
-            dir,
-        )
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        store.init_retirement_executor().unwrap();
+        (store, dir)
     }
 
     fn test_subscription(

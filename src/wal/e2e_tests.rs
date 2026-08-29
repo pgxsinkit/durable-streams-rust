@@ -88,6 +88,7 @@ impl Harness {
             .wal
             .set(Arc::clone(&walset))
             .unwrap_or_else(|_| panic!("WAL already attached"));
+        store.init_retirement_executor()?;
         // Spawn committers ourselves (not `walset.spawn_committers()`) so we keep
         // the handles and can stop them to simulate a crash.
         let mut committers = Vec::new();

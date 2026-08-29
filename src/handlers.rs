@@ -2584,30 +2584,42 @@ fn handle_head(store: Arc<Store>, path: String) -> Resp {
 // ---------- DELETE ----------
 
 async fn handle_delete(store: Arc<Store>, path: String) -> Resp {
-    let st = match store.get(&path) {
+    let st = match store.registered_stream(&path) {
         Some(s) => s,
         None => return text_response(404, "stream not found"),
     };
     if st.shared.read().unwrap().soft_deleted {
         return gone();
     }
-    // The 204 is a durability promise: once acked, a crash must never
-    // resurrect the stream. Await the on-disk removal (unlinks + parent-dir
-    // fsync, or the soft-delete meta flag) before responding — a detached
-    // removal task can be lost to a crash after the ack.
-    let store2 = Arc::clone(&store);
-    let st2 = Arc::clone(&st);
-    match tokio::task::spawn_blocking(move || store2.delete_or_soft_delete_durable(&st2)).await {
-        Ok(Ok(_)) => {
-            store
-                .subscriptions
-                .clone()
-                .on_stream_deleted(store.clone(), &path)
-                .await;
-            ResponseBuilder::new(204).body(empty())
+    let expired_at_dispatch = st.is_expired_at(SystemTime::now());
+    match store.retire_explicit(st).await {
+        ExplicitRetirementResult::Owner(_) if expired_at_dispatch => {
+            text_response(404, "stream not found")
         }
-        _ => text_response(500, "delete not durable"),
+        ExplicitRetirementResult::Owner(ticket) => match ticket.wait_first_attempt().await {
+            crate::retirement::FirstAttemptCompletion::Succeeded { .. } => {
+                ResponseBuilder::new(204).body(empty())
+            }
+            crate::retirement::FirstAttemptCompletion::Failed
+            | crate::retirement::FirstAttemptCompletion::Cancelled => retirement_retry_after("1"),
+        },
+        ExplicitRetirementResult::Missing => text_response(404, "stream not found"),
+        ExplicitRetirementResult::Gone => gone(),
+        ExplicitRetirementResult::Rejected(crate::retirement::RetirementAdmission::CoolingDown) => {
+            retirement_retry_after("60")
+        }
+        ExplicitRetirementResult::Existing(_)
+        | ExplicitRetirementResult::Rejected(_)
+        | ExplicitRetirementResult::Unavailable
+        | ExplicitRetirementResult::Cancelled(_)
+        | ExplicitRetirementResult::Stale => retirement_retry_after("1"),
     }
+}
+
+fn retirement_retry_after(seconds: &'static str) -> Resp {
+    ResponseBuilder::new(503)
+        .hs("retry-after", seconds)
+        .body(empty())
 }
 
 #[cfg(test)]
@@ -2734,6 +2746,367 @@ mod deletion_wakes_tests {
         signal.await.unwrap();
         assert!(source.next().await.is_none(), "no post-delete event");
 
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod explicit_delete_handler_tests {
+    use super::*;
+    use crate::retirement::RetirementConfig;
+    use crate::store::{
+        set_delete_fault_for, CreateResult, InflightAppendGuard, Store, StreamConfig,
+        DELETE_FAULT_LOCK,
+    };
+    use crate::tier::TierConfig;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::time::timeout;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct DeleteFaultReset(Arc<StreamState>);
+
+    impl Drop for DeleteFaultReset {
+        fn drop(&mut self) {
+            set_delete_fault_for(&self.0, 0);
+        }
+    }
+
+    fn directory(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ds-explicit-delete-handler-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn config(expires_at: Option<SystemTime>) -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    fn store(tag: &str) -> (std::path::PathBuf, Arc<Store>) {
+        let directory = directory(tag);
+        let _ = std::fs::remove_dir_all(&directory);
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        (directory, store)
+    }
+
+    fn create(store: &Store, path: &str, expires_at: Option<SystemTime>) -> Arc<StreamState> {
+        match store.create(path, config(expires_at), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected stream creation"),
+        }
+    }
+
+    fn retry_after(response: &Resp) -> Option<&str> {
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "retry-after")
+            .map(|(_, value)| value.as_str())
+    }
+
+    async fn wait_fenced(stream: &StreamState) {
+        timeout(Duration::from_secs(5), async {
+            while !stream.fenced.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement must fence the stream");
+    }
+
+    async fn wait_for_removal(stream: &StreamState) {
+        timeout(Duration::from_secs(5), async {
+            while stream.file_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background cleanup must remove the stream");
+    }
+
+    async fn wait_for_parent_refcount(parent: &StreamState, ref_count: u32) {
+        let meta = crate::store::meta_path(&parent.file_path);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let persisted = std::fs::read(&meta)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<crate::store::Meta>(&bytes).ok())
+                    .is_some_and(|meta| meta.ref_count == ref_count);
+                if persisted {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("parent refcount must be persisted");
+    }
+
+    async fn shutdown(store: &Store) {
+        if let Some(executor) = store.retirement_executor() {
+            executor.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_delete_handler_hard_success_waits_for_durable_cleanup() {
+        let _fault = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = store("hard-success");
+        store.init_retirement_executor().unwrap();
+        let stream = create(&store, "stream", None);
+
+        let response = handle_delete(store.clone(), "stream".into()).await;
+
+        assert_eq!(response.status, 204);
+        assert!(retry_after(&response).is_none());
+        assert!(!stream.file_path.exists());
+        assert!(store.registered_stream("stream").is_none());
+        shutdown(&store).await;
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_delete_handler_fork_child_cleanup_enters_runtime_for_parent_release() {
+        let _fault = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = store("fork-child");
+        store.init_retirement_executor().unwrap();
+        let parent = create(&store, "parent", None);
+        let child = match store
+            .create("child", config(None), Some(parent.clone()), 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected fork child creation"),
+        };
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+
+        assert_eq!(
+            handle_delete(store.clone(), "child".into()).await.status,
+            204
+        );
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+        wait_for_parent_refcount(&parent, 0).await;
+        shutdown(&store).await;
+        drop(child);
+        drop(parent);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_delete_handler_soft_success_persists_tombstone() {
+        let _fault = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = store("soft-success");
+        store.init_retirement_executor().unwrap();
+        let stream = create(&store, "stream", None);
+        stream.shared.write().unwrap().ref_count = 1;
+
+        let response = handle_delete(store.clone(), "stream".into()).await;
+
+        assert_eq!(response.status, 204);
+        assert!(stream.file_path.exists());
+        assert!(
+            store
+                .registered_stream("stream")
+                .unwrap()
+                .shared
+                .read()
+                .unwrap()
+                .soft_deleted
+        );
+        shutdown(&store).await;
+        drop(stream);
+        drop(store);
+        let reopened = Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap();
+        assert!(
+            reopened
+                .registered_stream("stream")
+                .unwrap()
+                .shared
+                .read()
+                .unwrap()
+                .soft_deleted
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_delete_handler_first_failure_returns_retry_then_retries() {
+        let _fault = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = store("retry");
+        let retirement = RetirementConfig {
+            retry_base: Duration::from_millis(1),
+            ..RetirementConfig::default()
+        };
+        store.init_retirement_executor_for_test(retirement).unwrap();
+        let stream = create(&store, "stream", None);
+        let _reset = DeleteFaultReset(stream.clone());
+        set_delete_fault_for(&stream, 2);
+
+        let response = handle_delete(store.clone(), "stream".into()).await;
+
+        assert_eq!(response.status, 503);
+        assert_eq!(retry_after(&response), Some("1"));
+        assert!(stream.fenced.load(Ordering::Acquire));
+        assert!(stream.file_path.exists());
+        set_delete_fault_for(&stream, 0);
+        wait_for_removal(&stream).await;
+        shutdown(&store).await;
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_delete_handler_duplicate_is_retryable_while_owner_waits() {
+        let _fault = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = store("duplicate");
+        store.init_retirement_executor().unwrap();
+        let stream = create(&store, "stream", None);
+        let appender = stream.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&stream, &appender).unwrap();
+        drop(appender);
+        let owner_store = store.clone();
+        let owner = tokio::spawn(async move { handle_delete(owner_store, "stream".into()).await });
+        wait_fenced(&stream).await;
+
+        let duplicate = handle_delete(store.clone(), "stream".into()).await;
+        assert_eq!(duplicate.status, 503);
+        assert_eq!(retry_after(&duplicate), Some("1"));
+        drop(guard);
+        assert_eq!(
+            timeout(Duration::from_secs(5), owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            204
+        );
+        shutdown(&store).await;
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_delete_handler_queue_full_has_no_fallback() {
+        let _fault = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = store("queue-full");
+        let retirement = RetirementConfig {
+            queue_capacity: 1,
+            ..RetirementConfig::default()
+        };
+        store.init_retirement_executor_for_test(retirement).unwrap();
+        let first = create(&store, "first", None);
+        let second = create(&store, "second", None);
+        let appender = first.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&first, &appender).unwrap();
+        drop(appender);
+        let owner_store = store.clone();
+        let owner = tokio::spawn(async move { handle_delete(owner_store, "first".into()).await });
+        wait_fenced(&first).await;
+
+        let response = handle_delete(store.clone(), "second".into()).await;
+        assert_eq!(response.status, 503);
+        assert_eq!(retry_after(&response), Some("1"));
+        assert!(second.file_path.exists());
+        assert!(store.registered_stream("second").is_some());
+        drop(guard);
+        assert_eq!(
+            timeout(Duration::from_secs(5), owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            204
+        );
+        shutdown(&store).await;
+        drop(first);
+        drop(second);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_delete_handler_due_owner_is_not_a_duplicate_success() {
+        let _fault = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = store("due");
+        store.init_retirement_executor().unwrap();
+        let stream = create(&store, "stream", Some(SystemTime::UNIX_EPOCH));
+        let appender = stream.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&stream, &appender).unwrap();
+        drop(appender);
+        let owner_store = store.clone();
+        let owner = tokio::spawn(async move { handle_delete(owner_store, "stream".into()).await });
+        wait_fenced(&stream).await;
+
+        let duplicate = handle_delete(store.clone(), "stream".into()).await;
+        assert_eq!(duplicate.status, 503);
+        assert_eq!(retry_after(&duplicate), Some("1"));
+        drop(guard);
+        assert_eq!(
+            timeout(Duration::from_secs(5), owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            404
+        );
+        wait_for_removal(&stream).await;
+        shutdown(&store).await;
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_delete_handler_maps_missing_gone_and_unavailable() {
+        let (missing_directory, missing_store) = store("missing");
+        assert_eq!(
+            handle_delete(missing_store.clone(), "stream".into())
+                .await
+                .status,
+            404
+        );
+        drop(missing_store);
+        let _ = std::fs::remove_dir_all(missing_directory);
+
+        let (gone_directory, gone_store) = store("gone");
+        let gone = create(&gone_store, "stream", None);
+        gone.shared.write().unwrap().soft_deleted = true;
+        assert_eq!(
+            handle_delete(gone_store.clone(), "stream".into())
+                .await
+                .status,
+            410
+        );
+        drop(gone);
+        drop(gone_store);
+        let _ = std::fs::remove_dir_all(gone_directory);
+
+        let (directory, store) = store("unavailable");
+        let stream = create(&store, "stream", None);
+        let response = handle_delete(store.clone(), "stream".into()).await;
+        assert_eq!(response.status, 503);
+        assert_eq!(retry_after(&response), Some("1"));
+        assert!(stream.file_path.exists());
+        drop(stream);
+        drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }
 }

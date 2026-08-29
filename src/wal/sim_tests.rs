@@ -292,6 +292,9 @@ fn boot(
         .wal
         .set(Arc::clone(&walset))
         .unwrap_or_else(|_| panic!("WAL already attached"));
+    store
+        .init_retirement_executor()
+        .expect("retirement executor initialization");
     let mut committers = Vec::new();
     for shard in walset.shards() {
         committers.push(shard.spawn_committer());

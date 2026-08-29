@@ -913,6 +913,21 @@ impl Store {
     pub(crate) fn init_retirement_executor(
         self: &Arc<Self>,
     ) -> std::io::Result<&Arc<crate::retirement::RetirementExecutor>> {
+        self.init_retirement_executor_with_config(crate::retirement::RetirementConfig::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn init_retirement_executor_for_test(
+        self: &Arc<Self>,
+        config: crate::retirement::RetirementConfig,
+    ) -> std::io::Result<&Arc<crate::retirement::RetirementExecutor>> {
+        self.init_retirement_executor_with_config(config)
+    }
+
+    fn init_retirement_executor_with_config(
+        self: &Arc<Self>,
+        config: crate::retirement::RetirementConfig,
+    ) -> std::io::Result<&Arc<crate::retirement::RetirementExecutor>> {
         let _init = self
             .retirement_init
             .lock()
@@ -923,20 +938,21 @@ impl Store {
                 "retirement executor already initialized",
             ));
         }
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            std::io::Error::other("retirement executor initialization requires a Tokio runtime")
+        })?;
 
         let store = Arc::downgrade(self);
         let cleanup: crate::retirement::CleanupCallback = Arc::new(move |stream, mode| {
+            let _runtime = runtime.enter();
             let store = store.upgrade().ok_or_else(|| {
                 std::io::Error::other("retirement cleanup ran after Store was dropped")
             })?;
             store.finalize_retirement_cleanup(stream, mode)
         });
         let executor = Arc::new(
-            crate::retirement::RetirementExecutor::new(
-                cleanup,
-                crate::retirement::RetirementConfig::default(),
-            )
-            .map_err(std::io::Error::other)?,
+            crate::retirement::RetirementExecutor::new(cleanup, config)
+                .map_err(std::io::Error::other)?,
         );
         self.retirement_executor
             .set(executor)
@@ -952,6 +968,11 @@ impl Store {
         &self,
     ) -> Option<&Arc<crate::retirement::RetirementExecutor>> {
         self.retirement_executor.get()
+    }
+
+    /// Clone the currently registered stream without triggering lazy expiry.
+    pub(crate) fn registered_stream(&self, path: &str) -> Option<Arc<StreamState>> {
+        self.streams.get(path).map(|stream| stream.clone())
     }
 
     /// Retire one exact registered stream incarnation. This only linearizes
@@ -1465,6 +1486,7 @@ impl Store {
     /// soft-delete meta flag — are durable on disk before this returns, so a
     /// post-ack crash can never resurrect the stream. Synchronous file I/O +
     /// fsync: call from a blocking context.
+    #[allow(dead_code)] // Retained for lazy expiry and legacy primitive tests until 005c follow-up.
     pub fn delete_or_soft_delete_durable(
         &self,
         st: &Arc<StreamState>,
@@ -1488,7 +1510,7 @@ impl Store {
         };
         if soft {
             #[cfg(test)]
-            if DELETE_FAULT.load(Ordering::Relaxed) == 1 {
+            if delete_fault_for(st) == 1 {
                 st.shared.write().unwrap().soft_deleted = false;
                 return Err(std::io::Error::other(
                     "injected soft-delete metadata failure",
@@ -1526,7 +1548,7 @@ impl Store {
         mode: LocalCleanupMode,
     ) -> std::io::Result<LocalCleanupOutcome> {
         #[cfg(test)]
-        if DELETE_FAULT.load(Ordering::Relaxed) == 2 {
+        if delete_fault_for(st) == 2 {
             return Err(std::io::Error::other("injected local cleanup failure"));
         }
 
@@ -1587,7 +1609,7 @@ impl Store {
 
         if mode == LocalCleanupMode::ExplicitDelete {
             #[cfg(test)]
-            if DELETE_FAULT.load(Ordering::Relaxed) == 3 {
+            if delete_fault_for(st) == 3 {
                 return Err(std::io::Error::other(
                     "injected parent-directory sync failure",
                 ));
@@ -1779,6 +1801,35 @@ impl Store {
 static DELETE_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 #[cfg(test)]
 pub(crate) static DELETE_FAULT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(test)]
+static DELETE_FAULT_STREAM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+static DELETE_FAULT_TARGET: std::sync::LazyLock<StdMutex<Option<std::sync::Weak<StreamState>>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(None));
+
+#[cfg(test)]
+pub(crate) fn set_delete_fault_for(stream: &Arc<StreamState>, fault: u8) {
+    *DELETE_FAULT_TARGET.lock().unwrap() = Some(Arc::downgrade(stream));
+    DELETE_FAULT_STREAM.store(fault, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn delete_fault_for(stream: &StreamState) -> u8 {
+    let global = DELETE_FAULT.load(Ordering::Relaxed);
+    if global != 0 {
+        global
+    } else if DELETE_FAULT_TARGET
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+        .is_some_and(|target| std::ptr::eq(target.as_ref(), stream))
+    {
+        DELETE_FAULT_STREAM.load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
 
 fn config_matches(existing: &StreamState, requested: &StreamConfig) -> bool {
     let ex = &existing.config;
