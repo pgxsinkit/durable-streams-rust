@@ -18,6 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
+use crate::expiration::{ExpirationCandidate, ExpirationCursor, ExpirationPage, ExpiringStreams};
+
 pub const MAX_SAFE_INT: u64 = (1u64 << 53) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -614,6 +616,9 @@ impl StreamState {
 
 pub struct Store {
     pub streams: DashMap<String, Arc<StreamState>>,
+    /// Membership-only index for immutable TTL/absolute-expiry policies. It
+    /// holds weak identities and is deliberately not a deadline scheduler.
+    expiring_streams: ExpiringStreams,
     pub data_dir: PathBuf,
     next_id: AtomicU64,
     /// Hot/cold tiering config (Off by default → fully inert).
@@ -996,6 +1001,7 @@ impl Store {
         let blobstore = build_blobstore(&tier_config, &data_dir)?;
         let store = Store {
             streams: DashMap::new(),
+            expiring_streams: ExpiringStreams::default(),
             data_dir,
             next_id: AtomicU64::new(seed & MAX_SAFE_INT),
             tier_config,
@@ -1412,7 +1418,12 @@ impl Store {
                 return self.cancel_retirement(&executor, &stream, ticket);
             }
             if shared.ref_count > 0 {
+                // Registration takes DashMap → shared → expiration-index. Hold
+                // this write through exact removal so a registrar either reads
+                // the old live state and finishes first, or observes this
+                // tombstone and never leaves membership behind.
                 shared.soft_deleted = true;
+                self.expiring_streams.unregister_exact(&stream);
                 true
             } else {
                 false
@@ -1425,6 +1436,10 @@ impl Store {
             if removed.is_none() {
                 return self.cancel_retirement(&executor, &stream, ticket);
             }
+            // Hard retirement removes registry before index membership. A
+            // racing creator/recoverer holding the exact DashMap identity must
+            // finish its registration before remove_if can win.
+            self.expiring_streams.unregister_exact(&stream);
             self.remove_inventory(&stream.path, stream.id);
         }
 
@@ -1455,6 +1470,50 @@ impl Store {
             .is_some_and(|current| current.id == stream.id && Arc::ptr_eq(current.value(), stream))
     }
 
+    fn has_expiration_policy(stream: &StreamState) -> bool {
+        stream.config.ttl_seconds.is_some() || stream.config.expires_at.is_some()
+    }
+
+    /// Register a durable exact live identity in the expiration index.
+    ///
+    /// Lock order is DashMap identity → stream shared state → expiration index.
+    /// The index itself never calls back into Store, so this one-way nesting
+    /// makes create/recovery registration atomic with soft retirement's shared
+    /// transition and ordered before hard retirement's registry removal.
+    fn register_expiring_if_exact_live(&self, stream: &Arc<StreamState>) {
+        if !Self::has_expiration_policy(stream) {
+            return;
+        }
+        let Some(current) = self.streams.get(&stream.path) else {
+            return;
+        };
+        if current.id != stream.id || !Arc::ptr_eq(current.value(), stream) {
+            return;
+        }
+        #[cfg(test)]
+        expiration_registration_test_support::wait_before_index_register(stream);
+        let shared = stream.shared.read().unwrap();
+        if !shared.soft_deleted {
+            self.expiring_streams.register_exact(stream);
+        }
+    }
+
+    /// Future scanners own the cursor; this only copies a bounded weak page.
+    #[allow(dead_code)] // ehu-c owns the scanner loop that consumes this page.
+    pub(crate) fn expiration_page(&self, cursor: ExpirationCursor, limit: usize) -> ExpirationPage {
+        self.expiring_streams.page(cursor, limit)
+    }
+
+    #[allow(dead_code)] // ehu-c owns the scanner loop that consumes this page.
+    pub(crate) fn prune_expiration_candidate(&self, candidate: &ExpirationCandidate) -> bool {
+        self.expiring_streams.prune_dead(candidate)
+    }
+
+    #[cfg(test)]
+    fn expiration_count(&self) -> usize {
+        self.expiring_streams.len()
+    }
+
     #[allow(dead_code)]
     fn is_exact_live(&self, stream: &Arc<StreamState>) -> bool {
         self.is_exact_registered(stream) && !stream.shared.read().unwrap().soft_deleted
@@ -1473,6 +1532,7 @@ impl Store {
         };
         if restored {
             self.publish_inventory(stream);
+            self.register_expiring_if_exact_live(stream);
         }
     }
 
@@ -1834,6 +1894,10 @@ impl Store {
             });
         }
         self.streams.insert(path.to_string(), state.clone());
+        // Recovery runs before serving, so this establishes weak membership for
+        // every durable live policy stream. Durable soft tombstones are fenced
+        // and deliberately excluded by the exact-live helper.
+        self.register_expiring_if_exact_live(&state);
         Some(state)
     }
 
@@ -1888,6 +1952,7 @@ impl Store {
             let mut s = st.shared.write().unwrap();
             if s.ref_count > 0 {
                 s.soft_deleted = true;
+                self.expiring_streams.unregister_exact(st);
                 true
             } else {
                 false
@@ -1897,12 +1962,14 @@ impl Store {
             #[cfg(test)]
             if delete_fault_for(st) == 1 {
                 st.shared.write().unwrap().soft_deleted = false;
+                self.register_expiring_if_exact_live(st);
                 return Err(std::io::Error::other(
                     "injected soft-delete metadata failure",
                 ));
             }
             if let Err(error) = write_meta_sync(st, true) {
                 st.shared.write().unwrap().soft_deleted = false;
+                self.register_expiring_if_exact_live(st);
                 return Err(error);
             }
             self.publish_inventory(st);
@@ -1917,6 +1984,7 @@ impl Store {
                 current.id == st.id && Arc::ptr_eq(current, st)
             });
             if removed.is_some() {
+                self.expiring_streams.unregister_exact(st);
                 self.remove_inventory(&st.path, st.id);
                 let _ = self.release_parent(st);
             }
@@ -2121,6 +2189,7 @@ impl Store {
             let _ = executor.cancel_prelogical(parent, &ticket);
             return Ok(SoftParentCollectionAdmission::Skipped);
         }
+        self.expiring_streams.unregister_exact(parent);
         self.remove_inventory(&parent.path, parent.id);
         if executor.release_logical(parent, &ticket) {
             return Ok(SoftParentCollectionAdmission::HandedOff(ticket));
@@ -2256,6 +2325,10 @@ impl Store {
                             return Err(e);
                         }
                     }
+                    #[cfg(test)]
+                    if CREATE_META_FAIL_ONCE.swap(false, Ordering::AcqRel) {
+                        return Err(std::io::Error::other("injected create metadata failure"));
+                    }
                     if let Err(e) = write_meta_sync(&state, true) {
                         if let Some(p) = &parent {
                             p.shared.write().unwrap().ref_count -= 1;
@@ -2276,6 +2349,7 @@ impl Store {
                     let _ = std::fs::remove_file(&state.file_path);
                     return Err(e);
                 }
+                self.register_expiring_if_exact_live(&state);
                 self.publish_inventory(&state);
                 Ok(CreateResult::Created(state))
             }
@@ -2285,6 +2359,8 @@ impl Store {
 
 #[cfg(test)]
 static DELETE_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+static CREATE_META_FAIL_ONCE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static DELETE_FAULT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[cfg(test)]
@@ -4136,11 +4212,15 @@ mod recovery_collector_test_support {
     static PAUSES: std::sync::LazyLock<StdMutex<HashMap<String, PauseState>>> =
         std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+    fn pause_key(stream: &Arc<StreamState>) -> String {
+        format!("{}:{:p}", stream.path, Arc::as_ptr(stream))
+    }
+
     /// Pauses exactly one captured collector candidate before its exact
     /// admission revalidation. Dropping it releases an in-flight collector so
     /// a failed assertion cannot strand a test task.
     pub(crate) struct CapturePause {
-        path: String,
+        key: String,
         stream: Arc<StreamState>,
         held: Arc<AtomicBool>,
         reached: Arc<tokio::sync::Notify>,
@@ -4151,14 +4231,15 @@ mod recovery_collector_test_support {
         let held = Arc::new(AtomicBool::new(false));
         let reached = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let key = pause_key(stream);
         let mut pauses = PAUSES.lock().unwrap_or_else(|error| error.into_inner());
         assert!(
-            !pauses.contains_key(&stream.path),
-            "a recovery collector capture pause is already installed for {}",
+            !pauses.contains_key(&key),
+            "a recovery collector capture pause is already installed for exact {}",
             stream.path
         );
         pauses.insert(
-            stream.path.clone(),
+            key.clone(),
             PauseState {
                 stream: Arc::downgrade(stream),
                 held: Arc::clone(&held),
@@ -4167,7 +4248,7 @@ mod recovery_collector_test_support {
             },
         );
         CapturePause {
-            path: stream.path.clone(),
+            key,
             stream: Arc::clone(stream),
             held,
             reached,
@@ -4195,13 +4276,13 @@ mod recovery_collector_test_support {
         fn drop(&mut self) {
             self.release.notify_one();
             let mut pauses = PAUSES.lock().unwrap_or_else(|error| error.into_inner());
-            if pauses.get(&self.path).is_some_and(|state| {
+            if pauses.get(&self.key).is_some_and(|state| {
                 state
                     .stream
                     .upgrade()
                     .is_some_and(|current| Arc::ptr_eq(&current, &self.stream))
             }) {
-                pauses.remove(&self.path);
+                pauses.remove(&self.key);
             }
         }
     }
@@ -4209,7 +4290,7 @@ mod recovery_collector_test_support {
     pub(crate) async fn wait_after_page_capture(stream: &Arc<StreamState>) {
         let state = {
             let pauses = PAUSES.lock().unwrap_or_else(|error| error.into_inner());
-            let Some(state) = pauses.get(&stream.path) else {
+            let Some(state) = pauses.get(&pause_key(stream)) else {
                 return;
             };
             if !state
@@ -4231,6 +4312,97 @@ mod recovery_collector_test_support {
             .await
             .expect("test must release recovery collector capture pause within five seconds");
         state.0.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod expiration_registration_test_support {
+    use super::*;
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    struct PauseState {
+        reached: Sender<()>,
+        release: Option<Receiver<()>>,
+    }
+
+    static PAUSES: std::sync::LazyLock<StdMutex<HashMap<String, PauseState>>> =
+        std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+    pub(crate) struct RegistrationPause {
+        path: String,
+        reached: StdMutex<Option<Receiver<()>>>,
+        release: Sender<()>,
+    }
+
+    pub(crate) fn pause_before_index_register(path: &str) -> RegistrationPause {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut pauses = PAUSES.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(
+            pauses
+                .insert(
+                    path.to_string(),
+                    PauseState {
+                        reached: reached_tx,
+                        release: Some(release_rx),
+                    },
+                )
+                .is_none(),
+            "an expiration registration pause is already installed for {path}"
+        );
+        RegistrationPause {
+            path: path.to_string(),
+            reached: StdMutex::new(Some(reached_rx)),
+            release: release_tx,
+        }
+    }
+
+    impl RegistrationPause {
+        pub(crate) async fn wait_until_held(&self) {
+            let reached = self
+                .reached
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+                .expect("wait_until_held may be called only once");
+            tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(5)))
+                .await
+                .expect("registration waiter should not panic")
+                .expect("registration should reach its pause within five seconds");
+        }
+
+        pub(crate) fn release(&self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    impl Drop for RegistrationPause {
+        fn drop(&mut self) {
+            let _ = self.release.send(());
+            PAUSES
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&self.path);
+        }
+    }
+
+    pub(crate) fn wait_before_index_register(stream: &Arc<StreamState>) {
+        let (reached, release) = {
+            let mut pauses = PAUSES.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(state) = pauses.get_mut(&stream.path) else {
+                return;
+            };
+            let Some(release) = state.release.take() else {
+                return;
+            };
+            (state.reached.clone(), release)
+        };
+        reached
+            .send(())
+            .expect("test must still be waiting for registration pause");
+        release
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test must release expiration registration pause within five seconds");
     }
 }
 
@@ -5277,6 +5449,278 @@ mod tier_tests {
         assert_eq!(seg_files, 0, "seal staged chunk files despite deleted");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod expiration_membership_tests {
+    use super::*;
+    use crate::expiration::ExpirationCursor;
+    use crate::retirement::{LogicalCompletion, TerminalCleanupCompletion};
+
+    fn config(ttl_seconds: Option<u64>, expires_at: Option<SystemTime>) -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds,
+            expires_at,
+            expires_at_raw: expires_at.map(|_| "test-absolute-expiry".into()),
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    fn temporary_store(tag: &str) -> (PathBuf, Arc<Store>) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "ds-expiration-membership-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = Arc::new(
+            Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap(),
+        );
+        (directory, store)
+    }
+
+    fn created(store: &Store, path: &str, config: StreamConfig) -> Arc<StreamState> {
+        match store.create(path, config, None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("test stream must be newly created"),
+        }
+    }
+
+    fn expiration_members(store: &Store) -> Vec<Arc<StreamState>> {
+        store
+            .expiration_page(ExpirationCursor::start(), usize::MAX)
+            .candidates
+            .into_iter()
+            .filter_map(|candidate| candidate.stream.upgrade())
+            .collect()
+    }
+
+    #[test]
+    fn durable_create_indexes_only_immutable_expiry_policies() {
+        let _fault_guard = DELETE_FAULT_LOCK.blocking_lock();
+        let (directory, store) = temporary_store("create");
+        let absolute = UNIX_EPOCH + Duration::from_secs(1);
+        let ttl = created(&store, "ttl", config(Some(1), None));
+        let absolute_stream = created(&store, "absolute", config(None, Some(absolute)));
+        let both = created(&store, "both", config(Some(1), Some(absolute)));
+        let overflow = created(&store, "overflow", config(Some(u64::MAX), None));
+        let _none = created(&store, "none", config(None, None));
+        let members = expiration_members(&store);
+        assert_eq!(store.expiration_count(), 4);
+        for expected in [&ttl, &absolute_stream, &both, &overflow] {
+            assert!(members.iter().any(|current| Arc::ptr_eq(current, expected)));
+        }
+
+        CREATE_META_FAIL_ONCE.store(true, Ordering::Release);
+        assert!(store
+            .create("failed", config(Some(1), None), None, 0)
+            .is_err());
+        assert!(store.registered_stream("failed").is_none());
+        assert_eq!(store.expiration_count(), 4);
+
+        let gate = Arc::new(std::sync::Barrier::new(3));
+        let first_store = Arc::clone(&store);
+        let first_gate = Arc::clone(&gate);
+        let first = std::thread::spawn(move || {
+            first_gate.wait();
+            first_store.create("raced", config(Some(1), None), None, 0)
+        });
+        let second_store = Arc::clone(&store);
+        let second_gate = Arc::clone(&gate);
+        let second = std::thread::spawn(move || {
+            second_gate.wait();
+            second_store.create("raced", config(Some(1), None), None, 0)
+        });
+        gate.wait();
+        let outcomes = [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CreateResult::Created(_)))
+                .count(),
+            1
+        );
+        assert_eq!(store.expiration_count(), 5);
+        assert_eq!(
+            expiration_members(&store)
+                .iter()
+                .filter(|stream| stream.path == "raced")
+                .count(),
+            1,
+            "the losing provisional identity never enters expiration membership"
+        );
+
+        drop(members);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn touches_never_change_expiration_membership() {
+        let (directory, store) = temporary_store("touch");
+        let stream = created(&store, "ttl", config(Some(60), None));
+        let before = expiration_members(&store);
+        stream.touch_at(SystemTime::now());
+        assert!(matches!(
+            store.request_liveness(Arc::clone(&stream), true).await,
+            RequestLiveness::Live(_)
+        ));
+        let after = expiration_members(&store);
+        assert_eq!(store.expiration_count(), 1);
+        assert!(Arc::ptr_eq(&before[0], &stream));
+        assert!(Arc::ptr_eq(&after[0], &stream));
+
+        drop(before);
+        drop(after);
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_registration_serializes_with_soft_and_hard_retirement() {
+        for (path, soft) in [("soft-race", true), ("hard-race", false)] {
+            let (directory, store) = temporary_store(path);
+            store.init_retirement_executor().unwrap();
+            let pause = expiration_registration_test_support::pause_before_index_register(path);
+            let creating_store = Arc::clone(&store);
+            let create = std::thread::spawn(move || {
+                creating_store.create(path, config(Some(60), None), None, 0)
+            });
+            pause.wait_until_held().await;
+            let stream = store
+                .registered_stream(path)
+                .expect("create inserted exact registry identity before registration pause");
+            if soft {
+                stream.shared.write().unwrap().ref_count = 1;
+            }
+            let retiring_store = Arc::clone(&store);
+            let retiring_stream = Arc::clone(&stream);
+            let retire =
+                tokio::spawn(async move { retiring_store.retire_explicit(retiring_stream).await });
+            pause.release();
+            assert!(matches!(
+                create.join().expect("create thread should not panic"),
+                Ok(CreateResult::Created(_))
+            ));
+            let ticket = match tokio::time::timeout(Duration::from_secs(5), retire)
+                .await
+                .expect("retirement must resolve after registration unlock")
+                .expect("retirement task should not panic")
+            {
+                ExplicitRetirementResult::Owner(ticket) => ticket,
+                _ => panic!("retirement owns the exact created identity"),
+            };
+            assert_eq!(ticket.wait_logical().await, LogicalCompletion::Completed);
+            assert!(matches!(
+                ticket.wait_terminal().await,
+                TerminalCleanupCompletion::Succeeded { .. }
+            ));
+            assert_eq!(store.expiration_count(), 0);
+            if soft {
+                assert!(store.is_exact_registered(&stream));
+                assert!(stream.shared.read().unwrap().soft_deleted);
+            } else {
+                assert!(!store.is_exact_registered(&stream));
+            }
+
+            store.retirement_executor().unwrap().shutdown().await;
+            drop(pause);
+            drop(stream);
+            drop(store);
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_removes_membership_and_restores_it_after_cancelled_hard_release() {
+        let (directory, store) = temporary_store("retirement");
+        store.init_retirement_executor().unwrap();
+        let soft = created(&store, "soft", config(Some(60), None));
+        soft.shared.write().unwrap().ref_count = 1;
+        assert_eq!(store.expiration_count(), 1);
+        let soft_ticket = match store.retire_explicit(Arc::clone(&soft)).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("soft retirement owns its stream"),
+        };
+        assert_eq!(
+            soft_ticket.wait_logical().await,
+            LogicalCompletion::Completed
+        );
+        assert!(matches!(
+            soft_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(store.is_exact_registered(&soft));
+        assert!(soft.shared.read().unwrap().soft_deleted);
+        assert_eq!(store.expiration_count(), 0);
+
+        let restored = created(&store, "restored", config(Some(60), None));
+        let appender = restored.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&restored, &appender).unwrap();
+        drop(appender);
+        let owner_store = Arc::clone(&store);
+        let owner_stream = Arc::clone(&restored);
+        let owner = tokio::spawn(async move { owner_store.retire_explicit(owner_stream).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !restored.fenced.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hard retirement fences before logical release");
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(guard);
+        let result = owner.await.unwrap();
+        assert!(matches!(result, ExplicitRetirementResult::Cancelled(_)));
+        assert!(store.is_exact_registered(&restored));
+        assert_eq!(store.expiration_count(), 1);
+        assert!(expiration_members(&store)
+            .iter()
+            .any(|current| Arc::ptr_eq(current, &restored)));
+
+        drop(restored);
+        drop(soft);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn recovery_indexes_live_expiring_streams_but_not_tombstones_or_no_policy() {
+        let (directory, store) = temporary_store("recovery");
+        let live = created(&store, "live", config(Some(u64::MAX), None));
+        let _no_policy = created(&store, "none", config(None, None));
+        let soft = created(&store, "soft", config(Some(1), None));
+        soft.shared.write().unwrap().soft_deleted = true;
+        write_meta_sync(&soft, true).unwrap();
+        drop(live);
+        drop(soft);
+        drop(store);
+
+        let recovered = Arc::new(
+            Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap(),
+        );
+        let live = recovered.registered_stream("live").unwrap();
+        let soft = recovered.registered_stream("soft").unwrap();
+        assert!(soft.fenced.load(Ordering::Acquire));
+        assert_eq!(recovered.expiration_count(), 1);
+        let members = expiration_members(&recovered);
+        assert!(Arc::ptr_eq(&members[0], &live));
+
+        drop(members);
+        drop(live);
+        drop(soft);
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(directory);
     }
 }
 

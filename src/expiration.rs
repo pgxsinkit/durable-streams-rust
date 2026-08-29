@@ -209,7 +209,7 @@ impl ExpiringStreams {
     }
 
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries
             .lock()
             .unwrap_or_else(|error| error.into_inner())

@@ -20,9 +20,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::api::{Method, Req};
+use crate::expiration::ExpirationCursor;
 use crate::handlers;
 use crate::handlers::test_support::DurabilityGuard;
-use crate::store::{write_meta_sync, Store};
+use crate::store::{write_meta_sync, ExplicitRetirementResult, Store};
 use crate::tier::TierConfig;
 use crate::wal::shard::CommitterHandle;
 use crate::wal::walset::WalSet;
@@ -169,6 +170,65 @@ async fn append_acked(store: &Arc<Store>, path: &str, content_type: &str, body: 
         "append to {path} expected 2xx ack, got {}",
         resp.status
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_wal_boot_rebuilds_expiration_membership_before_serving() {
+    let dir = tmp("expiration-membership-wal-boot");
+    let first = Harness::boot(&dir, Some(1), 1).unwrap();
+    let live = handlers::handle(
+        Arc::clone(&first.store),
+        put_req("live", OCTET, b"", &[("stream-ttl", "60")]),
+    )
+    .await;
+    assert_eq!(live.status, 201);
+    create_stream(&first.store, "none", OCTET).await;
+    let soft = handlers::handle(
+        Arc::clone(&first.store),
+        put_req("soft", OCTET, b"", &[("stream-ttl", "60")]),
+    )
+    .await;
+    assert_eq!(soft.status, 201);
+    let soft_stream = first.store.registered_stream("soft").unwrap();
+    soft_stream.shared.write().unwrap().ref_count = 1;
+    let ticket = match first.store.retire_explicit(Arc::clone(&soft_stream)).await {
+        ExplicitRetirementResult::Owner(ticket) => ticket,
+        _ => panic!("soft retirement should own its exact stream"),
+    };
+    let _ = ticket.wait_terminal().await;
+    first.crash();
+
+    // Harness::boot is the production sequence: Store sidecars, WAL replay and
+    // reset, attachment, then executor initialization. Membership is rebuilt
+    // during the sidecar phase, before a future scanner/readiness can run.
+    let mut recovered = Harness::boot(&dir, Some(1), 1).unwrap();
+    let candidates = recovered
+        .store
+        .expiration_page(ExpirationCursor::start(), usize::MAX)
+        .candidates;
+    assert_eq!(candidates.len(), 1);
+    let live = recovered.store.registered_stream("live").unwrap();
+    assert_eq!(candidates[0].stream_id, live.id);
+    assert!(candidates[0]
+        .stream
+        .upgrade()
+        .is_some_and(|current| Arc::ptr_eq(&current, &live)));
+    assert!(recovered
+        .store
+        .registered_stream("soft")
+        .unwrap()
+        .fenced
+        .load(std::sync::atomic::Ordering::Acquire));
+
+    recovered
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    recovered.stop_committers();
+    drop(recovered);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
