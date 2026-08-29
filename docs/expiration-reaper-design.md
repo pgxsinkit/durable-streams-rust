@@ -601,3 +601,15 @@ Implementation decisions:
    snapshot, so it cannot persist an in-flight append's speculative metadata.
 9. A cascade parent already marked by active/quarantined work receives ownership
    without retaining the completed child's permit or blocking shutdown.
+
+## Open production-hardening follow-ups
+
+These items are open and are not waivers of the failure modes they describe.
+Closing one requires the implementation and fault-injection coverage in its
+acceptance criteria.
+
+| ID | Open failure window | Acceptance criteria |
+| --- | --- | --- |
+| `REAPER-FU-1` | Quarantine WAL preflight uses the general durable-tails reader, which treats a missing or unreadable `tails` file as empty and skips malformed lines. If a quarantined stream's append segments have already been recycled, corrupt tails metadata can therefore hide its remaining checkpoint proof. | Add a checked recovery/preflight reader that distinguishes an absent tails file from read or parse failure and fails closed before replay or reset. Cover unreadable files, malformed/truncated lines, and a quarantined ID whose append is represented only by recycled-WAL tails evidence. |
+| `REAPER-FU-2` | Unpublished fork creation compensates a durably incremented parent refcount and removes child artifacts after a later create failure, but those compensation writes and unlinks can themselves fail. The result can be a conservative phantom parent reference or recoverable unpublished child artifacts until restart reconciliation/operator repair. | Give create rollback an explicit durable recovery state (or an equivalent idempotent transaction) so every write/fsync/rename/unlink fault combination converges after restart. Fault-inject each boundary and prove that no child becomes append-visible early, no live child loses its parent reference, and no phantom reference remains after recovery. |
+| `REAPER-FU-3` | Reaper shutdown stops admission and drains existing work, but `Handle::shutdown` has no overall deadline. A stuck filesystem operation or indefinitely delayed admitted cleanup can therefore hold graceful process shutdown forever. | Add a configurable wall-clock drain deadline that reports timeout to the caller, leaves unfinished streams fenced and recoverable, and exposes the timeout in logs/telemetry. Cover a held blocking cleanup and prove bounded return without clearing the exact retirement marker or losing the durable tombstone. |
