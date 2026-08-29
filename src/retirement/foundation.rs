@@ -1,7 +1,6 @@
 //! Completion and admission state shared by the later retirement executor.
 
-// TODO(retirement-C): remove this allowance once the coordinator consumes the
-// completion, admission, and per-stream state types in production.
+// TODO(retirement-C2): retry policy consumes the remaining failure fields.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -177,6 +176,10 @@ impl RetirementTicket {
                 true
             }
         });
+    }
+
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
     }
 
     pub(crate) async fn wait_logical(&self) -> LogicalCompletion {
