@@ -608,14 +608,6 @@ impl StreamState {
             .is_some_and(|deadline| now > deadline)
     }
 
-    /// Evaluate the canonical deadline under an already-held shared read lock.
-    /// The scanner keeps exact-registry and soft-state validation in this same
-    /// read-only critical section.
-    pub(crate) fn is_expired_while_shared(&self, shared: &Shared, now: SystemTime) -> bool {
-        self.expiry_deadline_while_shared(shared)
-            .is_some_and(|deadline| now > deadline)
-    }
-
     pub fn etag(&self, start: u64, end: u64, closed: bool) -> String {
         if closed {
             format!("\"{}:{}:{}:c\"", self.id, start, end)
@@ -1564,10 +1556,15 @@ impl Store {
                     let shared = stream.shared.read().unwrap();
                     if shared.soft_deleted {
                         None
-                    } else if stream.is_expired_while_shared(&shared, now) {
-                        Some(ExpirationCandidateObservation::Due)
                     } else {
-                        Some(ExpirationCandidateObservation::Live)
+                        match stream.expiry_deadline_while_shared(&shared) {
+                            Some(deadline) if now > deadline => {
+                                Some(ExpirationCandidateObservation::Due {
+                                    lag: now.duration_since(deadline).unwrap_or(Duration::ZERO),
+                                })
+                            }
+                            _ => Some(ExpirationCandidateObservation::Live),
+                        }
                     }
                 }
                 _ => None,
@@ -2948,10 +2945,10 @@ mod retirement_executor_lifecycle_tests {
             .candidates
             .pop()
             .expect("due stream is indexed");
-        assert_eq!(
+        assert!(matches!(
             store.observe_expiration_candidate(&candidate, SystemTime::now()),
-            crate::expiration::ExpirationCandidateObservation::Due
-        );
+            crate::expiration::ExpirationCandidateObservation::Due { .. }
+        ));
         renewed.shared.write().unwrap().last_access = SystemTime::now();
         assert!(matches!(
             store.retire_proactive_expiry(Arc::clone(&renewed)).await,

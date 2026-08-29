@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -259,9 +258,78 @@ fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExpirationCandidateObservation {
     Live,
-    Due,
+    /// Canonical deadline lag captured while holding the stream shared read.
+    Due {
+        lag: Duration,
+    },
     Dead,
     Stale,
+}
+
+/// The scanner's effective behavior, distinct from the requested CLI mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExpirationScannerEffectiveMode {
+    #[default]
+    Off,
+    Observe,
+    /// Delete was requested but is still held behind a safety gate.
+    DeleteGated,
+    /// Delete has passed its local gates and can submit bounded admissions.
+    DeleteActive,
+}
+
+/// Fixed, identifier-free scanner outcome counters for later telemetry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExpirationOutcomeCounts {
+    pub(crate) observed: u64,
+    /// Reserved until Store exposes an exact renewal-vs-other cancellation
+    /// result; this slice deliberately does not infer it from a ticket.
+    pub(crate) renewed: u64,
+    pub(crate) fenced: u64,
+    pub(crate) soft_deleted: u64,
+    pub(crate) reaped: u64,
+    pub(crate) stale: u64,
+    pub(crate) failed: u64,
+}
+
+/// One immutable O(1) health projection. It intentionally contains no path,
+/// stream ID collection, or candidate Arc; callers cannot retain Store state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ExpirationScannerSnapshot {
+    pub(crate) requested_mode: ExpirationReaperMode,
+    pub(crate) effective_mode: ExpirationScannerEffectiveMode,
+    pub(crate) running: bool,
+    pub(crate) initial_observe_pass_complete: bool,
+    pub(crate) startup_grace_elapsed: bool,
+    pub(crate) deletion_eligible: bool,
+    pub(crate) bulk_paused: bool,
+    pub(crate) clock_paused: bool,
+    pub(crate) index_entry_count: usize,
+    pub(crate) pass_sequence: u64,
+    pub(crate) current_page_count: u64,
+    pub(crate) last_scanned_stream_id: Option<u64>,
+    pub(crate) cursor_wrapped: bool,
+    pub(crate) current_checked: u64,
+    pub(crate) current_due: u64,
+    pub(crate) completed_checked: u64,
+    pub(crate) completed_due: u64,
+    pub(crate) bulk_threshold_numerator: u64,
+    pub(crate) bulk_threshold_denominator: u64,
+    pub(crate) current_due_fraction: f64,
+    pub(crate) completed_due_fraction: f64,
+    pub(crate) total_checked: u64,
+    pub(crate) total_due: u64,
+    pub(crate) total_pages: u64,
+    pub(crate) total_passes: u64,
+    pub(crate) proactive_admission_attempts: u64,
+    pub(crate) outcomes: ExpirationOutcomeCounts,
+    pub(crate) last_completed_pass_wall_time: Option<SystemTime>,
+    pub(crate) last_completed_pass_duration: Option<Duration>,
+    pub(crate) last_successful_scan_wall_time: Option<SystemTime>,
+    pub(crate) latest_due_lag: Option<Duration>,
+    pub(crate) current_max_due_lag: Option<Duration>,
+    pub(crate) completed_max_due_lag: Option<Duration>,
+    pub(crate) latest_clock_drift: Option<Duration>,
 }
 
 /// Level-triggered state shared with the future delete-mode controller.
@@ -270,11 +338,11 @@ pub(crate) struct ExpirationScannerStatus {
     initial_observe_pass: tokio::sync::Notify,
     started_at: Instant,
     startup_grace_duration: Duration,
+    requested_mode: ExpirationReaperMode,
     delete_requested: bool,
     bulk_fraction: BulkFraction,
     clock_jump_threshold_duration: Duration,
     safety: Mutex<DeleteSafetyState>,
-    proactive_admission_attempts: AtomicU64,
 }
 
 impl ExpirationScannerStatus {
@@ -288,21 +356,45 @@ impl ExpirationScannerStatus {
             initial_observe_pass: tokio::sync::Notify::new(),
             started_at,
             startup_grace_duration: config.startup_grace_duration(),
+            requested_mode: config.mode(),
             delete_requested: config.mode() == ExpirationReaperMode::Delete,
             bulk_fraction: config.bulk_fraction,
             clock_jump_threshold_duration: config.clock_jump_threshold_duration(),
             safety: Mutex::new(DeleteSafetyState::default()),
-            proactive_admission_attempts: AtomicU64::new(0),
         }
     }
 
     fn mark_initial_observe_pass_complete(&self) {
-        if !self
-            .initial_observe_pass_complete
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        let changed = {
+            let mut safety = self.lock_safety();
+            if safety.initial_observe_pass_complete {
+                false
+            } else {
+                safety.initial_observe_pass_complete = true;
+                true
+            }
+        };
+        self.publish_initial_observe_pass(changed);
+    }
+
+    fn publish_initial_observe_pass(&self, changed: bool) {
+        if changed
+            && !self
+                .initial_observe_pass_complete
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
             self.initial_observe_pass.notify_waiters();
         }
+    }
+
+    fn lock_safety(&self) -> std::sync::MutexGuard<'_, DeleteSafetyState> {
+        self.safety
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn set_running(&self, running: bool) {
+        self.lock_safety().running = running;
     }
 
     pub(crate) fn initial_observe_pass_complete(&self) -> bool {
@@ -324,52 +416,90 @@ impl ExpirationScannerStatus {
         }
     }
 
-    /// The grace state is recorded now for delete-mode activation later; this
-    /// read-only slice deliberately does not use it to alter observations.
+    /// Delete activation consults this monotonic startup-grace boundary; it
+    /// never changes the observer's candidate classification.
     pub(crate) fn startup_grace_active_at(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.started_at) < self.startup_grace_duration
     }
 
-    /// Record one fully classified page before any future delete activation can
-    /// inspect it. This observer owns no action capability: a bulk pause is
-    /// sticky state only until a later slice deliberately consumes it.
+    /// Record one fully classified page before delete activation inspects it.
+    /// This small wrapper keeps the safety-state unit tests independent from
+    /// scanner wall/monotonic clock plumbing.
     fn record_observe_page(&self, checked: u64, due: u64, pass_complete: bool) {
-        let completed = {
-            let mut safety = self
-                .safety
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            safety.current_checked = safety.current_checked.saturating_add(checked);
-            safety.current_due = safety.current_due.saturating_add(due);
+        self.record_scanned_page(ScannerPageAccounting {
+            checked,
+            due,
+            stale: 0,
+            index_entry_count: 0,
+            last_scanned_stream_id: None,
+            cursor_wrapped: false,
+            pass_complete,
+            latest_due_lag: None,
+            max_due_lag: None,
+            wall: SystemTime::now(),
+            monotonic: Instant::now(),
+        });
+    }
+
+    fn record_scanned_page(&self, page: ScannerPageAccounting) {
+        let initial_transition = {
+            let mut safety = self.lock_safety();
+            if safety.current_pass_started_monotonic.is_none() {
+                safety.current_pass_started_monotonic = Some(page.monotonic);
+            }
+            safety.index_entry_count = page.index_entry_count;
+            safety.current_page_count = safety.current_page_count.saturating_add(1);
+            if page.last_scanned_stream_id.is_some() {
+                safety.last_scanned_stream_id = page.last_scanned_stream_id;
+            }
+            safety.cursor_wrapped = page.cursor_wrapped;
+            safety.current_checked = safety.current_checked.saturating_add(page.checked);
+            safety.current_due = safety.current_due.saturating_add(page.due);
+            safety.total_checked = safety.total_checked.saturating_add(page.checked);
+            safety.total_due = safety.total_due.saturating_add(page.due);
+            safety.total_pages = safety.total_pages.saturating_add(1);
+            safety.last_successful_scan_wall_time = Some(page.wall);
+            safety.outcomes.observed = safety.outcomes.observed.saturating_add(page.checked);
+            safety.outcomes.stale = safety.outcomes.stale.saturating_add(page.stale);
+            safety.latest_due_lag = page.latest_due_lag;
+            safety.current_max_due_lag = max_duration(safety.current_max_due_lag, page.max_due_lag);
             if self
                 .bulk_fraction
                 .exceeded_by(safety.current_due, safety.current_checked)
             {
                 safety.bulk_paused = true;
             }
-            if pass_complete {
+            if page.pass_complete {
                 safety.completed_checked = safety.current_checked;
                 safety.completed_due = safety.current_due;
-                // Publish the completed counts before the next pass begins.
+                safety.completed_max_due_lag = safety.current_max_due_lag;
+                safety.last_completed_pass_wall_time = Some(page.wall);
+                safety.last_completed_pass_duration = safety
+                    .current_pass_started_monotonic
+                    .map(|started| page.monotonic.saturating_duration_since(started));
+                safety.total_passes = safety.total_passes.saturating_add(1);
                 safety.current_checked = 0;
                 safety.current_due = 0;
-                true
+                safety.current_page_count = 0;
+                safety.current_max_due_lag = None;
+                safety.current_pass_started_monotonic = None;
+                if safety.initial_observe_pass_complete {
+                    false
+                } else {
+                    safety.initial_observe_pass_complete = true;
+                    true
+                }
             } else {
                 false
             }
         };
-        if completed {
-            self.mark_initial_observe_pass_complete();
-        }
+        self.publish_initial_observe_pass(initial_transition);
     }
 
     /// Sample exactly at the boundary after observing a page and before the
     /// scanner sleeps. The first sample only establishes a baseline.
     fn sample_clock(&self, wall: SystemTime, monotonic: Instant) {
-        let mut safety = self
-            .safety
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut safety = self.lock_safety();
         if let Some(previous) = safety.last_clock_sample {
             let wall_elapsed = wall.duration_since(previous.wall);
             let monotonic_elapsed = monotonic.checked_duration_since(previous.monotonic);
@@ -380,6 +510,7 @@ impl ExpirationScannerStatus {
                     } else {
                         monotonic_elapsed - wall_elapsed
                     };
+                    safety.latest_clock_drift = Some(divergence);
                     if divergence > self.clock_jump_threshold_duration {
                         safety.clock_paused = true;
                     }
@@ -387,21 +518,46 @@ impl ExpirationScannerStatus {
                 // A backward wall clock or impossible monotonic ordering is
                 // unsafe for deletion activation, but remains harmless to the
                 // read-only observer and lazy request-time expiration.
-                _ => safety.clock_paused = true,
+                (Err(_), Some(monotonic_elapsed)) => {
+                    let wall_reversal =
+                        previous.wall.duration_since(wall).unwrap_or(Duration::ZERO);
+                    safety.latest_clock_drift =
+                        Some(wall_reversal.saturating_add(monotonic_elapsed));
+                    safety.clock_paused = true;
+                }
+                (Ok(wall_elapsed), None) => {
+                    let monotonic_reversal = previous
+                        .monotonic
+                        .checked_duration_since(monotonic)
+                        .unwrap_or(Duration::MAX);
+                    safety.latest_clock_drift =
+                        Some(wall_elapsed.saturating_add(monotonic_reversal));
+                    safety.clock_paused = true;
+                }
+                (Err(_), None) => {
+                    let wall_reversal =
+                        previous.wall.duration_since(wall).unwrap_or(Duration::ZERO);
+                    let monotonic_reversal = previous
+                        .monotonic
+                        .checked_duration_since(monotonic)
+                        .unwrap_or(Duration::MAX);
+                    safety.latest_clock_drift = Some(if wall_reversal >= monotonic_reversal {
+                        wall_reversal - monotonic_reversal
+                    } else {
+                        monotonic_reversal - wall_reversal
+                    });
+                    safety.clock_paused = true;
+                }
             }
         }
         safety.last_clock_sample = Some(ClockSample { wall, monotonic });
     }
 
-    /// Read an immutable, testable delete-safety projection. Nothing in this
-    /// slice acts on `deletion_eligible`; 8dy activation must opt in later.
+    /// Read the safety projection used by the page-level Delete admission gate.
     pub(crate) fn safety_snapshot_at(&self, now: Instant) -> DeleteSafetySnapshot {
-        let safety = self
-            .safety
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let safety = self.lock_safety();
         let startup_grace_elapsed = !self.startup_grace_active_at(now);
-        let initial_observe_pass_complete = self.initial_observe_pass_complete();
+        let initial_observe_pass_complete = safety.initial_observe_pass_complete;
         DeleteSafetySnapshot {
             initial_observe_pass_complete,
             startup_grace_elapsed,
@@ -419,15 +575,93 @@ impl ExpirationScannerStatus {
         }
     }
 
+    pub(crate) fn snapshot_at(&self, now: Instant) -> ExpirationScannerSnapshot {
+        let safety = self.lock_safety();
+        let startup_grace_elapsed = !self.startup_grace_active_at(now);
+        let deletion_eligible = self.delete_requested
+            && safety.initial_observe_pass_complete
+            && startup_grace_elapsed
+            && !safety.bulk_paused
+            && !safety.clock_paused;
+        let effective_mode = match self.requested_mode {
+            ExpirationReaperMode::Off => ExpirationScannerEffectiveMode::Off,
+            ExpirationReaperMode::Observe => ExpirationScannerEffectiveMode::Observe,
+            ExpirationReaperMode::Delete if deletion_eligible && safety.running => {
+                ExpirationScannerEffectiveMode::DeleteActive
+            }
+            ExpirationReaperMode::Delete => ExpirationScannerEffectiveMode::DeleteGated,
+        };
+        ExpirationScannerSnapshot {
+            requested_mode: self.requested_mode,
+            effective_mode,
+            running: safety.running,
+            initial_observe_pass_complete: safety.initial_observe_pass_complete,
+            startup_grace_elapsed,
+            deletion_eligible,
+            bulk_paused: safety.bulk_paused,
+            clock_paused: safety.clock_paused,
+            index_entry_count: safety.index_entry_count,
+            pass_sequence: safety.total_passes.saturating_add(1),
+            current_page_count: safety.current_page_count,
+            last_scanned_stream_id: safety.last_scanned_stream_id,
+            cursor_wrapped: safety.cursor_wrapped,
+            current_checked: safety.current_checked,
+            current_due: safety.current_due,
+            completed_checked: safety.completed_checked,
+            completed_due: safety.completed_due,
+            bulk_threshold_numerator: self.bulk_fraction.numerator,
+            bulk_threshold_denominator: self.bulk_fraction.denominator,
+            current_due_fraction: due_fraction(safety.current_due, safety.current_checked),
+            completed_due_fraction: due_fraction(safety.completed_due, safety.completed_checked),
+            total_checked: safety.total_checked,
+            total_due: safety.total_due,
+            total_pages: safety.total_pages,
+            total_passes: safety.total_passes,
+            proactive_admission_attempts: safety.proactive_admission_attempts,
+            outcomes: safety.outcomes,
+            last_completed_pass_wall_time: safety.last_completed_pass_wall_time,
+            last_completed_pass_duration: safety.last_completed_pass_duration,
+            last_successful_scan_wall_time: safety.last_successful_scan_wall_time,
+            latest_due_lag: safety.latest_due_lag,
+            current_max_due_lag: safety.current_max_due_lag,
+            completed_max_due_lag: safety.completed_max_due_lag,
+            latest_clock_drift: safety.latest_clock_drift,
+        }
+    }
+
     fn record_proactive_admission_attempt(&self) {
-        self.proactive_admission_attempts
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        let mut safety = self.lock_safety();
+        safety.proactive_admission_attempts = safety.proactive_admission_attempts.saturating_add(1);
+    }
+
+    fn record_proactive_outcome(&self, result: &crate::store::ExplicitRetirementResult) {
+        let mut safety = self.lock_safety();
+        match result {
+            // Owner means only that logical retirement admitted this stream.
+            // Physical completion is executor-owned and belongs to 0ln-b, so
+            // this snapshot deliberately leaves `reaped` at zero here.
+            crate::store::ExplicitRetirementResult::Owner(_) => {}
+            crate::store::ExplicitRetirementResult::Existing(_) => {
+                safety.outcomes.fenced = safety.outcomes.fenced.saturating_add(1)
+            }
+            crate::store::ExplicitRetirementResult::Gone => {
+                safety.outcomes.soft_deleted = safety.outcomes.soft_deleted.saturating_add(1)
+            }
+            crate::store::ExplicitRetirementResult::Missing
+            | crate::store::ExplicitRetirementResult::Stale => {
+                safety.outcomes.stale = safety.outcomes.stale.saturating_add(1)
+            }
+            crate::store::ExplicitRetirementResult::Cancelled(_)
+            | crate::store::ExplicitRetirementResult::Rejected(_)
+            | crate::store::ExplicitRetirementResult::Unavailable => {
+                safety.outcomes.failed = safety.outcomes.failed.saturating_add(1)
+            }
+        }
     }
 
     #[cfg(test)]
     fn proactive_admission_attempts(&self) -> u64 {
-        self.proactive_admission_attempts
-            .load(AtomicOrdering::Relaxed)
+        self.lock_safety().proactive_admission_attempts
     }
 }
 
@@ -437,15 +671,57 @@ struct ClockSample {
     monotonic: Instant,
 }
 
+struct ScannerPageAccounting {
+    checked: u64,
+    due: u64,
+    stale: u64,
+    index_entry_count: usize,
+    last_scanned_stream_id: Option<u64>,
+    cursor_wrapped: bool,
+    pass_complete: bool,
+    latest_due_lag: Option<Duration>,
+    max_due_lag: Option<Duration>,
+    wall: SystemTime,
+    monotonic: Instant,
+}
+
 #[derive(Default)]
 struct DeleteSafetyState {
+    running: bool,
+    initial_observe_pass_complete: bool,
+    index_entry_count: usize,
+    current_page_count: u64,
+    last_scanned_stream_id: Option<u64>,
+    cursor_wrapped: bool,
     current_checked: u64,
     current_due: u64,
     completed_checked: u64,
     completed_due: u64,
+    total_checked: u64,
+    total_due: u64,
+    total_pages: u64,
+    total_passes: u64,
+    proactive_admission_attempts: u64,
+    outcomes: ExpirationOutcomeCounts,
+    current_pass_started_monotonic: Option<Instant>,
+    last_completed_pass_wall_time: Option<SystemTime>,
+    last_completed_pass_duration: Option<Duration>,
+    last_successful_scan_wall_time: Option<SystemTime>,
+    latest_due_lag: Option<Duration>,
+    current_max_due_lag: Option<Duration>,
+    completed_max_due_lag: Option<Duration>,
+    latest_clock_drift: Option<Duration>,
     bulk_paused: bool,
     clock_paused: bool,
     last_clock_sample: Option<ClockSample>,
+}
+
+fn max_duration(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 /// Read-only deletion-safety state reserved for future activation and metrics.
@@ -505,6 +781,7 @@ impl ExpirationScanner {
             };
         }
 
+        status.set_running(true);
         let store = Arc::downgrade(store);
         let task_status = Arc::clone(&status);
         let task = tokio::spawn(async move {
@@ -524,6 +801,10 @@ impl ExpirationScanner {
 
     pub(crate) fn status(&self) -> &Arc<ExpirationScannerStatus> {
         &self.status
+    }
+
+    pub(crate) fn snapshot_at(&self, now: Instant) -> ExpirationScannerSnapshot {
+        self.status.snapshot_at(now)
     }
 
     pub(crate) async fn shutdown(mut self) {
@@ -547,8 +828,14 @@ struct ObservedPage {
     next_cursor: ExpirationCursor,
     pass_complete: bool,
     candidate_count: usize,
+    index_entry_count: usize,
+    last_scanned_stream_id: Option<u64>,
+    cursor_wrapped: bool,
     checked_count: u64,
     due_count: usize,
+    stale_count: u64,
+    latest_due_lag: Option<Duration>,
+    max_due_lag: Option<Duration>,
     due_streams: Vec<Arc<StreamState>>,
 }
 
@@ -558,6 +845,9 @@ async fn run_scanner(
     status: Arc<ExpirationScannerStatus>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let _running = ScannerRunningGuard {
+        status: Arc::clone(&status),
+    };
     let mut cursor = ExpirationCursor::start();
     let mut delete_pacer = DeletePacer::new(config.delete_rate_deletions_per_second());
     loop {
@@ -573,11 +863,19 @@ async fn run_scanner(
         let observed = observe_page(&store, cursor, SystemTime::now());
         cursor = observed.next_cursor;
         let candidate_count = observed.candidate_count;
-        status.record_observe_page(
-            observed.checked_count,
-            u64::try_from(observed.due_count).expect("page due count fits u64"),
-            observed.pass_complete,
-        );
+        status.record_scanned_page(ScannerPageAccounting {
+            checked: observed.checked_count,
+            due: u64::try_from(observed.due_count).expect("page due count fits u64"),
+            stale: observed.stale_count,
+            index_entry_count: observed.index_entry_count,
+            last_scanned_stream_id: observed.last_scanned_stream_id,
+            cursor_wrapped: observed.cursor_wrapped,
+            pass_complete: observed.pass_complete,
+            latest_due_lag: observed.latest_due_lag,
+            max_due_lag: observed.max_due_lag,
+            wall: SystemTime::now(),
+            monotonic: Instant::now(),
+        });
         status.sample_clock(SystemTime::now(), Instant::now());
         let safety = status.safety_snapshot_at(Instant::now());
         if !admit_due_candidates(
@@ -606,6 +904,16 @@ async fn run_scanner(
                 }
             }
         }
+    }
+}
+
+struct ScannerRunningGuard {
+    status: Arc<ExpirationScannerStatus>,
+}
+
+impl Drop for ScannerRunningGuard {
+    fn drop(&mut self) {
+        self.status.set_running(false);
     }
 }
 
@@ -642,7 +950,8 @@ async fn admit_due_candidates(
         // Its ticket/physical phase remains executor-owned; the scanner waits
         // on neither completion.
         status.record_proactive_admission_attempt();
-        let _ = store.retire_proactive_expiry(stream).await;
+        let result = store.retire_proactive_expiry(stream).await;
+        status.record_proactive_outcome(&result);
     }
     true
 }
@@ -691,12 +1000,17 @@ fn observe_page(store: &Store, cursor: ExpirationCursor, now: SystemTime) -> Obs
     let page = store.expiration_page(cursor, OBSERVATION_PAGE_SIZE);
     let mut checked_count = 0u64;
     let mut due_count = 0;
+    let mut stale_count = 0u64;
+    let mut latest_due_lag = None;
+    let mut max_due_lag = None;
     let mut due_streams = Vec::new();
     for candidate in &page.candidates {
         match store.observe_expiration_candidate(candidate, now) {
-            ExpirationCandidateObservation::Due => {
+            ExpirationCandidateObservation::Due { lag } => {
                 checked_count = checked_count.saturating_add(1);
                 due_count += 1;
+                latest_due_lag = Some(lag);
+                max_due_lag = max_duration(max_due_lag, Some(lag));
                 if let Some(stream) = candidate.stream.upgrade() {
                     due_streams.push(stream);
                 }
@@ -704,15 +1018,24 @@ fn observe_page(store: &Store, cursor: ExpirationCursor, now: SystemTime) -> Obs
             ExpirationCandidateObservation::Live => {
                 checked_count = checked_count.saturating_add(1);
             }
-            ExpirationCandidateObservation::Dead | ExpirationCandidateObservation::Stale => {}
+            ExpirationCandidateObservation::Dead => {}
+            ExpirationCandidateObservation::Stale => {
+                stale_count = stale_count.saturating_add(1);
+            }
         }
     }
     ObservedPage {
         next_cursor: page.next_cursor,
         pass_complete: page.pass_complete,
         candidate_count: page.candidates.len(),
+        index_entry_count: page.entry_count,
+        last_scanned_stream_id: page.candidates.last().map(|candidate| candidate.stream_id),
+        cursor_wrapped: page.wrapped,
         checked_count,
         due_count,
+        stale_count,
+        latest_due_lag,
+        max_due_lag,
         due_streams,
     }
 }
@@ -773,6 +1096,8 @@ pub(crate) struct ExpirationCandidate {
 /// A bounded page plus the state needed to continue the same pass.
 pub(crate) struct ExpirationPage {
     pub(crate) candidates: Vec<ExpirationCandidate>,
+    /// Cardinality captured under the same index lock as this bounded page.
+    pub(crate) entry_count: usize,
     pub(crate) next_cursor: ExpirationCursor,
     /// True once this pass has entered its wrapped, lower-ID half.
     pub(crate) wrapped: bool,
@@ -876,9 +1201,11 @@ impl ExpiringStreams {
             .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let entry_count = entries.len();
         if entries.is_empty() {
             return ExpirationPage {
                 candidates: Vec::new(),
+                entry_count,
                 next_cursor: ExpirationCursor::start(),
                 wrapped: cursor.wrapped,
                 pass_complete: true,
@@ -887,6 +1214,7 @@ impl ExpiringStreams {
         if limit == 0 {
             return ExpirationPage {
                 candidates: Vec::new(),
+                entry_count,
                 next_cursor: cursor,
                 wrapped: cursor.wrapped,
                 pass_complete: false,
@@ -944,6 +1272,7 @@ impl ExpiringStreams {
         };
         ExpirationPage {
             candidates,
+            entry_count,
             next_cursor,
             wrapped,
             pass_complete: complete,
@@ -1354,6 +1683,159 @@ mod tests {
         assert!(reversed_monotonic.safety_snapshot_at(start).clock_paused);
     }
 
+    #[test]
+    fn scanner_snapshot_is_bounded_consistent_and_tracks_page_completion() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<ExpirationScannerSnapshot>();
+        assert_copy::<ExpirationOutcomeCounts>();
+
+        let start = Instant::now();
+        let wall = UNIX_EPOCH.checked_add(Duration::from_secs(10)).unwrap();
+        let status =
+            ExpirationScannerStatus::new_at(&scanner_config(ExpirationReaperMode::Observe), start);
+        status.set_running(true);
+        status.record_scanned_page(ScannerPageAccounting {
+            checked: 3,
+            due: 1,
+            stale: 1,
+            index_entry_count: 7,
+            last_scanned_stream_id: Some(41),
+            cursor_wrapped: false,
+            pass_complete: false,
+            latest_due_lag: Some(Duration::from_secs(2)),
+            max_due_lag: Some(Duration::from_secs(2)),
+            wall,
+            monotonic: start,
+        });
+        let partial = status.snapshot_at(start);
+        assert_eq!(partial.requested_mode, ExpirationReaperMode::Observe);
+        assert_eq!(
+            partial.effective_mode,
+            ExpirationScannerEffectiveMode::Observe
+        );
+        assert!(partial.running);
+        assert_eq!(partial.index_entry_count, 7);
+        assert_eq!(partial.current_page_count, 1);
+        assert_eq!(partial.last_scanned_stream_id, Some(41));
+        assert_eq!((partial.current_checked, partial.current_due), (3, 1));
+        assert_eq!((partial.total_checked, partial.total_due), (3, 1));
+        assert_eq!(partial.outcomes.observed, 3);
+        assert_eq!(partial.outcomes.stale, 1);
+        assert_eq!(partial.latest_due_lag, Some(Duration::from_secs(2)));
+
+        status.record_scanned_page(ScannerPageAccounting {
+            checked: 2,
+            due: 1,
+            stale: 0,
+            index_entry_count: 7,
+            last_scanned_stream_id: Some(42),
+            cursor_wrapped: true,
+            pass_complete: true,
+            latest_due_lag: Some(Duration::from_secs(4)),
+            max_due_lag: Some(Duration::from_secs(4)),
+            wall: wall.checked_add(Duration::from_secs(5)).unwrap(),
+            monotonic: start.checked_add(Duration::from_secs(5)).unwrap(),
+        });
+        let completed = status.snapshot_at(start);
+        assert!(completed.initial_observe_pass_complete);
+        assert_eq!(
+            (completed.completed_checked, completed.completed_due),
+            (5, 2)
+        );
+        assert_eq!((completed.current_checked, completed.current_due), (0, 0));
+        assert_eq!(completed.total_pages, 2);
+        assert_eq!(completed.total_passes, 1);
+        assert_eq!(completed.last_scanned_stream_id, Some(42));
+        assert!(completed.cursor_wrapped);
+        assert_eq!(
+            completed.completed_max_due_lag,
+            Some(Duration::from_secs(4))
+        );
+        assert_eq!(
+            completed.last_completed_pass_duration,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            completed.last_completed_pass_wall_time,
+            Some(wall.checked_add(Duration::from_secs(5)).unwrap())
+        );
+    }
+
+    #[test]
+    fn scanner_snapshot_saturates_and_concurrent_reads_are_self_consistent() {
+        let start = Instant::now();
+        let status = Arc::new(ExpirationScannerStatus::new_at(
+            &scanner_config(ExpirationReaperMode::Observe),
+            start,
+        ));
+        status.record_scanned_page(ScannerPageAccounting {
+            checked: u64::MAX,
+            due: u64::MAX,
+            stale: 0,
+            index_entry_count: 1,
+            last_scanned_stream_id: None,
+            cursor_wrapped: false,
+            pass_complete: false,
+            latest_due_lag: None,
+            max_due_lag: None,
+            wall: UNIX_EPOCH,
+            monotonic: start,
+        });
+        let writer = Arc::clone(&status);
+        let writer = std::thread::spawn(move || {
+            for _ in 0..32 {
+                writer.record_scanned_page(ScannerPageAccounting {
+                    checked: 1,
+                    due: 1,
+                    stale: 0,
+                    index_entry_count: 1,
+                    last_scanned_stream_id: None,
+                    cursor_wrapped: false,
+                    pass_complete: false,
+                    latest_due_lag: None,
+                    max_due_lag: None,
+                    wall: UNIX_EPOCH,
+                    monotonic: Instant::now(),
+                });
+            }
+        });
+        for _ in 0..32 {
+            let snapshot = status.snapshot_at(start);
+            assert!(snapshot.current_due <= snapshot.current_checked);
+            assert!(snapshot.total_due <= snapshot.total_checked);
+            assert!(snapshot.total_pages >= snapshot.total_passes);
+        }
+        writer.join().unwrap();
+        let saturated = status.snapshot_at(start);
+        assert_eq!(saturated.total_checked, u64::MAX);
+        assert_eq!(saturated.total_due, u64::MAX);
+    }
+
+    #[test]
+    fn due_observation_reports_canonical_lag_without_wall_clock_panics() {
+        let (directory, store) = store("snapshot-due-lag");
+        let stream = streams(&store, &["due"]).pop().unwrap();
+        stream.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let candidate = store
+            .expiration_page(ExpirationCursor::start(), 1)
+            .candidates
+            .pop()
+            .unwrap();
+        assert!(matches!(
+            store.observe_expiration_candidate(&candidate, UNIX_EPOCH + Duration::from_secs(61)),
+            ExpirationCandidateObservation::Due { lag } if lag == Duration::from_secs(1)
+        ));
+        stream.shared.write().unwrap().last_access =
+            UNIX_EPOCH.checked_sub(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            store.observe_expiration_candidate(&candidate, UNIX_EPOCH + Duration::from_secs(60)),
+            ExpirationCandidateObservation::Due { lag } if lag == Duration::from_secs(1)
+        ));
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     async fn wait_for_initial_pass(scanner: &ExpirationScanner) {
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -1373,6 +1855,16 @@ mod tests {
         assert!(scanner.task.is_none());
         assert!(scanner.status().initial_observe_pass_complete());
         assert!(scanner.status().startup_grace_active_at(Instant::now()));
+        let snapshot = scanner.snapshot_at(Instant::now());
+        assert_eq!(snapshot.requested_mode, ExpirationReaperMode::Off);
+        assert_eq!(snapshot.effective_mode, ExpirationScannerEffectiveMode::Off);
+        assert!(!snapshot.running);
+        assert!(snapshot.initial_observe_pass_complete);
+        assert_eq!(snapshot.total_pages, 0);
+        assert_eq!(
+            snapshot.index_entry_count, 0,
+            "Off has not observed the index"
+        );
         wait_for_initial_pass(&scanner).await;
         scanner.shutdown().await;
 
@@ -1392,6 +1884,15 @@ mod tests {
         let empty =
             ExpirationScanner::start(&empty_store, scanner_config(ExpirationReaperMode::Observe));
         wait_for_initial_pass(&empty).await;
+        let empty_snapshot = empty.snapshot_at(Instant::now());
+        assert_eq!(
+            empty_snapshot.effective_mode,
+            ExpirationScannerEffectiveMode::Observe
+        );
+        assert!(empty_snapshot.running);
+        assert!(empty_snapshot.initial_observe_pass_complete);
+        assert_eq!(empty_snapshot.index_entry_count, 0);
+        assert!(empty_snapshot.total_passes >= 1);
         empty.shutdown().await;
         drop(empty_store);
         let _ = std::fs::remove_dir_all(empty_directory);
@@ -1474,6 +1975,10 @@ mod tests {
         );
         assert_eq!(status.proactive_admission_attempts(), 1);
         assert!(stream.fenced.load(Ordering::Acquire));
+        let snapshot = status.snapshot_at(Instant::now());
+        assert_eq!(snapshot.proactive_admission_attempts, 1);
+        assert_eq!(snapshot.outcomes.reaped, 0);
+        assert_eq!(snapshot.outcomes.failed, 0);
         store.retirement_executor().unwrap().shutdown().await;
 
         drop(stream);
@@ -1602,6 +2107,7 @@ mod tests {
             .await
         );
         assert_eq!(status.proactive_admission_attempts(), 2);
+        assert_eq!(status.snapshot_at(Instant::now()).outcomes.failed, 2);
         assert!(streams
             .iter()
             .all(|stream| !stream.fenced.load(Ordering::Acquire)));
@@ -1686,9 +2192,17 @@ mod tests {
         let (directory, store) = store("scanner-shutdown");
         let scanner =
             ExpirationScanner::start(&store, scanner_config(ExpirationReaperMode::Observe));
+        let status = Arc::clone(scanner.status());
+        assert!(status.snapshot_at(Instant::now()).running);
         tokio::time::timeout(Duration::from_secs(5), scanner.shutdown())
             .await
             .expect("scanner shutdown should join promptly");
+        let snapshot = status.snapshot_at(Instant::now());
+        assert!(!snapshot.running);
+        assert_eq!(
+            snapshot.total_passes, 0,
+            "shutdown may leave a partial pass"
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -1740,10 +2254,12 @@ mod tests {
 
         let first = index.page(ExpirationCursor::start(), 2);
         assert_eq!(ids(&first), expected[..2]);
+        assert_eq!(first.entry_count, 3);
         assert!(!first.wrapped);
         assert!(!first.pass_complete);
         let second = index.page(first.next_cursor, 2);
         assert_eq!(ids(&second), expected[2..]);
+        assert_eq!(second.entry_count, 3);
         assert!(second.pass_complete);
         assert_eq!(second.next_cursor, ExpirationCursor::start());
 
