@@ -18,7 +18,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
-use crate::expiration::{ExpirationCandidate, ExpirationCursor, ExpirationPage, ExpiringStreams};
+use crate::expiration::{
+    ExpirationCandidate, ExpirationCandidateObservation, ExpirationCursor, ExpirationPage,
+    ExpiringStreams,
+};
 
 pub const MAX_SAFE_INT: u64 = (1u64 << 53) - 1;
 
@@ -579,14 +582,14 @@ impl StreamState {
     }
 
     /// Returns the earliest finite expiry deadline, or `None` when none exists.
-    ///
-    /// This acquires `shared.read()` internally; callers must not already hold
-    /// the shared lock.
     pub fn expiry_deadline(&self) -> Option<SystemTime> {
+        let shared = self.shared.read().unwrap();
+        self.expiry_deadline_while_shared(&shared)
+    }
+
+    fn expiry_deadline_while_shared(&self, shared: &Shared) -> Option<SystemTime> {
         let ttl_deadline = self.config.ttl_seconds.and_then(|ttl_seconds| {
-            self.shared
-                .read()
-                .unwrap()
+            shared
                 .last_access
                 .checked_add(Duration::from_secs(ttl_seconds))
         });
@@ -602,6 +605,14 @@ impl StreamState {
     /// Applies the protocol's strict expiration boundary: `now > deadline`.
     pub fn is_expired_at(&self, now: SystemTime) -> bool {
         self.expiry_deadline()
+            .is_some_and(|deadline| now > deadline)
+    }
+
+    /// Evaluate the canonical deadline under an already-held shared read lock.
+    /// The scanner keeps exact-registry and soft-state validation in this same
+    /// read-only critical section.
+    pub(crate) fn is_expired_while_shared(&self, shared: &Shared, now: SystemTime) -> bool {
+        self.expiry_deadline_while_shared(shared)
             .is_some_and(|deadline| now > deadline)
     }
 
@@ -1507,6 +1518,46 @@ impl Store {
     #[allow(dead_code)] // ehu-c owns the scanner loop that consumes this page.
     pub(crate) fn prune_expiration_candidate(&self, candidate: &ExpirationCandidate) -> bool {
         self.expiring_streams.prune_dead(candidate)
+    }
+
+    /// Observe one index candidate without taking an appender lock or changing
+    /// stream state. The registry guard establishes exact identity before the
+    /// shared read decides whether it is a live canonical expiry candidate.
+    pub(crate) fn observe_expiration_candidate(
+        &self,
+        candidate: &ExpirationCandidate,
+        now: SystemTime,
+    ) -> ExpirationCandidateObservation {
+        let Some(stream) = candidate.stream.upgrade() else {
+            self.prune_expiration_candidate(candidate);
+            return ExpirationCandidateObservation::Dead;
+        };
+        let observation = {
+            match self.streams.get(&stream.path) {
+                Some(current)
+                    if candidate.stream_id == stream.id
+                        && current.id == stream.id
+                        && Arc::ptr_eq(current.value(), &stream) =>
+                {
+                    let shared = stream.shared.read().unwrap();
+                    if shared.soft_deleted {
+                        None
+                    } else if stream.is_expired_while_shared(&shared, now) {
+                        Some(ExpirationCandidateObservation::Due)
+                    } else {
+                        Some(ExpirationCandidateObservation::Live)
+                    }
+                }
+                _ => None,
+            }
+        };
+        match observation {
+            Some(observation) => observation,
+            None => {
+                self.expiring_streams.prune_stale(candidate, &stream);
+                ExpirationCandidateObservation::Stale
+            }
+        }
     }
 
     #[cfg(test)]

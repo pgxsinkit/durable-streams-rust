@@ -10,9 +10,9 @@ use std::fmt;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
-use crate::store::StreamState;
+use crate::store::{Store, StreamState};
 
 /// Requested behavior for the future expiration reaper.
 ///
@@ -140,6 +140,8 @@ impl ExpirationScannerConfig {
 }
 
 const MAX_RATE_PER_SECOND: u64 = 1_000_000_000;
+const OBSERVATION_PAGE_SIZE: usize = 128;
+const IDLE_SCAN_DELAY: Duration = Duration::from_millis(100);
 
 fn parse_positive_rate(flag: &str, value: &str, unit: &str) -> Result<u64, String> {
     match value.parse::<u64>() {
@@ -161,6 +163,207 @@ fn parse_bulk_fraction(flag: &str, value: &str) -> Result<f64, String> {
         Ok(fraction) if fraction.is_finite() && fraction > 0.0 && fraction <= 1.0 => Ok(fraction),
         _ => Err(format!("{flag} must be a finite number in (0, 1]")),
     }
+}
+
+/// Read-only result from validating one weak expiration-index candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpirationCandidateObservation {
+    Live,
+    Due,
+    Dead,
+    Stale,
+}
+
+/// Level-triggered state shared with the future delete-mode controller.
+pub(crate) struct ExpirationScannerStatus {
+    initial_observe_pass_complete: std::sync::atomic::AtomicBool,
+    initial_observe_pass: tokio::sync::Notify,
+    started_at: Instant,
+    startup_grace_duration: Duration,
+}
+
+impl ExpirationScannerStatus {
+    fn new(startup_grace_duration: Duration) -> Self {
+        Self {
+            initial_observe_pass_complete: std::sync::atomic::AtomicBool::new(false),
+            initial_observe_pass: tokio::sync::Notify::new(),
+            started_at: Instant::now(),
+            startup_grace_duration,
+        }
+    }
+
+    fn mark_initial_observe_pass_complete(&self) {
+        if !self
+            .initial_observe_pass_complete
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.initial_observe_pass.notify_waiters();
+        }
+    }
+
+    pub(crate) fn initial_observe_pass_complete(&self) -> bool {
+        self.initial_observe_pass_complete
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wait until a complete page sequence has observed the current index at
+    /// least once. This is level-triggered, so late callers return immediately.
+    pub(crate) async fn wait_initial_observe_pass(&self) {
+        loop {
+            let notified = self.initial_observe_pass.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.initial_observe_pass_complete() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// The grace state is recorded now for delete-mode activation later; this
+    /// read-only slice deliberately does not use it to alter observations.
+    pub(crate) fn startup_grace_active_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started_at) < self.startup_grace_duration
+    }
+}
+
+/// Supervised process-lifetime expiration scanner.
+///
+/// Off mode creates no task. Observe and requested Delete mode both run the
+/// same read-only observer until 8dy deliberately adds retirement admission.
+pub(crate) struct ExpirationScanner {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    status: Arc<ExpirationScannerStatus>,
+}
+
+impl ExpirationScanner {
+    pub(crate) fn start(store: &Arc<Store>, config: ExpirationScannerConfig) -> Self {
+        let status = Arc::new(ExpirationScannerStatus::new(
+            config.startup_grace_duration(),
+        ));
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        if config.mode() == ExpirationReaperMode::Off {
+            // No background loop in Off mode, while callers waiting on the
+            // future activation boundary still receive a completed level state.
+            status.mark_initial_observe_pass_complete();
+            return Self {
+                shutdown,
+                task: None,
+                status,
+            };
+        }
+
+        let store = Arc::downgrade(store);
+        let task_status = Arc::clone(&status);
+        let task = tokio::spawn(async move {
+            // Delete intentionally enters the observer too. Keep this match at
+            // the task boundary so a future edit cannot activate deletion merely
+            // by accepting the requested CLI mode.
+            match config.mode() {
+                ExpirationReaperMode::Observe | ExpirationReaperMode::Delete => {
+                    run_read_only_scanner(store, config, task_status, shutdown_rx).await;
+                }
+                ExpirationReaperMode::Off => unreachable!("off mode starts no scanner task"),
+            }
+        });
+        Self {
+            shutdown,
+            task: Some(task),
+            status,
+        }
+    }
+
+    pub(crate) fn status(&self) -> &Arc<ExpirationScannerStatus> {
+        &self.status
+    }
+
+    pub(crate) async fn shutdown(mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ExpirationScanner {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+struct ObservedPage {
+    next_cursor: ExpirationCursor,
+    pass_complete: bool,
+    candidate_count: usize,
+    #[cfg(test)]
+    due_count: usize,
+}
+
+async fn run_read_only_scanner(
+    store: Weak<Store>,
+    config: ExpirationScannerConfig,
+    status: Arc<ExpirationScannerStatus>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut cursor = ExpirationCursor::start();
+    loop {
+        let Some(store) = store.upgrade() else {
+            return;
+        };
+        let observed = observe_page(&store, cursor, SystemTime::now());
+        cursor = observed.next_cursor;
+        if observed.pass_complete {
+            status.mark_initial_observe_pass_complete();
+        }
+        let delay = page_pacing_delay(
+            config.scan_rate_candidates_per_second(),
+            observed.candidate_count,
+        );
+        drop(store);
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn observe_page(store: &Store, cursor: ExpirationCursor, now: SystemTime) -> ObservedPage {
+    let page = store.expiration_page(cursor, OBSERVATION_PAGE_SIZE);
+    #[cfg(test)]
+    let mut due_count = 0;
+    for candidate in &page.candidates {
+        if store.observe_expiration_candidate(candidate, now) == ExpirationCandidateObservation::Due
+        {
+            #[cfg(test)]
+            {
+                due_count += 1;
+            }
+        }
+    }
+    ObservedPage {
+        next_cursor: page.next_cursor,
+        pass_complete: page.pass_complete,
+        candidate_count: page.candidates.len(),
+        #[cfg(test)]
+        due_count,
+    }
+}
+
+fn page_pacing_delay(rate_per_second: u64, candidate_count: usize) -> Duration {
+    if candidate_count == 0 {
+        return IDLE_SCAN_DELAY;
+    }
+    let nanos =
+        (u128::from(candidate_count as u64) * 1_000_000_000).div_ceil(u128::from(rate_per_second));
+    Duration::from_nanos(u64::try_from(nanos).expect("page pacing is bounded by page size"))
 }
 
 /// Stable round-robin position owned by an expiration scanner.
@@ -277,6 +480,28 @@ impl ExpiringStreams {
             entries.remove(&candidate.stream_id);
         }
         dead_and_same
+    }
+
+    /// Remove a live candidate that was found stale outside the index lock.
+    /// The candidate's upgraded Arc must still be the current occupant, so a
+    /// replacement at the same stable ID cannot be removed accidentally.
+    pub(crate) fn prune_stale(
+        &self,
+        candidate: &ExpirationCandidate,
+        stream: &Arc<StreamState>,
+    ) -> bool {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let exact = entries
+            .get(&candidate.stream_id)
+            .and_then(Weak::upgrade)
+            .is_some_and(|current| Arc::ptr_eq(&current, stream));
+        if exact {
+            entries.remove(&candidate.stream_id);
+        }
+        exact
     }
 
     /// Return one bounded round-robin page without upgrading a weak reference
@@ -397,6 +622,7 @@ mod tests {
     use crate::store::{CreateResult, Store, StreamConfig};
     use crate::tier::TierConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn scanner_config_defaults_and_valid_cli_overrides_are_typed() {
@@ -497,6 +723,165 @@ mod tests {
             fork_offset_raw: None,
             fork_sub_offset: None,
         }
+    }
+
+    fn scanner_config(mode: ExpirationReaperMode) -> ExpirationScannerConfig {
+        ExpirationScannerConfig {
+            mode,
+            ..ExpirationScannerConfig::default()
+        }
+    }
+
+    async fn wait_for_initial_pass(scanner: &ExpirationScanner) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            scanner.status().wait_initial_observe_pass(),
+        )
+        .await
+        .expect("scanner should complete an observe pass within five seconds");
+    }
+
+    #[tokio::test]
+    async fn scanner_off_starts_no_task_or_scan_loop() {
+        let (directory, store) = store("scanner-off");
+        let stream = streams(&store, &["due"]).pop().unwrap();
+        stream.shared.write().unwrap().last_access = UNIX_EPOCH;
+
+        let scanner = ExpirationScanner::start(&store, scanner_config(ExpirationReaperMode::Off));
+        assert!(scanner.task.is_none());
+        assert!(scanner.status().initial_observe_pass_complete());
+        assert!(scanner.status().startup_grace_active_at(Instant::now()));
+        wait_for_initial_pass(&scanner).await;
+        scanner.shutdown().await;
+
+        assert!(store
+            .registered_stream("due")
+            .is_some_and(|current| Arc::ptr_eq(&current, &stream)));
+        assert!(!stream.fenced.load(Ordering::Acquire));
+        assert_eq!(stream.shared.read().unwrap().last_access, UNIX_EPOCH);
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn scanner_observe_completes_empty_and_populated_passes_read_only() {
+        let (empty_directory, empty_store) = store("scanner-empty");
+        let empty =
+            ExpirationScanner::start(&empty_store, scanner_config(ExpirationReaperMode::Observe));
+        wait_for_initial_pass(&empty).await;
+        empty.shutdown().await;
+        drop(empty_store);
+        let _ = std::fs::remove_dir_all(empty_directory);
+
+        let (directory, store) = store("scanner-observe");
+        let stream = streams(&store, &["due"]).pop().unwrap();
+        stream.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let observed = observe_page(
+            &store,
+            ExpirationCursor::start(),
+            UNIX_EPOCH + Duration::from_secs(61),
+        );
+        assert_eq!(observed.due_count, 1);
+        assert!(observed.pass_complete);
+        assert!(!stream.fenced.load(Ordering::Acquire));
+        assert!(!stream.meta_dirty.load(Ordering::Acquire));
+        assert_eq!(stream.shared.read().unwrap().last_access, UNIX_EPOCH);
+
+        let scanner =
+            ExpirationScanner::start(&store, scanner_config(ExpirationReaperMode::Observe));
+        wait_for_initial_pass(&scanner).await;
+        scanner.shutdown().await;
+        assert!(store
+            .registered_stream("due")
+            .is_some_and(|current| Arc::ptr_eq(&current, &stream)));
+        assert!(!stream.fenced.load(Ordering::Acquire));
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn scanner_delete_request_is_still_read_only_observation() {
+        let (directory, store) = store("scanner-delete-requested");
+        let stream = streams(&store, &["due"]).pop().unwrap();
+        stream.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let scanner =
+            ExpirationScanner::start(&store, scanner_config(ExpirationReaperMode::Delete));
+        assert!(scanner.task.is_some());
+        wait_for_initial_pass(&scanner).await;
+        scanner.shutdown().await;
+
+        assert!(store
+            .registered_stream("due")
+            .is_some_and(|current| Arc::ptr_eq(&current, &stream)));
+        assert!(!stream.fenced.load(Ordering::Acquire));
+        assert!(!stream.shared.read().unwrap().soft_deleted);
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn scanner_prunes_dead_and_replaced_candidates_without_touching_replacements() {
+        let (directory, store) = store("scanner-stale");
+        let dead = streams(&store, &["dead"]).pop().unwrap();
+        assert!(store.streams.remove("dead").is_some());
+        drop(dead);
+        let observed = observe_page(&store, ExpirationCursor::start(), SystemTime::now());
+        assert_eq!(observed.candidate_count, 1);
+        assert_eq!(
+            store
+                .expiration_page(ExpirationCursor::start(), 1)
+                .candidates
+                .len(),
+            0
+        );
+
+        let old = streams(&store, &["replacement"]).pop().unwrap();
+        assert!(store.streams.remove("replacement").is_some());
+        let replacement = match store.create("replacement", config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("vacated path must create a replacement"),
+        };
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        let observed = observe_page(&store, ExpirationCursor::start(), SystemTime::now());
+        assert_eq!(observed.candidate_count, 2);
+        let page = store.expiration_page(ExpirationCursor::start(), 2);
+        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(page.candidates[0].stream_id, replacement.id);
+        assert!(page.candidates[0]
+            .stream
+            .upgrade()
+            .is_some_and(|current| Arc::ptr_eq(&current, &replacement)));
+
+        drop(old);
+        drop(replacement);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn scanner_page_pacing_is_nonzero_and_rate_bounded() {
+        assert_eq!(page_pacing_delay(10_000, 1), Duration::from_micros(100));
+        assert_eq!(
+            page_pacing_delay(10_000, 128),
+            Duration::from_micros(12_800)
+        );
+        assert_eq!(page_pacing_delay(1_000_000_000, 1), Duration::from_nanos(1));
+        assert_eq!(page_pacing_delay(10_000, 0), IDLE_SCAN_DELAY);
+    }
+
+    #[tokio::test]
+    async fn scanner_shutdown_joins_the_supervised_task() {
+        let (directory, store) = store("scanner-shutdown");
+        let scanner =
+            ExpirationScanner::start(&store, scanner_config(ExpirationReaperMode::Observe));
+        tokio::time::timeout(Duration::from_secs(5), scanner.shutdown())
+            .await
+            .expect("scanner shutdown should join promptly");
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     fn store(tag: &str) -> (std::path::PathBuf, Arc<Store>) {

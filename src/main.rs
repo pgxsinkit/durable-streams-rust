@@ -586,10 +586,6 @@ fn main() {
         .expect("failed to build runtime");
 
     rt.block_on(async move {
-        // The future scanner runtime consumes this immutable configuration.
-        // Keeping it in the runtime block makes startup parsing explicit while
-        // 1r0f-a intentionally starts no scanner or retirement work.
-        let _expiration_reaper_config = expiration_reaper_config;
         // Hold the advisory lock until all runtime-owned store and WAL state is
         // drained.  Its drop at the end of this block is the release point.
         let _data_dir_lock = data_dir_lock;
@@ -712,6 +708,11 @@ fn main() {
         let recovery_collector = store
             .start_recovery_collector()
             .expect("failed to start recovered tombstone collector");
+        // Starts after all recovery/WAL/retirement initialization and before
+        // readiness or socket exposure. Delete remains read-only observer mode
+        // in this slice; 8dy is the sole future activation point for cleanup.
+        let expiration_scanner =
+            expiration::ExpirationScanner::start(&store, expiration_reaper_config);
         let retirement_for_shutdown = Arc::clone(
             store
                 .retirement_executor()
@@ -745,6 +746,7 @@ fn main() {
                 #[cfg(target_os = "linux")]
                 sse_reactor::shutdown();
                 engine_raw::drain(std::time::Duration::from_secs(25)).await;
+                expiration_scanner.shutdown().await;
                 recovery_collector.shutdown().await;
                 retirement_for_shutdown.shutdown().await;
                 // Stop + join the dedicated committer threads (Tier-2a) AFTER the
