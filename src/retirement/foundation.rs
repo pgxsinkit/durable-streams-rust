@@ -119,6 +119,14 @@ impl RetirementConfig {
     }
 }
 
+/// Exponential retry delay for a failed physical cleanup attempt. The shift is
+/// bounded before multiplication so a malformed large attempt count cannot
+/// overflow, and the approved sixty-second maximum remains authoritative.
+pub(crate) fn retry_backoff(attempt: u8, base: Duration) -> Duration {
+    let shift = u32::from(attempt.saturating_sub(1)).min(6);
+    base.saturating_mul(1u32 << shift).min(MAX_RETRY_BACKOFF)
+}
+
 struct TicketState {
     logical: watch::Sender<Option<LogicalCompletion>>,
     first_attempt: watch::Sender<Option<FirstAttemptCompletion>>,

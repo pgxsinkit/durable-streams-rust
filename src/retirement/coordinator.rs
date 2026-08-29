@@ -1,24 +1,25 @@
-//! Bounded one-attempt retirement coordinator.
+//! Bounded retirement coordinator with one supervised retry timer.
 //!
 //! This slice owns admission and scheduling only. Logical retirement is still
-//! completed by the later handler-ordering slice; cleanup retries are likewise
-//! deliberately absent here.
+//! completed by the later handler-ordering slice.
 
 // TODO(retirement-005): handler retirement wiring makes this coordinator live.
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::{Ordering as CmpOrdering, Reverse};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use tokio::sync::{mpsc, Notify};
 
 use crate::store::{LocalCleanupMode, StreamState};
 
 use super::{
-    CleanupCallback, FirstAttemptCompletion, LogicalCompletion, PhysicalAttemptResult,
-    PhysicalExecutor, PhysicalSubmitError, RetirementAdmission, RetirementConfig,
-    RetirementPriority, RetirementReservation, RetirementTicket, TerminalCleanupCompletion,
+    retry_backoff, CleanupCallback, FirstAttemptCompletion, LogicalCompletion,
+    PhysicalAttemptResult, PhysicalExecutor, PhysicalSubmitError, RetirementAdmission,
+    RetirementConfig, RetirementPriority, RetirementReservation, RetirementTicket,
+    TerminalCleanupCompletion, MAX_CLEANUP_ATTEMPTS,
 };
 
 /// The result of an admission attempt. Duplicate admissions return the exact
@@ -41,13 +42,43 @@ impl Job {
     }
 }
 
+struct JobRecord {
+    job: Arc<Job>,
+    active_attempt: Option<u8>,
+    retry_scheduled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScheduledRetry {
+    due: Instant,
+    sequence: u64,
+    id: u64,
+}
+
+impl Ord for ScheduledRetry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.due
+            .cmp(&other.due)
+            .then_with(|| self.sequence.cmp(&other.sequence))
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for ScheduledRetry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Default)]
 struct CoordinatorState {
-    jobs: HashMap<u64, Arc<Job>>,
+    jobs: HashMap<u64, JobRecord>,
     interactive_pending: VecDeque<Arc<Job>>,
     proactive_pending: VecDeque<Arc<Job>>,
+    retries: BinaryHeap<Reverse<ScheduledRetry>>,
     active_interactive: usize,
     active_proactive: usize,
+    next_retry_sequence: u64,
     closed: bool,
 }
 
@@ -59,6 +90,7 @@ impl CoordinatorState {
 
 struct WorkerEvent {
     id: u64,
+    attempt: u8,
     result: PhysicalAttemptResult,
 }
 
@@ -159,7 +191,14 @@ impl RetirementExecutor {
             priority,
             mode,
         });
-        state.jobs.insert(job.id(), job.clone());
+        state.jobs.insert(
+            job.id(),
+            JobRecord {
+                job: job.clone(),
+                active_attempt: None,
+                retry_scheduled: false,
+            },
+        );
         match priority {
             RetirementPriority::Interactive => state.interactive_pending.push_back(job),
             RetirementPriority::Proactive => state.proactive_pending.push_back(job),
@@ -197,11 +236,13 @@ impl RetirementExecutor {
             state.closed = true;
             state.interactive_pending.clear();
             state.proactive_pending.clear();
+            state.retries.clear();
             state.active_interactive = 0;
             state.active_proactive = 0;
             std::mem::take(&mut state.jobs)
         };
-        for (_, job) in jobs {
+        for (_, record) in jobs {
+            let job = record.job;
             job.ticket.complete_logical(LogicalCompletion::Cancelled);
             job.ticket
                 .complete_first_attempt(FirstAttemptCompletion::Cancelled);
@@ -227,6 +268,11 @@ impl RetirementExecutor {
             state.proactive_pending.len(),
         )
     }
+
+    #[cfg(test)]
+    fn scheduled_retry_count(&self) -> usize {
+        lock_recover(&self.inner.state).retries.len()
+    }
 }
 
 impl Drop for RetirementExecutor {
@@ -236,7 +282,9 @@ impl Drop for RetirementExecutor {
             task.abort();
         }
         // PhysicalExecutor::drop only wakes workers and cancels unstarted jobs;
-        // it intentionally does not join on the caller's runtime thread.
+        // it intentionally does not join on the caller's runtime thread. A
+        // cancellation may reach ticket observers before an already-running
+        // synchronous cleanup callback returns.
     }
 }
 
@@ -245,22 +293,61 @@ async fn coordinator(inner: Weak<Inner>, mut events: mpsc::Receiver<WorkerEvent>
         let Some(inner) = inner.upgrade() else {
             return;
         };
+        enqueue_due_retries(&inner);
         dispatch_ready(&inner);
 
         let notified = inner.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
+        let next_retry = next_retry_deadline(&inner);
         if lock_recover(&inner.state).closed {
             return;
         }
-        tokio::select! {
-            event = events.recv() => match event {
-                Some(event) => finish_attempt(&inner, event),
-                None => return,
-            },
-            _ = &mut notified => {},
+        if let Some(due) = next_retry {
+            tokio::select! {
+                event = events.recv() => match event {
+                    Some(event) => finish_attempt(&inner, event),
+                    None => return,
+                },
+                _ = &mut notified => {},
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => {},
+            }
+        } else {
+            tokio::select! {
+                event = events.recv() => match event {
+                    Some(event) => finish_attempt(&inner, event),
+                    None => return,
+                },
+                _ = &mut notified => {},
+            }
         }
     }
+}
+
+fn enqueue_due_retries(inner: &Arc<Inner>) {
+    let mut state = lock_recover(&inner.state);
+    let now = Instant::now();
+    while state.retries.peek().is_some_and(|retry| retry.0.due <= now) {
+        let retry = state.retries.pop().expect("peeked retry").0;
+        let job = match state.jobs.get_mut(&retry.id) {
+            Some(record) if record.retry_scheduled => {
+                record.retry_scheduled = false;
+                record.job.clone()
+            }
+            _ => continue,
+        };
+        match job.priority {
+            RetirementPriority::Interactive => state.interactive_pending.push_back(job),
+            RetirementPriority::Proactive => state.proactive_pending.push_back(job),
+        }
+    }
+}
+
+fn next_retry_deadline(inner: &Inner) -> Option<Instant> {
+    lock_recover(&inner.state)
+        .retries
+        .peek()
+        .map(|retry| retry.0.due)
 }
 
 fn dispatch_ready(inner: &Arc<Inner>) {
@@ -283,6 +370,12 @@ fn dispatch_ready(inner: &Arc<Inner>) {
                 None
             };
             let Some(job) = job else { return };
+            let Some(record) = state.jobs.get(&job.id()) else {
+                continue;
+            };
+            if record.active_attempt.is_some() || record.retry_scheduled {
+                continue;
+            }
 
             #[cfg(test)]
             if let Some(observer) = &inner.dispatch_observer {
@@ -294,12 +387,17 @@ fn dispatch_ready(inner: &Arc<Inner>) {
                 .submit(job.stream.clone(), job.priority, job.mode)
             {
                 Ok(attempt) => {
-                    job.stream.retirement_state().record_attempt();
+                    let attempt_number = job.stream.retirement_state().record_attempt();
+                    state
+                        .jobs
+                        .get_mut(&job.id())
+                        .expect("queued job remains admitted")
+                        .active_attempt = Some(attempt_number);
                     match job.priority {
                         RetirementPriority::Interactive => state.active_interactive += 1,
                         RetirementPriority::Proactive => state.active_proactive += 1,
                     }
-                    Some((job, attempt))
+                    Some((job, attempt, attempt_number))
                 }
                 Err(PhysicalSubmitError::Full) => {
                     push_front(&mut state, job);
@@ -313,7 +411,7 @@ fn dispatch_ready(inner: &Arc<Inner>) {
         };
 
         match submitted {
-            Some((job, attempt)) => {
+            Some((job, attempt, attempt_number)) => {
                 let events = inner.events.clone();
                 // At most coordinator_capacity waiter tasks exist: each is
                 // created only after reserving an active coordinator slot and
@@ -322,6 +420,7 @@ fn dispatch_ready(inner: &Arc<Inner>) {
                     let _ = events
                         .send(WorkerEvent {
                             id: job.id(),
+                            attempt: attempt_number,
                             result: attempt.wait().await,
                         })
                         .await;
@@ -357,10 +456,14 @@ fn settle_without_attempt(state: &mut CoordinatorState, job: Arc<Job>, cancelled
 }
 
 fn finish_attempt(inner: &Inner, event: WorkerEvent) {
-    let job = {
+    let outcome = {
         let mut state = lock_recover(&inner.state);
-        let Some(job) = state.jobs.remove(&event.id) else {
-            return;
+        let job = match state.jobs.get_mut(&event.id) {
+            Some(record) if record.active_attempt == Some(event.attempt) => {
+                record.active_attempt = None;
+                record.job.clone()
+            }
+            _ => return,
         };
         match job.priority {
             RetirementPriority::Interactive => {
@@ -370,32 +473,89 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
                 state.active_proactive = state.active_proactive.saturating_sub(1)
             }
         }
-        job
-    };
-    let (first, terminal) = match event.result {
-        PhysicalAttemptResult::Succeeded {
-            reclaimed_local_bytes,
-        } => (
-            FirstAttemptCompletion::Succeeded {
+        match event.result {
+            PhysicalAttemptResult::Succeeded {
                 reclaimed_local_bytes,
-            },
-            TerminalCleanupCompletion::Succeeded {
-                reclaimed_local_bytes,
-            },
-        ),
-        PhysicalAttemptResult::Failed | PhysicalAttemptResult::Panicked => (
-            FirstAttemptCompletion::Failed,
-            TerminalCleanupCompletion::Failed,
-        ),
-        PhysicalAttemptResult::Cancelled => (
-            FirstAttemptCompletion::Cancelled,
-            TerminalCleanupCompletion::Cancelled,
-        ),
+            } => {
+                state.jobs.remove(&event.id);
+                AttemptOutcome::Succeeded(job, reclaimed_local_bytes)
+            }
+            PhysicalAttemptResult::Failed | PhysicalAttemptResult::Panicked
+                if event.attempt < MAX_CLEANUP_ATTEMPTS =>
+            {
+                state.next_retry_sequence = state.next_retry_sequence.wrapping_add(1);
+                let due = Instant::now() + retry_backoff(event.attempt, inner.config.retry_base);
+                let sequence = state.next_retry_sequence;
+                state
+                    .jobs
+                    .get_mut(&event.id)
+                    .expect("active record remains")
+                    .retry_scheduled = true;
+                state.retries.push(Reverse(ScheduledRetry {
+                    due,
+                    sequence,
+                    id: event.id,
+                }));
+                AttemptOutcome::Retry(job)
+            }
+            PhysicalAttemptResult::Failed | PhysicalAttemptResult::Panicked => {
+                state.jobs.remove(&event.id);
+                AttemptOutcome::Failed(job)
+            }
+            PhysicalAttemptResult::Cancelled => {
+                state.jobs.remove(&event.id);
+                AttemptOutcome::Cancelled(job)
+            }
+        }
     };
-    job.ticket.complete_first_attempt(first);
-    job.ticket.complete_terminal(terminal);
-    job.stream.retirement_state().finish(&job.ticket);
+    if event.attempt == 1 {
+        match &outcome {
+            AttemptOutcome::Succeeded(job, reclaimed_local_bytes) => job
+                .ticket
+                .complete_first_attempt(FirstAttemptCompletion::Succeeded {
+                    reclaimed_local_bytes: *reclaimed_local_bytes,
+                }),
+            AttemptOutcome::Retry(job) | AttemptOutcome::Failed(job) => job
+                .ticket
+                .complete_first_attempt(FirstAttemptCompletion::Failed),
+            AttemptOutcome::Cancelled(job) => job
+                .ticket
+                .complete_first_attempt(FirstAttemptCompletion::Cancelled),
+        }
+    }
+    match outcome {
+        AttemptOutcome::Succeeded(job, reclaimed_local_bytes) => {
+            job.ticket
+                .complete_terminal(TerminalCleanupCompletion::Succeeded {
+                    reclaimed_local_bytes,
+                });
+            job.stream.retirement_state().finish(&job.ticket);
+        }
+        AttemptOutcome::Retry(_) => {}
+        AttemptOutcome::Failed(job) => {
+            job.ticket
+                .complete_terminal(TerminalCleanupCompletion::Failed);
+            job.stream.retirement_state().fail_terminal(
+                &job.ticket,
+                Instant::now(),
+                SystemTime::now(),
+                inner.config.cooldown,
+            );
+        }
+        AttemptOutcome::Cancelled(job) => {
+            job.ticket
+                .complete_terminal(TerminalCleanupCompletion::Cancelled);
+            job.stream.retirement_state().finish(&job.ticket);
+        }
+    }
     inner.notify.notify_one();
+}
+
+enum AttemptOutcome {
+    Succeeded(Arc<Job>, u64),
+    Retry(Arc<Job>),
+    Failed(Arc<Job>),
+    Cancelled(Arc<Job>),
 }
 
 fn lock_recover<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -459,6 +619,13 @@ mod tests {
             physical_queue_capacity: 16,
             cleanup_workers: 4,
             ..RetirementConfig::default()
+        }
+    }
+
+    fn retry_config(queue: usize, retry_base: Duration) -> RetirementConfig {
+        RetirementConfig {
+            retry_base,
+            ..config(queue, 8, 0)
         }
     }
 
@@ -607,7 +774,16 @@ mod tests {
         })
         .await
         .expect("interactive reserved slot should start");
-        assert_eq!(started.load(Ordering::Acquire), 3);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if started.load(Ordering::Acquire) == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all admitted cleanup callbacks should start");
         *gate.0.lock().unwrap() = true;
         gate.1.notify_all();
         assert!(matches!(
@@ -697,7 +873,7 @@ mod tests {
     async fn retirement_queue_coordinator_failure_and_shutdown_settle_every_phase() {
         let (store, failing, directory) = store_stream("settle");
         let failure: CleanupCallback = Arc::new(|_, _| Err(io::Error::other("expected")));
-        let executor = RetirementExecutor::new(failure, config(2, 8, 0)).unwrap();
+        let executor = RetirementExecutor::new(failure, retry_config(2, Duration::ZERO)).unwrap();
         let failed = ticket(executor.admit(
             failing,
             RetirementPriority::Interactive,
@@ -733,5 +909,178 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_queue_coordinator_retry_failure_then_success_preserves_first_result() {
+        let (store, stream, directory) = store_stream("retry-success");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let callback_attempts = attempts.clone();
+        let cleanup: CleanupCallback = Arc::new(move |_, _| {
+            if callback_attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                Err(io::Error::other("first attempt fails"))
+            } else {
+                Ok(LocalCleanupOutcome {
+                    reclaimed_local_bytes: 9,
+                })
+            }
+        });
+        let executor = RetirementExecutor::new(cleanup, retry_config(2, Duration::ZERO)).unwrap();
+        let scheduled_ticket = ticket(executor.admit(
+            stream,
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        assert_eq!(
+            scheduled_ticket.wait_first_attempt().await,
+            FirstAttemptCompletion::Failed
+        );
+        assert_eq!(
+            scheduled_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded {
+                reclaimed_local_bytes: 9
+            }
+        );
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        executor.shutdown().await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_queue_coordinator_retry_permanent_failure_cools_down_and_releases_memory() {
+        let (store, stream, directory) = store_stream("retry-permanent");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let callback_attempts = attempts.clone();
+        let cleanup: CleanupCallback = Arc::new(move |_, _| {
+            callback_attempts.fetch_add(1, Ordering::AcqRel);
+            Err(io::Error::other("permanent"))
+        });
+        let executor = RetirementExecutor::new(cleanup, retry_config(2, Duration::ZERO)).unwrap();
+        let scheduled_ticket = ticket(executor.admit(
+            stream.clone(),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        assert_eq!(
+            scheduled_ticket.wait_first_attempt().await,
+            FirstAttemptCompletion::Failed
+        );
+        assert_eq!(
+            scheduled_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Failed
+        );
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            usize::from(MAX_CLEANUP_ATTEMPTS)
+        );
+        assert_eq!(executor.pending_and_jobs(), (0, 0, 0));
+        assert_eq!(executor.scheduled_retry_count(), 0);
+        assert!(matches!(
+            executor.admit(
+                stream,
+                RetirementPriority::Interactive,
+                LocalCleanupMode::Expiry
+            ),
+            RetirementAdmissionResult::Rejected(RetirementAdmission::CoolingDown)
+        ));
+        executor.shutdown().await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_queue_coordinator_retry_shutdown_and_drop_cancel_scheduled_work() {
+        let (store, first, directory) = store_stream("retry-cancel");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let callback_attempts = attempts.clone();
+        let cleanup: CleanupCallback = Arc::new(move |_, _| {
+            callback_attempts.fetch_add(1, Ordering::AcqRel);
+            Err(io::Error::other("retry later"))
+        });
+        let executor =
+            RetirementExecutor::new(cleanup.clone(), retry_config(2, Duration::from_secs(60)))
+                .unwrap();
+        let scheduled_ticket = ticket(executor.admit(
+            first,
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        assert_eq!(
+            scheduled_ticket.wait_first_attempt().await,
+            FirstAttemptCompletion::Failed
+        );
+        executor.shutdown().await;
+        assert_eq!(
+            scheduled_ticket.wait_logical().await,
+            LogicalCompletion::Cancelled
+        );
+        assert_eq!(
+            scheduled_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Cancelled
+        );
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+
+        let dropped =
+            RetirementExecutor::new(cleanup, retry_config(2, Duration::from_secs(60))).unwrap();
+        let dropped_ticket = ticket(dropped.admit(
+            stream(&store, "dropped"),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        assert_eq!(
+            dropped_ticket.wait_first_attempt().await,
+            FirstAttemptCompletion::Failed
+        );
+        drop(dropped);
+        assert_eq!(
+            dropped_ticket.wait_logical().await,
+            LogicalCompletion::Cancelled
+        );
+        assert_eq!(
+            dropped_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Cancelled
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_queue_coordinator_retry_success_on_first_attempt_does_not_schedule() {
+        let (store, stream, directory) = store_stream("retry-first-success");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let callback_attempts = attempts.clone();
+        let cleanup: CleanupCallback = Arc::new(move |_, _| {
+            callback_attempts.fetch_add(1, Ordering::AcqRel);
+            Ok(LocalCleanupOutcome::default())
+        });
+        let executor = RetirementExecutor::new(cleanup, retry_config(2, Duration::ZERO)).unwrap();
+        let ticket = ticket(executor.admit(
+            stream,
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+        assert_eq!(executor.scheduled_retry_count(), 0);
+        executor.shutdown().await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn retirement_queue_coordinator_retry_backoff_is_capped_and_overflow_safe() {
+        let base = Duration::from_secs(1);
+        assert_eq!(retry_backoff(1, base), Duration::from_secs(1));
+        assert_eq!(retry_backoff(2, base), Duration::from_secs(2));
+        assert_eq!(retry_backoff(3, base), Duration::from_secs(4));
+        assert_eq!(retry_backoff(7, base), Duration::from_secs(60));
+        assert_eq!(
+            retry_backoff(u8::MAX, Duration::MAX),
+            Duration::from_secs(60)
+        );
     }
 }
