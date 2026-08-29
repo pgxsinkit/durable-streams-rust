@@ -1521,6 +1521,12 @@ impl Store {
             }
         };
 
+        #[cfg(test)]
+        crate::test_cut_points::hit_async(
+            crate::test_cut_points::CutPoint::FenceBeforeAppenderTransition,
+            &stream,
+        )
+        .await;
         let (newly_applied_expiry_fence, expiry_fence_present) = {
             let appender = stream.appender.lock().await;
             if !self.is_exact_live(&stream) {
@@ -1551,6 +1557,12 @@ impl Store {
                 mode == LocalCleanupMode::Expiry,
             )
         };
+        #[cfg(test)]
+        crate::test_cut_points::hit_async(
+            crate::test_cut_points::CutPoint::FenceAfterAppenderTransition,
+            &stream,
+        )
+        .await;
         if expiry_fence_present {
             #[cfg(feature = "telemetry")]
             executor.mark_expiry_fence(&stream);
@@ -1577,6 +1589,12 @@ impl Store {
         // On error cancel the ticket but deliberately keep the exact fence: a
         // later owner retries this idempotent hand-off without reopening writes.
         if let Some(wal) = self.wal.get() {
+            #[cfg(test)]
+            crate::test_cut_points::hit_async(
+                crate::test_cut_points::CutPoint::WalForgetBeforeDurableTails,
+                &stream,
+            )
+            .await;
             if let Err(error) = wal.forget_stream(stream.id).await {
                 log_expiry_failure(
                     ExpiryFailureLogCategory::WalForget,
@@ -1585,6 +1603,12 @@ impl Store {
                 );
                 return self.cancel_retirement(&executor, &stream, ticket);
             }
+            #[cfg(test)]
+            crate::test_cut_points::hit_async(
+                crate::test_cut_points::CutPoint::WalForgetAndTailsCompleted,
+                &stream,
+            )
+            .await;
         }
         if !self.is_exact_live(&stream) {
             return self.cancel_retirement(&executor, &stream, ticket);
@@ -1594,6 +1618,12 @@ impl Store {
             .clone()
             .on_stream_deleted(Arc::clone(self), &stream.path)
             .await;
+        #[cfg(test)]
+        crate::test_cut_points::hit_async(
+            crate::test_cut_points::CutPoint::SubscriptionTransition,
+            &stream,
+        )
+        .await;
         if !self.is_exact_live(&stream) {
             return self.cancel_retirement(&executor, &stream, ticket);
         }
@@ -1615,6 +1645,14 @@ impl Store {
                 false
             }
         };
+        if soft_deleted {
+            #[cfg(test)]
+            crate::test_cut_points::hit_async(
+                crate::test_cut_points::CutPoint::ExpirationIndexRemoval,
+                &stream,
+            )
+            .await;
+        }
         if !soft_deleted {
             let removed = self.streams.remove_if(&stream.path, |_, current| {
                 current.id == stream.id && Arc::ptr_eq(current, &stream)
@@ -1622,11 +1660,30 @@ impl Store {
             if removed.is_none() {
                 return self.cancel_retirement(&executor, &stream, ticket);
             }
+            drop(removed);
+            #[cfg(test)]
+            crate::test_cut_points::hit_async(
+                crate::test_cut_points::CutPoint::RegistryRemoval,
+                &stream,
+            )
+            .await;
             // Hard retirement removes registry before index membership. A
             // racing creator/recoverer holding the exact DashMap identity must
             // finish its registration before remove_if can win.
             self.expiring_streams.unregister_exact(&stream);
+            #[cfg(test)]
+            crate::test_cut_points::hit_async(
+                crate::test_cut_points::CutPoint::ExpirationIndexRemoval,
+                &stream,
+            )
+            .await;
             self.remove_inventory(&stream.path, stream.id);
+            #[cfg(test)]
+            crate::test_cut_points::hit_async(
+                crate::test_cut_points::CutPoint::InventoryRemoval,
+                &stream,
+            )
+            .await;
         }
 
         if executor.release_logical(&stream, &ticket) {
@@ -1795,12 +1852,23 @@ impl Store {
                     "soft retirement lost its exact registry tombstone",
                 ));
             }
+            #[cfg(test)]
+            crate::test_cut_points::hit_blocking(
+                crate::test_cut_points::CutPoint::PhysicalSoftWriteEntry,
+                stream,
+            );
             write_meta_sync(stream, true)?;
             self.publish_inventory(stream);
-            return Ok(LocalCleanupOutcome {
+            let outcome = LocalCleanupOutcome {
                 reclaimed_local_bytes: 0,
                 disposition: LocalCleanupDisposition::DurableSoftDeleted,
-            });
+            };
+            #[cfg(test)]
+            crate::test_cut_points::hit_blocking(
+                crate::test_cut_points::CutPoint::PhysicalSoftWriteDisposition,
+                stream,
+            );
+            return Ok(outcome);
         }
         if self.is_exact_registered(stream) {
             return Err(std::io::Error::other(
@@ -1815,7 +1883,17 @@ impl Store {
             LocalCleanupMode::CascadeCollection => LocalCleanupMode::ExplicitDelete,
             mode => mode,
         };
+        #[cfg(test)]
+        crate::test_cut_points::hit_blocking(
+            crate::test_cut_points::CutPoint::PhysicalHardUnlinkEntry,
+            stream,
+        );
         let outcome = self.cleanup_local_stream(stream, cleanup_mode)?;
+        #[cfg(test)]
+        crate::test_cut_points::hit_blocking(
+            crate::test_cut_points::CutPoint::PhysicalHardUnlinkDisposition,
+            stream,
+        );
         self.release_parent(stream)?;
         Ok(outcome)
     }
@@ -2233,6 +2311,7 @@ impl Store {
                 current.id == st.id && Arc::ptr_eq(current, st)
             });
             if removed.is_some() {
+                drop(removed);
                 self.expiring_streams.unregister_exact(st);
                 self.remove_inventory(&st.path, st.id);
                 let _ = self.release_parent(st);
@@ -2291,44 +2370,57 @@ impl Store {
             Err(error) => return Err(error),
         }
 
-        let _meta_lock = st
-            .meta_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let mut outcome = LocalCleanupOutcome::default();
-        for path in &paths {
-            let bytes = match std::fs::metadata(path) {
-                Ok(metadata) => metadata.len(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            match std::fs::remove_file(path) {
-                Ok(()) => outcome.reclaimed_local_bytes += bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
-
-        if mode == LocalCleanupMode::ExplicitDelete {
-            #[cfg(test)]
-            if delete_fault_for(st) == 3 {
-                return Err(std::io::Error::other(
-                    "injected parent-directory sync failure",
-                ));
-            }
-            let mut synced_dirs = HashSet::new();
+        #[cfg(test)]
+        crate::test_cut_points::hit_blocking(
+            crate::test_cut_points::CutPoint::MetadataLockBeforeUnlink,
+            st,
+        );
+        let outcome = {
+            let _meta_lock = st
+                .meta_lock
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut outcome = LocalCleanupOutcome::default();
             for path in &paths {
-                if let Some(parent) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-                    if synced_dirs.insert(parent.to_path_buf()) {
-                        match File::open(parent) {
-                            Ok(directory) => directory.sync_all()?,
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(error) => return Err(error),
+                let bytes = match std::fs::metadata(path) {
+                    Ok(metadata) => metadata.len(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                match std::fs::remove_file(path) {
+                    Ok(()) => outcome.reclaimed_local_bytes += bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+
+            if mode == LocalCleanupMode::ExplicitDelete {
+                #[cfg(test)]
+                if delete_fault_for(st) == 3 {
+                    return Err(std::io::Error::other(
+                        "injected parent-directory sync failure",
+                    ));
+                }
+                let mut synced_dirs = HashSet::new();
+                for path in &paths {
+                    if let Some(parent) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+                        if synced_dirs.insert(parent.to_path_buf()) {
+                            match File::open(parent) {
+                                Ok(directory) => directory.sync_all()?,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error),
+                            }
                         }
                     }
                 }
             }
-        }
+            outcome
+        };
+        #[cfg(test)]
+        crate::test_cut_points::hit_blocking(
+            crate::test_cut_points::CutPoint::MetadataLockAfterUnlink,
+            st,
+        );
         Ok(outcome)
     }
 
@@ -2356,6 +2448,11 @@ impl Store {
         // the decrement above. The new count is durable before a zero-ref parent
         // can ever be made collectible.
         write_meta_sync(&parent, true)?;
+        #[cfg(test)]
+        crate::test_cut_points::hit_blocking(
+            crate::test_cut_points::CutPoint::ForkReferenceTransition,
+            &parent,
+        );
 
         #[cfg(test)]
         if take_parent_release_fail_once_for(child) {
@@ -2447,6 +2544,7 @@ impl Store {
             let _ = executor.cancel_prelogical(parent, &ticket);
             return Ok(SoftParentCollectionAdmission::Skipped);
         }
+        drop(removed);
         self.expiring_streams.unregister_exact(parent);
         self.remove_inventory(&parent.path, parent.id);
         if executor.release_logical(parent, &ticket) {

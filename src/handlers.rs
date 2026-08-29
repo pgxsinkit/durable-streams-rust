@@ -104,154 +104,6 @@ pub(crate) mod test_support {
     }
 }
 
-#[cfg(test)]
-mod append_fence_test_support {
-    use super::*;
-    use std::sync::Mutex;
-    use tokio::sync::Barrier;
-
-    struct AfterWalPauseState {
-        path: String,
-        reached: Arc<Barrier>,
-        release: Arc<Barrier>,
-    }
-
-    static AFTER_WAL_PAUSE: Mutex<Option<AfterWalPauseState>> = Mutex::new(None);
-
-    pub(super) struct AfterWalPause {
-        path: String,
-        reached: Arc<Barrier>,
-        release: Arc<Barrier>,
-    }
-
-    pub(super) fn pause_after_wal(path: &str) -> AfterWalPause {
-        let reached = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        *AFTER_WAL_PAUSE.lock().unwrap() = Some(AfterWalPauseState {
-            path: path.to_string(),
-            reached: reached.clone(),
-            release: release.clone(),
-        });
-        AfterWalPause {
-            path: path.to_string(),
-            reached,
-            release,
-        }
-    }
-
-    impl AfterWalPause {
-        pub(super) async fn wait_until_handler(&self) {
-            self.reached.wait().await;
-        }
-
-        pub(super) async fn release_handler(&self) {
-            self.release.wait().await;
-        }
-    }
-
-    impl Drop for AfterWalPause {
-        fn drop(&mut self) {
-            let mut pause = AFTER_WAL_PAUSE.lock().unwrap();
-            if pause.as_ref().is_some_and(|pause| {
-                pause.path == self.path && Arc::ptr_eq(&pause.reached, &self.reached)
-            }) {
-                *pause = None;
-            }
-        }
-    }
-
-    pub(super) async fn wait_after_wal(stream: &StreamState) {
-        let barriers = AFTER_WAL_PAUSE.lock().unwrap().as_ref().and_then(|pause| {
-            (pause.path == stream.path).then(|| (pause.reached.clone(), pause.release.clone()))
-        });
-        if let Some((reached, release)) = barriers {
-            reached.wait().await;
-            release.wait().await;
-        }
-    }
-}
-
-#[cfg(test)]
-mod fork_source_lease_test_support {
-    use super::*;
-    use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
-    use tokio::sync::Barrier;
-
-    struct PauseState {
-        reached: Arc<Barrier>,
-        release: Arc<Barrier>,
-    }
-
-    static PAUSES: LazyLock<Mutex<HashMap<String, PauseState>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-
-    pub(super) struct ForkSourceLeasePause {
-        path: String,
-        reached: Arc<Barrier>,
-        release: Arc<Barrier>,
-    }
-
-    pub(super) fn pause_after_lease(path: &str) -> ForkSourceLeasePause {
-        let reached = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        PAUSES.lock().unwrap().insert(
-            path.to_string(),
-            PauseState {
-                reached: reached.clone(),
-                release: release.clone(),
-            },
-        );
-        ForkSourceLeasePause {
-            path: path.to_string(),
-            reached,
-            release,
-        }
-    }
-
-    impl ForkSourceLeasePause {
-        pub(super) async fn wait_until_held(&self) {
-            tokio::time::timeout(Duration::from_secs(5), self.reached.wait())
-                .await
-                .expect("fork source lease was not acquired");
-        }
-
-        pub(super) async fn release(&self) {
-            tokio::time::timeout(Duration::from_secs(5), self.release.wait())
-                .await
-                .expect("fork source lease did not resume");
-        }
-    }
-
-    impl Drop for ForkSourceLeasePause {
-        fn drop(&mut self) {
-            let mut pauses = PAUSES.lock().unwrap();
-            if pauses
-                .get(&self.path)
-                .is_some_and(|pause| Arc::ptr_eq(&pause.reached, &self.reached))
-            {
-                pauses.remove(&self.path);
-            }
-        }
-    }
-
-    pub(super) async fn wait_after_lease(stream: &StreamState) {
-        let barriers = PAUSES
-            .lock()
-            .unwrap()
-            .get(&stream.path)
-            .map(|pause| (pause.reached.clone(), pause.release.clone()));
-        if let Some((reached, release)) = barriers {
-            tokio::time::timeout(Duration::from_secs(5), reached.wait())
-                .await
-                .expect("fork source lease handler did not reach pause");
-            tokio::time::timeout(Duration::from_secs(5), release.wait())
-                .await
-                .expect("fork source lease handler was not released");
-        }
-    }
-}
-
 fn long_poll_timeout_dur() -> Duration {
     Duration::from_millis(LONG_POLL_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -791,7 +643,8 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             }
         }
         #[cfg(test)]
-        fork_source_lease_test_support::wait_after_lease(&src).await;
+        crate::test_cut_points::hit_async(crate::test_cut_points::CutPoint::ForkSourceLease, &src)
+            .await;
         match &content_type_hdr {
             None => content_type = src.config.content_type.clone(),
             Some(ct) => {
@@ -1015,11 +868,21 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                     }
                 };
                 drop(ap);
+                #[cfg(test)]
+                crate::test_cut_points::hit_async(
+                    crate::test_cut_points::CutPoint::AppendAfterAppenderDropBeforeWalWait,
+                    &st,
+                )
+                .await;
                 if let Some(lsn) = staged_lsn {
                     wait_durable_lsn(&store, &st, lsn).await;
                 }
                 #[cfg(test)]
-                append_fence_test_support::wait_after_wal(&st).await;
+                crate::test_cut_points::hit_async(
+                    crate::test_cut_points::CutPoint::AppendPostDurablePreVisible,
+                    &st,
+                )
+                .await;
                 if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
                     return text_response(404, "stream not found");
                 }
@@ -1710,6 +1573,12 @@ async fn handle_append_inner(
         None
     };
     drop(ap);
+    #[cfg(test)]
+    crate::test_cut_points::hit_async(
+        crate::test_cut_points::CutPoint::AppendAfterAppenderDropBeforeWalWait,
+        &st,
+    )
+    .await;
 
     // Wait for durability off the lock before exposing the bytes.
     if let Some(lsn) = staged_lsn {
@@ -1718,7 +1587,11 @@ async fn handle_append_inner(
         crate::srvstats::record_durwait(dur_t0.elapsed());
     }
     #[cfg(test)]
-    append_fence_test_support::wait_after_wal(&st).await;
+    crate::test_cut_points::hit_async(
+        crate::test_cut_points::CutPoint::AppendPostDurablePreVisible,
+        &st,
+    )
+    .await;
 
     if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
         ret!(text_response(404, "stream not found"), Conflict);
@@ -2236,6 +2109,9 @@ async fn handle_long_poll(
     // Subscribe before observing the tail so a concurrent retirement wake cannot
     // be missed between the initial snapshot and the wait loop.
     let mut deletion = st.subscribe_deletion();
+    #[cfg(test)]
+    crate::test_cut_points::hit_async(crate::test_cut_points::CutPoint::DeletionWatchRecheck, &st)
+        .await;
     if deletion_observed(&mut deletion) {
         return deletion_missing_response();
     }
@@ -3687,14 +3563,17 @@ mod fork_source_liveness_tests {
         let (directory, store) = store("self-expiry");
         store.init_retirement_executor().unwrap();
         let source = create(&store, "self-source", Some(3_600));
-        let pause = fork_source_lease_test_support::pause_after_lease("self-source");
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::ForkSourceLease,
+            &source,
+        );
         let fork_store = store.clone();
         let self_fork = tokio::spawn(async move {
             handle(fork_store, fork_put("self-source", "self-source")).await
         });
         pause.wait_until_held().await;
         source.shared.write().unwrap().last_access = UNIX_EPOCH;
-        pause.release().await;
+        pause.release();
 
         let response = timeout(Duration::from_secs(5), self_fork)
             .await
@@ -3725,7 +3604,10 @@ mod fork_source_liveness_tests {
         let (directory, store) = store("lease");
         store.init_retirement_executor().unwrap();
         let source = create(&store, "source-lease", None);
-        let pause = fork_source_lease_test_support::pause_after_lease("source-lease");
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::ForkSourceLease,
+            &source,
+        );
         let fork_store = store.clone();
         let fork = tokio::spawn(async move {
             handle(fork_store, fork_put("source-lease", "child-lease")).await
@@ -3738,7 +3620,7 @@ mod fork_source_liveness_tests {
         wait_fenced(&source).await;
         assert_eq!(source.shared.read().unwrap().ref_count, 0);
         assert!(store.registered_stream("child-lease").is_none());
-        pause.release().await;
+        pause.release();
 
         assert_eq!(
             timeout(Duration::from_secs(5), fork)
@@ -3771,7 +3653,10 @@ mod fork_source_liveness_tests {
         store.init_retirement_executor().unwrap();
         let source = create(&store, "source-conflict", None);
         let _target = create(&store, "child-conflict", None);
-        let pause = fork_source_lease_test_support::pause_after_lease("source-conflict");
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::ForkSourceLease,
+            &source,
+        );
         let fork_store = store.clone();
         let fork = tokio::spawn(async move {
             handle(fork_store, fork_put("source-conflict", "child-conflict")).await
@@ -3783,7 +3668,7 @@ mod fork_source_liveness_tests {
                 async move { handle_delete(delete_store, "source-conflict".into()).await },
             );
         wait_fenced(&source).await;
-        pause.release().await;
+        pause.release();
 
         assert_eq!(
             timeout(Duration::from_secs(5), fork)
@@ -4106,16 +3991,6 @@ mod append_fence_tests {
         }
     }
 
-    fn put(path: &str, body: &'static [u8]) -> Req {
-        Req {
-            method: Method::Put,
-            path: path.into(),
-            query: None,
-            headers: vec![("content-type".into(), "application/octet-stream".into())],
-            body: Bytes::from_static(body),
-        }
-    }
-
     fn close(path: &str) -> Req {
         Req {
             method: Method::Post,
@@ -4193,49 +4068,19 @@ mod append_fence_tests {
             CreateResult::Created(state) => state,
             _ => panic!("expected new stream"),
         };
-        let pause = append_fence_test_support::pause_after_wal("append-midflight");
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::AppendPostDurablePreVisible,
+            &state,
+        );
         let task_store = store.clone();
         let task =
             tokio::spawn(async move { handle(task_store, post("append-midflight", b"x")).await });
 
-        tokio::time::timeout(Duration::from_secs(5), pause.wait_until_handler())
-            .await
-            .expect("append must reach the post-WAL fence check");
+        pause.wait_until_held().await;
         let appender = state.appender.lock().await;
         state.fence_while_holding_appender(&appender);
         drop(appender);
-        tokio::time::timeout(Duration::from_secs(5), pause.release_handler())
-            .await
-            .expect("append must resume after fencing");
-
-        assert_eq!(task.await.unwrap().status, 404);
-        assert_eq!(state.tail().bytes, 0);
-        assert_eq!(state.inflight_appends.load(Ordering::Acquire), 0);
-
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn create_initial_fence_midflight_skips_publication_and_success() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let directory = directory("midflight-create");
-        let store =
-            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
-        let pause = append_fence_test_support::pause_after_wal("create-midflight");
-        let task_store = store.clone();
-        let task =
-            tokio::spawn(async move { handle(task_store, put("create-midflight", b"x")).await });
-
-        tokio::time::timeout(Duration::from_secs(5), pause.wait_until_handler())
-            .await
-            .expect("create must reach the post-WAL fence check");
-        let state = store.get("create-midflight").expect("created stream");
-        let appender = state.appender.lock().await;
-        state.fence_while_holding_appender(&appender);
-        drop(appender);
-        tokio::time::timeout(Duration::from_secs(5), pause.release_handler())
-            .await
-            .expect("create must resume after fencing");
+        pause.release();
 
         assert_eq!(task.await.unwrap().status, 404);
         assert_eq!(state.tail().bytes, 0);

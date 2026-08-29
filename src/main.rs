@@ -16,6 +16,8 @@ mod store;
 mod store_manifest;
 mod subscriptions;
 mod telemetry;
+#[cfg(test)]
+mod test_cut_points;
 mod tier;
 mod wal;
 
