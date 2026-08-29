@@ -24,6 +24,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::shard::{CommitterHandle, Shard};
+use crate::store::StreamState;
 
 /// The persisted-`N` file under the data dir: `<data-dir>/wal/shards`.
 const SHARDS_FILE: &str = "shards";
@@ -159,6 +160,16 @@ impl WalSet {
         &self.shards
     }
 
+    /// Remove checkpoint/tail bookkeeping for a truly hard-retired stream from
+    /// exactly the shard selected by the persisted stream-id routing function.
+    /// Store owns the retirement policy and must not call this for soft-deleted
+    /// fork parents.
+    pub async fn forget_stream(&self, st: &Arc<StreamState>) -> io::Result<()> {
+        Arc::clone(self.shard_for(st.id))
+            .forget_stream(Arc::clone(st))
+            .await
+    }
+
     /// Reset every shard's on-disk WAL to a fresh, empty state — called **once**,
     /// after `wal::recovery::recover` has replayed every durable record into the
     /// per-stream files and BEFORE `spawn_committers`/any append. See
@@ -266,5 +277,70 @@ mod tests {
             WalSet::open(&d, Some(8), 8).is_err(),
             "mismatched --wal-shards rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn forget_stream_routes_to_exactly_its_persisted_shard() {
+        let d = tmp("forget-route");
+        let w = WalSet::open(&d, Some(4), 4).unwrap();
+        let store =
+            crate::store::Store::new_with_tier(d.clone(), crate::tier::TierConfig::default())
+                .unwrap();
+        let stream = match store
+            .create(
+                "forget-route",
+                crate::store::StreamConfig {
+                    content_type: "application/octet-stream".into(),
+                    ttl_seconds: None,
+                    expires_at: None,
+                    expires_at_raw: None,
+                    create_closed: false,
+                    forked_from: None,
+                    fork_offset_raw: None,
+                    fork_sub_offset: None,
+                },
+                None,
+                0,
+            )
+            .unwrap()
+        {
+            crate::store::CreateResult::Created(stream) => stream,
+            _ => panic!("create failed"),
+        };
+        let stream_id = stream.id;
+        let target = w
+            .shards
+            .iter()
+            .position(|s| Arc::ptr_eq(s, w.shard_for(stream_id)))
+            .unwrap();
+        let other = (target + 1) % w.shards.len();
+
+        std::fs::write(
+            w.shards[target].dir().join("tails"),
+            format!("{stream_id} 10\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            w.shards[other].dir().join("tails"),
+            format!("{stream_id} 20\n"),
+        )
+        .unwrap();
+
+        w.forget_stream(&stream).await.unwrap();
+        w.shards[target].checkpoint().await.unwrap();
+        w.shards[other].checkpoint().await.unwrap();
+
+        assert!(
+            !w.shards[target]
+                .read_durable_tails()
+                .contains_key(&stream_id),
+            "routed shard pruned the retired stream"
+        );
+        assert_eq!(
+            w.shards[other].read_durable_tails().get(&stream_id),
+            Some(&20),
+            "forget did not touch any other shard"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

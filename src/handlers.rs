@@ -77,9 +77,84 @@ pub fn durability() -> DurabilityMode {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{set_durability, DurabilityMode};
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use tokio::sync::Notify;
 
     static MODE_LOCK: Mutex<()> = Mutex::new(());
+    static APPEND_HOOK: Mutex<Option<Arc<AppendHook>>> = Mutex::new(None);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum AppendHookPoint {
+        AfterAdmission,
+        BeforeTailPublication,
+        BeforeClosePublication,
+        AfterPublication,
+    }
+
+    struct AppendHook {
+        point: AppendHookPoint,
+        reached: Notify,
+        release: Notify,
+    }
+
+    pub(crate) struct AppendHookGuard {
+        hook: Arc<AppendHook>,
+    }
+
+    impl AppendHookGuard {
+        pub(crate) async fn reached(&self) {
+            self.hook.reached.notified().await;
+        }
+
+        pub(crate) fn release(&self) {
+            self.hook.release.notify_one();
+        }
+    }
+
+    impl Drop for AppendHookGuard {
+        fn drop(&mut self) {
+            let mut installed = APPEND_HOOK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if installed
+                .as_ref()
+                .is_some_and(|hook| Arc::ptr_eq(hook, &self.hook))
+            {
+                installed.take();
+                self.hook.release.notify_waiters();
+            }
+        }
+    }
+
+    pub(crate) fn install_append_hook(point: AppendHookPoint) -> AppendHookGuard {
+        let hook = Arc::new(AppendHook {
+            point,
+            reached: Notify::new(),
+            release: Notify::new(),
+        });
+        let mut installed = APPEND_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            installed.is_none(),
+            "an append test hook is already installed"
+        );
+        *installed = Some(Arc::clone(&hook));
+        AppendHookGuard { hook }
+    }
+
+    pub(crate) async fn pause_append(point: AppendHookPoint) {
+        let hook = APPEND_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|hook| hook.point == point)
+            .cloned();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.release.notified().await;
+        }
+    }
 
     pub(crate) struct DurabilityGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
 
@@ -306,6 +381,7 @@ async fn dispatch(
             ("/_admin/inventory", Method::Get, Some(_)) => {
                 inventory_response(&store, req.query.as_deref())
             }
+            ("/_admin/expiry", Method::Get, Some(_)) => expiry_status_response(),
             (_, Method::Get, _) => text_response(404, "admin endpoint not found"),
             _ => text_response(405, "admin endpoints are read-only"),
         }
@@ -316,7 +392,7 @@ async fn dispatch(
             Method::Put => handle_create(store, req, path).await,
             Method::Post => handle_append(store, req, path).await,
             Method::Get => handle_read(store, req, path).await,
-            Method::Head => handle_head(store, path),
+            Method::Head => handle_head(store, path).await,
             Method::Delete => handle_delete(store, path).await,
             Method::Options => unreachable!("OPTIONS handled before route dispatch"),
             Method::Other => text_response(405, "method not allowed"),
@@ -437,6 +513,21 @@ fn inventory_response(store: &Store, query: Option<&str>) -> Resp {
     response
 }
 
+fn expiry_status_response() -> Resp {
+    let Some(status) = crate::expiry_reaper::status() else {
+        return text_response(404, "expiry coordinator not running");
+    };
+    match serde_json::to_vec(&status) {
+        Ok(body) => ResponseBuilder::new(200)
+            .hs("content-type", "application/json")
+            .body(full(body)),
+        Err(error) => {
+            tracing::error!(%error, "expiry status serialization failed");
+            text_response(500, "expiry status unavailable")
+        }
+    }
+}
+
 fn encode_inventory_cursor(generation: u64, path: &str) -> String {
     format!(
         "{generation}.{}",
@@ -548,6 +639,116 @@ fn parse_rfc3339(s: &str) -> Result<SystemTime, ()> {
     Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64))
 }
 
+#[cfg(test)]
+async fn retire_without_process_coordinator(
+    store: &Arc<Store>,
+    candidate: &ExpiryCandidate,
+    durability: RetirementDurability,
+) -> std::io::Result<crate::expiry_reaper::CoordinatedOutcome> {
+    use crate::expiry_reaper::CoordinatedOutcome;
+    let prepared = match durability {
+        RetirementDurability::Expiry => {
+            store
+                .prepare_expiry_retirement(candidate, SystemTime::now())
+                .await
+        }
+        RetirementDurability::Explicit => store.prepare_delete(&candidate.stream()).await,
+    };
+    match prepared {
+        PrepareRetirement::Renewed => return Ok(CoordinatedOutcome::Renewed),
+        PrepareRetirement::Stale => return Ok(CoordinatedOutcome::Stale),
+        PrepareRetirement::Gone => return Ok(CoordinatedOutcome::Gone),
+        PrepareRetirement::Ready => {}
+    }
+    let stream = candidate.stream();
+    #[cfg(target_os = "linux")]
+    crate::sse_reactor::wake_stream(&stream);
+    store
+        .subscriptions
+        .clone()
+        .on_stream_deleted(store.clone(), &stream.path, candidate.stream_id())
+        .await?;
+    // `finish_retirement` deliberately returns only one physical step so the
+    // production coordinator can pace a newly eligible fork parent without
+    // taking another bounded admission. Direct unit tests do not start that
+    // process coordinator, so preserve the same continuation semantics here.
+    // The parent's subscription transition already ran when it was originally
+    // soft-deleted; only the root candidate needs the transition above.
+    let mut current = candidate.clone();
+    loop {
+        let step = store.finish_retirement(&current, durability).await?;
+        match step.cascade {
+            Some(parent) => current = parent,
+            None => return Ok(CoordinatedOutcome::Retired(step.outcome)),
+        }
+    }
+}
+
+pub(crate) async fn enqueue_expired_before_not_found(
+    _store: &Arc<Store>,
+    candidate: &ExpiryCandidate,
+    now: SystemTime,
+) {
+    // StreamLookup::Expired also covers a non-expired stream already fenced by
+    // explicit DELETE. Never downgrade that retirement to Expiry durability.
+    if !candidate.stream().is_expired_at(now) {
+        return;
+    }
+    #[cfg(test)]
+    if crate::expiry_reaper::status().is_none() {
+        if let Err(error) =
+            retire_without_process_coordinator(_store, candidate, RetirementDurability::Expiry)
+                .await
+        {
+            tracing::error!(%error, stream_id = candidate.stream_id(), "test lazy expiry retirement failed");
+        }
+        return;
+    }
+    match crate::expiry_reaper::enqueue_expired(candidate.clone()) {
+        Ok(()) | Err(crate::expiry_reaper::EnqueueError::AlreadyQueued) => {}
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                stream_id = candidate.stream_id(),
+                "lazy expiry queue unavailable; a scan or later request will retry"
+            );
+        }
+    }
+}
+
+async fn coordinated_retire_and_wait(
+    _store: &Arc<Store>,
+    candidate: &ExpiryCandidate,
+    durability: RetirementDurability,
+) -> std::io::Result<crate::expiry_reaper::CoordinatedOutcome> {
+    #[cfg(test)]
+    if crate::expiry_reaper::status().is_none() {
+        return retire_without_process_coordinator(_store, candidate, durability).await;
+    }
+    crate::expiry_reaper::retire_and_wait(candidate.clone(), durability).await
+}
+
+/// Expired PUT may race a lazy GET/scanner that already admitted this exact
+/// incarnation. Join that bounded retirement instead of converting the
+/// coordinator's `AlreadyQueued` marker into a transient 503.
+async fn coordinated_retire_or_join_and_wait(
+    _store: &Arc<Store>,
+    candidate: &ExpiryCandidate,
+    durability: RetirementDurability,
+) -> std::io::Result<crate::expiry_reaper::CoordinatedOutcome> {
+    #[cfg(test)]
+    if crate::expiry_reaper::status().is_none() {
+        return retire_without_process_coordinator(_store, candidate, durability).await;
+    }
+    crate::expiry_reaper::retire_or_join_and_wait(candidate.clone(), durability).await
+}
+
+fn retirement_busy() -> Resp {
+    ResponseBuilder::new(503)
+        .hs("retry-after", "1")
+        .body(full("stream retirement in progress"))
+}
+
 async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
     // Read Content-Type ONCE: `content_type_hdr` carries presence (used for fork
     // inheritance / match below); `content_type` is the resolved value with the
@@ -610,13 +811,16 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
     let mut expires_at = expires_at;
     let mut exp_raw = exp_raw;
     if let Some(src_path) = &forked_from {
-        let src = match store.get(src_path) {
-            Some(s) => s,
-            None => return text_response(404, "fork source not found"),
+        let lookup_now = SystemTime::now();
+        let src = match store.lookup_at(src_path, lookup_now, false) {
+            StreamLookup::Live(stream) => stream,
+            StreamLookup::Gone(_) => return text_response(409, "fork source is deleted"),
+            StreamLookup::Missing => return text_response(404, "fork source not found"),
+            StreamLookup::Expired(candidate) => {
+                enqueue_expired_before_not_found(&store, &candidate, lookup_now).await;
+                return text_response(404, "fork source not found");
+            }
         };
-        if src.shared.read().unwrap().soft_deleted {
-            return text_response(409, "fork source is deleted");
-        }
         match &content_type_hdr {
             None => content_type = src.config.content_type.clone(),
             Some(ct) => {
@@ -720,18 +924,86 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
     // fsync concurrently and the async workers stay free to dispatch.
     let result = {
         let store = store.clone();
-        match tokio::task::spawn_blocking(move || store.create(&path, config, parent, base_offset))
-            .await
+        let create_path = path.clone();
+        let create_config = config.clone();
+        let create_parent = parent.clone();
+        match tokio::task::spawn_blocking(move || {
+            store.create(&create_path, create_config, create_parent, base_offset)
+        })
+        .await
         {
             Ok(Ok(r)) => r,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return retirement_busy()
+            }
             Ok(Err(e)) => return text_response(500, &e.to_string()),
             Err(_) => return text_response(500, "create task failed"),
         }
     };
+    let result = match result {
+        CreateResult::Expired(candidate) => {
+            // CreateResult::Expired also represents a non-expired incarnation
+            // already fenced by an explicit DELETE. Only a genuinely expired
+            // stream may enter the Expiry-durability path; otherwise preserve
+            // the outstanding explicit retirement and ask the client to retry.
+            if !candidate.stream().is_expired_at(SystemTime::now()) {
+                return retirement_busy();
+            }
+            match coordinated_retire_or_join_and_wait(
+                &store,
+                &candidate,
+                RetirementDurability::Expiry,
+            )
+            .await
+            {
+                Ok(crate::expiry_reaper::CoordinatedOutcome::Retired(_)) => {}
+                Ok(crate::expiry_reaper::CoordinatedOutcome::Gone) => {
+                    return text_response(409, "stream exists with different configuration")
+                }
+                Ok(
+                    crate::expiry_reaper::CoordinatedOutcome::Renewed
+                    | crate::expiry_reaper::CoordinatedOutcome::Stale,
+                ) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return retirement_busy()
+                }
+                Err(error) => {
+                    tracing::error!(%error, stream_id = candidate.stream_id(), "expired PUT retirement failed");
+                    return text_response(500, "expired stream retirement failed");
+                }
+            }
+
+            // Retry exactly once after retirement/revalidation. A second expiry
+            // result means another incarnation won the path race; ask the client
+            // to retry instead of performing path-unsafe cleanup by name.
+            let store2 = store.clone();
+            match tokio::task::spawn_blocking(move || {
+                store2.create(&path, config, parent, base_offset)
+            })
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return retirement_busy()
+                }
+                Ok(Err(error)) => return text_response(500, &error.to_string()),
+                Err(_) => return text_response(500, "create task failed"),
+            }
+        }
+        result => result,
+    };
     match result {
+        CreateResult::Expired(_) => ResponseBuilder::new(503)
+            .hs("retry-after", "1")
+            .body(full("stream retirement in progress")),
+        CreateResult::SourceUnavailable => text_response(409, "fork source is unavailable"),
         CreateResult::Conflict => text_response(409, "stream exists with different configuration"),
         CreateResult::Exists(st) => {
-            st.touch();
+            // Store::evaluate_existing_create performed the compatible PUT's
+            // TTL refresh atomically with its live/fence/configuration check.
+            if st.config.ttl_seconds.is_some() {
+                store.mark_meta_dirty(&st);
+            }
             let t = st.tail();
             let mut b = ResponseBuilder::new(200)
                 .h("content-type", st.config.content_type.clone())
@@ -743,14 +1015,32 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
         }
         CreateResult::Created(st) => {
             let notify_subscription = wire.is_some();
+            let mut append_guard = None;
             if let Some(wire) = wire {
                 let lock_t0 = crate::telemetry::Timer::start();
                 let mut ap = st.appender.lock().await;
                 crate::telemetry::record_append_lock_wait(lock_t0.elapsed_secs());
+                let append_now = SystemTime::now();
+                let guard = match st.begin_append_at(append_now) {
+                    Ok(guard) => guard,
+                    Err(StreamAccessError::Gone) => return gone(),
+                    Err(StreamAccessError::Expired) => {
+                        drop(ap);
+                        let candidate = store.candidate_for(&st);
+                        enqueue_expired_before_not_found(&store, &candidate, append_now).await;
+                        return text_response(404, "stream not found");
+                    }
+                };
+                #[cfg(test)]
+                test_support::pause_append(test_support::AppendHookPoint::AfterAdmission).await;
                 let pre_written = ap.written;
                 let new_tail = match write_wire(&st, &mut ap, &wire) {
                     Ok(t) => t,
-                    Err(_) => return text_response(500, "write failed"),
+                    Err(WireWriteError::Access(StreamAccessError::Gone)) => return gone(),
+                    Err(WireWriteError::Access(StreamAccessError::Expired)) => {
+                        return text_response(404, "stream not found")
+                    }
+                    Err(WireWriteError::Io) => return text_response(500, "write failed"),
                 };
                 let target = ap.written;
                 // Read `file_base` under the appender lock so a concurrent
@@ -780,8 +1070,23 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                 if let Some(lsn) = staged_lsn {
                     wait_durable_lsn(&store, &st, lsn).await;
                 }
+                if !guard.may_publish() {
+                    return text_response(404, "stream not found");
+                }
+                #[cfg(test)]
+                test_support::pause_append(test_support::AppendHookPoint::BeforeTailPublication)
+                    .await;
                 // Durable now (wal) / page-cache written (memory): expose to readers.
-                publish_durable_tail(&store, &st, new_tail, &wire);
+                match publish_durable_tail(&store, &st, new_tail, &wire) {
+                    Ok(()) => {}
+                    Err(StreamAccessError::Gone) => return gone(),
+                    Err(StreamAccessError::Expired) => {
+                        return text_response(404, "stream not found")
+                    }
+                }
+                #[cfg(test)]
+                test_support::pause_append(test_support::AppendHookPoint::AfterPublication).await;
+                append_guard = Some(guard);
             }
             if notify_subscription {
                 store
@@ -805,7 +1110,13 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             if t.closed {
                 b = b.hs(H_CLOSED, "true");
             }
-            b.body(empty())
+            let response = b.body(empty());
+            // Keep the admission guard alive through subscription notification
+            // and the final 2xx decision. Once the atomic publication won the
+            // stream's shared lock, a later fence must not downgrade that
+            // already-visible write to 404.
+            drop(append_guard);
+            response
         }
     }
 }
@@ -931,9 +1242,15 @@ async fn wait_durable_lsn(store: &Arc<Store>, st: &Arc<StreamState>, lsn: u64) {
 /// ordering — PROTOCOL.md §4.1). Adds no fsync: the per-stream file stays
 /// async/WAL-recoverable; the only durability barrier is the WAL `fdatasync`
 /// awaited in `wait_durable_lsn`.
-fn write_wire(st: &StreamState, ap: &mut Appender, wire: &Bytes) -> std::io::Result<u64> {
+enum WireWriteError {
+    Io,
+    Access(StreamAccessError),
+}
+
+fn write_wire(st: &StreamState, ap: &mut Appender, wire: &Bytes) -> Result<u64, WireWriteError> {
     use std::io::Write;
-    if let Err(e) = (&*ap.file).write_all(wire) {
+    let pre_written = ap.written;
+    if (&*ap.file).write_all(wire).is_err() {
         // A partial write (ENOSPC mid-slice) leaves garbage bytes in the file
         // PAST `ap.written` while the logical offsets don't advance — every
         // later append would land after the garbage (O_APPEND) with a logical
@@ -941,15 +1258,21 @@ fn write_wire(st: &StreamState, ap: &mut Appender, wire: &Bytes) -> std::io::Res
         // offset desync for all subsequent data. Truncate back to the exact
         // pre-write length so physical == logical again.
         let _ = ap.file.set_len(ap.written);
-        return Err(e);
+        return Err(WireWriteError::Io);
     }
     ap.written += wire.len() as u64;
-    let tail = {
-        let mut s = st.shared.write().unwrap();
+    let tail = match st.with_live_shared_mut(|s| {
         let tail = s.file_base + ap.written;
         s.tail = tail;
         s.last_access = SystemTime::now();
         tail
+    }) {
+        Ok(tail) => tail,
+        Err(error) => {
+            let _ = ap.file.set_len(pre_written);
+            ap.written = pre_written;
+            return Err(WireWriteError::Access(error));
+        }
     };
     Ok(tail)
 }
@@ -963,27 +1286,23 @@ fn write_wire(st: &StreamState, ap: &mut Appender, wire: &Bytes) -> std::io::Res
 /// concurrent appenders (whose group-commit fsyncs may resolve out of order)
 /// safe: a later appender publishing the higher frontier first is fine (all
 /// lower bytes are durable too), and the earlier appender then no-ops.
-fn publish_durable_tail(store: &Store, st: &StreamState, tail: u64, wire: &Bytes) {
-    let closed;
-    {
-        let mut s = st.shared.write().unwrap();
-        if tail <= s.durable_tail {
-            // A concurrent appender already published an equal/greater durable
-            // frontier — nothing to expose, and re-firing would regress the watch.
-            return;
-        }
-        s.durable_tail = tail;
-        closed = s.closed_durable;
-    }
+fn publish_durable_tail(
+    store: &Store,
+    st: &StreamState,
+    tail: u64,
+    wire: &Bytes,
+) -> Result<(), StreamAccessError> {
+    let Some(published) = st.publish_durable_tail_if_live(tail)? else {
+        // A concurrent appender already published an equal/greater durable
+        // frontier — nothing to expose, and re-firing would regress the watch.
+        return Ok(());
+    };
     // Publish the resident chunk BEFORE waking subscribers, so a long-poll/SSE
     // reader woken by the tail update reliably hits the cache (one shared copy)
     // instead of racing ahead and falling back to a file read. The chunk spans
     // [tail - wire.len(), tail).
     st.set_last_chunk(tail - wire.len() as u64, wire.clone());
-    st.tail_tx.send_replace(Tail {
-        bytes: tail,
-        closed,
-    });
+    st.tail_tx.send_replace(published);
     // Inventory observes the already-published durable tail. This deliberately
     // adds no fsync to the append hot path; a generation-bound page detects
     // concurrent change and backup quiescence supplies a stable window.
@@ -991,6 +1310,7 @@ fn publish_durable_tail(store: &Store, st: &StreamState, tail: u64, wire: &Bytes
     // Wake any reactor-served subscribers of this stream (no-op when none).
     #[cfg(target_os = "linux")]
     crate::sse_reactor::wake_stream(st);
+    Ok(())
 }
 
 // ---------- POST (append) ----------
@@ -1118,9 +1438,15 @@ async fn handle_append_inner(
     // Load-telemetry probe: bumps the in-flight gauge and records service time on
     // drop (covers every return path). No-op unless `--server-stats` is on.
     let _probe = crate::srvstats::AppendProbe::start();
-    let st = match store.get(&path) {
-        Some(s) => s,
-        None => return (text_response(404, "stream not found"), Conflict, false),
+    let lookup_now = SystemTime::now();
+    let st = match store.lookup_at(&path, lookup_now, false) {
+        StreamLookup::Live(stream) => stream,
+        StreamLookup::Gone(_) => return (gone(), Conflict, false),
+        StreamLookup::Missing => return (text_response(404, "stream not found"), Conflict, false),
+        StreamLookup::Expired(candidate) => {
+            enqueue_expired_before_not_found(&store, &candidate, lookup_now).await;
+            return (text_response(404, "stream not found"), Conflict, false);
+        }
     };
     let is_json = st.is_json;
     macro_rules! ret {
@@ -1176,6 +1502,19 @@ async fn handle_append_inner(
     let mut ap = st.appender.lock().await;
     crate::telemetry::record_append_lock_wait(lock_t0.elapsed_secs());
     crate::srvstats::record_applock_wait(srv_lock_t0.elapsed());
+    let append_now = SystemTime::now();
+    let append_guard = match st.begin_append_at(append_now) {
+        Ok(guard) => guard,
+        Err(StreamAccessError::Gone) => ret!(gone(), Conflict),
+        Err(StreamAccessError::Expired) => {
+            drop(ap);
+            let candidate = store.candidate_for(&st);
+            enqueue_expired_before_not_found(&store, &candidate, append_now).await;
+            ret!(text_response(404, "stream not found"), Conflict)
+        }
+    };
+    #[cfg(test)]
+    test_support::pause_append(test_support::AppendHookPoint::AfterAdmission).await;
 
     // Closed checks (precedence: closed → seq regression → gap).
     {
@@ -1306,19 +1645,27 @@ async fn handle_append_inner(
     // append must leave NO trace — neither bytes (resurrected by the next
     // append/checkpoint) nor producer/seq dedup state (which would swallow the
     // client's retry as a duplicate: silent loss from the client's view).
-    let (prev_producer, prev_seq_header) = {
+    let (prev_tail, prev_last_access, prev_producer, prev_seq_header, prev_closed, prev_closed_by) = {
         let sh = st.shared.read().unwrap();
         (
+            sh.tail,
+            sh.last_access,
             producer
                 .as_ref()
                 .map(|p| (p.id.clone(), sh.producers.get(&p.id).cloned())),
             sh.last_seq_header.clone(),
+            sh.closed,
+            sh.closed_by.clone(),
         )
     };
     if !wire.is_empty() {
         match write_wire(&st, &mut ap, &wire) {
             Ok(t) => new_tail = Some(t),
-            Err(_) => ret!(text_response(500, "write failed"), Conflict),
+            Err(WireWriteError::Access(StreamAccessError::Gone)) => ret!(gone(), Conflict),
+            Err(WireWriteError::Access(StreamAccessError::Expired)) => {
+                ret!(text_response(404, "stream not found"), Conflict)
+            }
+            Err(WireWriteError::Io) => ret!(text_response(500, "write failed"), Conflict),
         }
     }
     // Does this append change state the memory-mode sidecar must persist? Captured
@@ -1331,8 +1678,7 @@ async fn handle_append_inner(
     // plain non-TTL append needs no sidecar flush at all (cardinality-cliff #1).
     let meta_persist_needed =
         producer.is_some() || seq_header.is_some() || st.config.ttl_seconds.is_some();
-    {
-        let mut s = st.shared.write().unwrap();
+    let state_update = st.with_live_shared_mut(|s| {
         // A body append refreshes last_access in write_wire. A close-only POST
         // has no wire bytes, but it is still a successful write operation and
         // therefore MUST slide a Stream-TTL window as well.
@@ -1348,8 +1694,8 @@ async fn handle_append_inner(
                 },
             );
         }
-        if let Some(seq) = seq_header {
-            s.last_seq_header = Some(seq);
+        if let Some(seq) = &seq_header {
+            s.last_seq_header = Some(seq.clone());
         }
         if close_req {
             // Set the closed flag in memory so the durable meta capture below
@@ -1362,6 +1708,21 @@ async fn handle_append_inner(
             s.closed = true;
             if let Some(p) = &producer {
                 s.closed_by = Some((p.id.clone(), p.epoch, p.seq));
+            }
+        }
+    });
+    if let Err(error) = state_update {
+        let _ = ap.file.set_len(pre_written);
+        ap.written = pre_written;
+        {
+            let mut shared = st.shared.write().unwrap();
+            shared.tail = prev_tail;
+            shared.last_access = prev_last_access;
+        }
+        match error {
+            StreamAccessError::Gone => ret!(gone(), Conflict),
+            StreamAccessError::Expired => {
+                ret!(text_response(404, "stream not found"), Conflict)
             }
         }
     }
@@ -1389,7 +1750,8 @@ async fn handle_append_inner(
                 ap.written = pre_written;
                 {
                     let mut sh = st.shared.write().unwrap();
-                    sh.tail = sh.file_base + pre_written;
+                    sh.tail = prev_tail;
+                    sh.last_access = prev_last_access;
                     if let Some((id, prev)) = &prev_producer {
                         match prev {
                             Some(ps) => {
@@ -1401,10 +1763,8 @@ async fn handle_append_inner(
                         }
                     }
                     sh.last_seq_header = prev_seq_header.clone();
-                    if close_req {
-                        sh.closed = false;
-                        sh.closed_by = None;
-                    }
+                    sh.closed = prev_closed;
+                    sh.closed_by = prev_closed_by.clone();
                 }
                 ret!(text_response(500, "wal stage failed"), Conflict)
             }
@@ -1420,11 +1780,31 @@ async fn handle_append_inner(
         wait_durable_lsn(&store, &st, lsn).await;
         crate::srvstats::record_durwait(dur_t0.elapsed());
     }
+    if !append_guard.may_publish() {
+        ret!(text_response(404, "stream not found"), Conflict);
+    }
+    #[cfg(test)]
+    test_support::pause_append(test_support::AppendHookPoint::BeforeTailPublication).await;
 
-    // Durable now (wal) / page-cache written (memory): expose the new bytes to
-    // readers, mirroring the close-visibility ordering below.
-    if let Some(t) = new_tail {
-        publish_durable_tail(&store, &st, t, &wire);
+    // A successful atomic reader-visible publication is the request's
+    // linearization point. Retirement may fence immediately afterwards, but it
+    // cannot turn already-visible durable bytes into a 404 response.
+    let mut publication_committed = false;
+
+    // For an open append, expose durable bytes now. A body+close append waits
+    // until the close metadata is durable and publishes bytes + EOF together
+    // below, leaving no window where bytes are visible but the same request can
+    // still lose the close race and return 404.
+    if !close_req {
+        if let Some(t) = new_tail {
+            match publish_durable_tail(&store, &st, t, &wire) {
+                Ok(()) => publication_committed = true,
+                Err(StreamAccessError::Gone) => ret!(gone(), Conflict),
+                Err(StreamAccessError::Expired) => {
+                    ret!(text_response(404, "stream not found"), Conflict)
+                }
+            }
+        }
     }
 
     // Closure ordering: WAL fsync → durable meta commit → expose the closure to
@@ -1437,19 +1817,38 @@ async fn handle_append_inner(
         if !matches!(meta_res, Ok(Ok(()))) {
             ret!(text_response(500, "close not durable"), Conflict);
         }
-        let tail = {
-            let mut s = st.shared.write().unwrap();
-            s.closed_durable = true;
-            s.durable_tail
+        #[cfg(test)]
+        test_support::pause_append(test_support::AppendHookPoint::BeforeClosePublication).await;
+        let (tail, advanced) = match new_tail {
+            Some(tail) => match st.publish_durable_tail_and_close_if_live(tail) {
+                Ok(published) => published,
+                Err(StreamAccessError::Gone) => ret!(gone(), Conflict),
+                Err(StreamAccessError::Expired) => {
+                    ret!(text_response(404, "stream not found"), Conflict)
+                }
+            },
+            None => match st.publish_durable_close_if_live() {
+                Ok(tail) => (tail, false),
+                Err(StreamAccessError::Gone) => ret!(gone(), Conflict),
+                Err(StreamAccessError::Expired) => {
+                    ret!(text_response(404, "stream not found"), Conflict)
+                }
+            },
         };
-        st.tail_tx.send_replace(Tail {
-            bytes: tail,
-            closed: true,
-        });
+        if advanced {
+            st.set_last_chunk(tail.bytes - wire.len() as u64, wire.clone());
+        }
+        st.tail_tx.send_replace(tail);
         store.publish_inventory_tail(&st);
         #[cfg(target_os = "linux")]
         crate::sse_reactor::wake_stream(&st);
-    } else if staged_lsn.is_some() {
+        publication_committed = true;
+    }
+    if publication_committed {
+        #[cfg(test)]
+        test_support::pause_append(test_support::AppendHookPoint::AfterPublication).await;
+    }
+    if !close_req && staged_lsn.is_some() {
         // WAL mode: the stream is in its shard's dirty set (register_dirty ran
         // during staging), so the ~3 s checkpoint will write the sidecar for us —
         // just mark it. This keeps the meta `File::create`+`rename` (and its
@@ -1472,7 +1871,7 @@ async fn handle_append_inner(
             st.meta_dirty
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-    } else if meta_persist_needed {
+    } else if !close_req && meta_persist_needed {
         // No WAL record staged (memory durability): no checkpoint will flush
         // the sidecar — queue it for the store-level periodic sweeper. Same
         // batched treatment the wal branch above gets from the checkpoint: no
@@ -1499,6 +1898,10 @@ async fn handle_append_inner(
             .await;
     }
 
+    if !publication_committed && !append_guard.may_publish() {
+        ret!(text_response(404, "stream not found"), Conflict);
+    }
+
     let tail = st.tail();
     let status = if producer.is_some() && !body.is_empty() {
         200
@@ -1514,7 +1917,11 @@ async fn handle_append_inner(
     if tail.closed {
         b = b.hs(H_CLOSED, "true");
     }
-    (b.body(empty()), Accept, is_json)
+    let response = b.body(empty());
+    if !publication_committed && !append_guard.may_publish() {
+        ret!(text_response(404, "stream not found"), Conflict);
+    }
+    (response, Accept, is_json)
 }
 
 /// Append one pull-wake control event through the ordinary JSON append path.
@@ -1762,17 +2169,18 @@ async fn materialize_resolved(
 // ---------- GET (catch-up / long-poll / SSE) ----------
 
 async fn handle_read(store: Arc<Store>, req: Req, path: String) -> Resp {
-    let st = match store.get(&path) {
-        Some(s) => s,
-        None => return text_response(404, "stream not found"),
+    let lookup_now = SystemTime::now();
+    let st = match store.lookup_at(&path, lookup_now, true) {
+        StreamLookup::Live(stream) => stream,
+        StreamLookup::Gone(_) => return gone(),
+        StreamLookup::Missing => return text_response(404, "stream not found"),
+        StreamLookup::Expired(candidate) => {
+            enqueue_expired_before_not_found(&store, &candidate, lookup_now).await;
+            return text_response(404, "stream not found");
+        }
     };
-    if st.shared.read().unwrap().soft_deleted {
-        return gone();
-    }
-    // Only TTL is reset by a read, and touch() takes the write lock — skip it for
-    // non-TTL streams to keep their read path lock-free.
+    // lookup_at refreshes a sliding TTL atomically with the liveness decision.
     if st.config.ttl_seconds.is_some() {
-        st.touch();
         store.mark_meta_dirty(&st); // sliding TTL must survive restarts
     }
     let q = match parse_query(req.query.as_deref()) {
@@ -1918,6 +2326,7 @@ async fn handle_long_poll(
     client_cursor: Option<u64>,
     cache_hit: &mut bool,
 ) -> Resp {
+    let mut deleted = st.subscribe_deleted();
     let t0 = st.tail();
     // A beyond-tail numeric offset is treated as caught-up at the tail (see
     // `resolve_start`), so it follows the normal wait path below.
@@ -1937,6 +2346,9 @@ async fn handle_long_poll(
     let mut rx = st.tail_tx.subscribe();
     let deadline = Instant::now() + long_poll_timeout_dur();
     loop {
+        if st.is_fenced() {
+            return text_response(404, "stream not found");
+        }
         let t = *rx.borrow_and_update();
         if t.bytes > from {
             // Caught-up consumer woken by new appends: freshly-written, hot.
@@ -1955,6 +2367,7 @@ async fn handle_long_poll(
                     return long_poll_timeout(t.bytes, cursor, t.closed);
                 }
             }
+            _ = deleted.changed() => return text_response(404, "stream not found"),
             _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => {
                 // Deadline hit — but re-check the tail EXACTLY like the
                 // closed-channel arm above. Returning a timeout that advertises
@@ -2107,6 +2520,7 @@ pub(crate) fn sse_control_event(
 struct SseSource {
     st: Arc<StreamState>,
     rxw: tokio::sync::watch::Receiver<Tail>,
+    deleted: tokio::sync::watch::Receiver<bool>,
     pos: u64,
     start: u64,
     deadline: Instant,
@@ -2125,6 +2539,10 @@ impl SseSource {
             return None;
         }
         loop {
+            if self.st.is_fenced() {
+                self.done = true;
+                return None;
+            }
             let t = *self.rxw.borrow_and_update();
             if t.bytes > self.pos {
                 // Read new range and emit data + control. Caught-up subscribers
@@ -2220,6 +2638,10 @@ impl SseSource {
                         return None;
                     }
                 }
+                _ = self.deleted.changed() => {
+                    self.done = true;
+                    return None;
+                }
                 _ = tokio::time::sleep(wait) => {
                     // No new data within the keep-alive window: emit a heartbeat
                     // control (still open here — the close path returns above).
@@ -2270,6 +2692,7 @@ fn handle_sse(st: Arc<StreamState>, offset: ParsedOffset, client_cursor: Option<
 
     let src = SseSource {
         rxw: st.tail_tx.subscribe(),
+        deleted: st.subscribe_deleted(),
         st,
         pos: start,
         start,
@@ -2326,14 +2749,17 @@ async fn read_range_bytes(st: &Arc<StreamState>, start: u64, end: u64) -> std::i
 
 // ---------- HEAD ----------
 
-fn handle_head(store: Arc<Store>, path: String) -> Resp {
-    let st = match store.get(&path) {
-        Some(s) => s,
-        None => return text_response(404, "stream not found"),
+async fn handle_head(store: Arc<Store>, path: String) -> Resp {
+    let lookup_now = SystemTime::now();
+    let st = match store.lookup_at(&path, lookup_now, false) {
+        StreamLookup::Live(stream) => stream,
+        StreamLookup::Gone(_) => return gone(),
+        StreamLookup::Missing => return text_response(404, "stream not found"),
+        StreamLookup::Expired(candidate) => {
+            enqueue_expired_before_not_found(&store, &candidate, lookup_now).await;
+            return text_response(404, "stream not found");
+        }
     };
-    if st.shared.read().unwrap().soft_deleted {
-        return gone();
-    }
     // HEAD must not reset the TTL.
     let t = st.tail();
     let mut b = ResponseBuilder::new(200)
@@ -2355,29 +2781,34 @@ fn handle_head(store: Arc<Store>, path: String) -> Resp {
 // ---------- DELETE ----------
 
 async fn handle_delete(store: Arc<Store>, path: String) -> Resp {
-    let st = match store.get(&path) {
-        Some(s) => s,
-        None => return text_response(404, "stream not found"),
+    let now = SystemTime::now();
+    let candidate = match store.lookup_at(&path, now, false) {
+        StreamLookup::Missing => return text_response(404, "stream not found"),
+        StreamLookup::Gone(_) => return gone(),
+        StreamLookup::Live(stream) => store.candidate_for(&stream),
+        StreamLookup::Expired(candidate) => {
+            if candidate.stream().is_expired_at(now) {
+                enqueue_expired_before_not_found(&store, &candidate, now).await;
+                return text_response(404, "stream not found");
+            }
+            candidate
+        }
     };
-    if st.shared.read().unwrap().soft_deleted {
-        return gone();
-    }
-    // The 204 is a durability promise: once acked, a crash must never
-    // resurrect the stream. Await the on-disk removal (unlinks + parent-dir
-    // fsync, or the soft-delete meta flag) before responding — a detached
-    // removal task can be lost to a crash after the ack.
-    let store2 = Arc::clone(&store);
-    let st2 = Arc::clone(&st);
-    match tokio::task::spawn_blocking(move || store2.delete_or_soft_delete_durable(&st2)).await {
-        Ok(Ok(())) => {
-            store
-                .subscriptions
-                .clone()
-                .on_stream_deleted(store.clone(), &path)
-                .await;
+
+    match coordinated_retire_and_wait(&store, &candidate, RetirementDurability::Explicit).await {
+        Ok(crate::expiry_reaper::CoordinatedOutcome::Retired(_)) => {
             ResponseBuilder::new(204).body(empty())
         }
-        _ => text_response(500, "delete not durable"),
+        Ok(crate::expiry_reaper::CoordinatedOutcome::Gone) => gone(),
+        Ok(crate::expiry_reaper::CoordinatedOutcome::Stale) => {
+            text_response(404, "stream not found")
+        }
+        Ok(crate::expiry_reaper::CoordinatedOutcome::Renewed) => retirement_busy(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => retirement_busy(),
+        Err(error) => {
+            tracing::error!(%error, stream_id = candidate.stream_id(), "stream retirement failed");
+            text_response(500, "delete not durable")
+        }
     }
 }
 
@@ -2501,7 +2932,10 @@ mod admin_inventory_tests {
                 method: Method::Post,
                 path: "close-only".into(),
                 query: None,
-                headers: vec![("stream-closed".into(), "true".into())],
+                headers: vec![
+                    ("content-type".into(), "application/octet-stream".into()),
+                    ("stream-closed".into(), "true".into()),
+                ],
                 body: bytes::Bytes::new(),
             },
         )
@@ -2558,6 +2992,13 @@ mod admin_inventory_tests {
             409
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expiry_admin_status_is_absent_without_a_process_coordinator() {
+        if crate::expiry_reaper::status().is_none() {
+            assert_eq!(expiry_status_response().status, 404);
+        }
     }
 }
 
@@ -3019,6 +3460,1044 @@ mod memory_mode_tests {
         }
 
         crate::handlers::set_long_poll_timeout(30_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletion_wakes_a_caught_up_long_poll_as_not_found() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("lp-delete-wake");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                put_req("lp/deleted", "application/octet-stream"),
+            )
+            .await
+            .status,
+            201
+        );
+
+        let waiting = tokio::spawn(handle(
+            Arc::clone(&store),
+            Req {
+                method: Method::Get,
+                path: "lp/deleted".into(),
+                query: Some("live=long-poll&offset=0000000000000000_0000000000000000".into()),
+                headers: vec![],
+                body: Bytes::new(),
+            },
+        ));
+        // Let the read subscribe to the stream's sticky deletion signal.
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                Req {
+                    method: Method::Delete,
+                    path: "lp/deleted".into(),
+                    query: None,
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+            )
+            .await
+            .status,
+            204
+        );
+
+        let response = tokio::time::timeout(Duration::from_millis(500), waiting)
+            .await
+            .expect("deletion must wake the long poll")
+            .unwrap();
+        assert_eq!(response.status, 404);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletion_ends_an_inline_sse_without_waiting_for_a_heartbeat() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("sse-delete-wake");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                put_req("sse/deleted", "application/octet-stream"),
+            )
+            .await
+            .status,
+            201
+        );
+        let response = handle(
+            Arc::clone(&store),
+            Req {
+                method: Method::Get,
+                path: "sse/deleted".into(),
+                query: Some("live=sse&offset=0000000000000000_0000000000000000".into()),
+                headers: vec![],
+                body: Bytes::new(),
+            },
+        )
+        .await;
+        let Body::Sse(mut source) = response.body else {
+            panic!("expected inline SSE source")
+        };
+        assert!(source.next_chunk().await.is_some(), "initial control event");
+        let waiting = tokio::spawn(async move { source.next_chunk().await });
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                Req {
+                    method: Method::Delete,
+                    path: "sse/deleted".into(),
+                    query: None,
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+            )
+            .await
+            .status,
+            204
+        );
+        let next = tokio::time::timeout(Duration::from_millis(500), waiting)
+            .await
+            .expect("deletion must wake the SSE source")
+            .unwrap();
+        assert!(next.is_none(), "a deleted stream terminates its SSE feed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lazy_expiry_fence_wakes_a_caught_up_long_poll_before_paced_retirement() {
+        const CHILD: &str = "DS_TEST_EXPIRY_LONG_POLL_WAKE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "handlers::memory_mode_tests::lazy_expiry_fence_wakes_a_caught_up_long_poll_before_paced_retirement",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child lazy-expiry long-poll regression failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+                crate::handlers::set_long_poll_timeout(50);
+                let dir = tmp("lazy-expiry-long-poll-wake");
+                let store =
+                    Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+                let config = crate::expiry_reaper::Config {
+                    delete_rate: 100_000,
+                    delete_concurrency: 1,
+                    ..crate::expiry_reaper::Config::default()
+                };
+                let reaper = crate::expiry_reaper::spawn(store.clone(), config);
+                let mut put = put_req("ttl/lp-wake", "application/octet-stream");
+                put.headers.push(("stream-ttl".into(), "1".into()));
+                assert_eq!(handle(store.clone(), put).await.status, 201);
+                let stream = store.streams.get("ttl/lp-wake").unwrap().clone();
+
+                let waiting = tokio::spawn(handle(
+                    store.clone(),
+                    Req {
+                        method: Method::Get,
+                        path: "ttl/lp-wake".into(),
+                        query: Some(
+                            "live=long-poll&offset=0000000000000000_0000000000000000".into(),
+                        ),
+                        headers: vec![],
+                        body: Bytes::new(),
+                    },
+                ));
+                while stream.tail_tx.receiver_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+
+                // Prevent the paced worker from reaching prepare's deletion
+                // wake. The request-time lookup fence itself must wake the
+                // already-subscribed long poll.
+                let appender = stream.appender.lock().await;
+                stream.shared.write().unwrap().last_access =
+                    SystemTime::now() - Duration::from_secs(2);
+                assert_eq!(
+                    handle(
+                        store.clone(),
+                        Req {
+                            method: Method::Head,
+                            path: "ttl/lp-wake".into(),
+                            query: None,
+                            headers: vec![],
+                            body: Bytes::new(),
+                        },
+                    )
+                    .await
+                    .status,
+                    404
+                );
+                let response = tokio::time::timeout(Duration::from_millis(500), waiting)
+                    .await
+                    .expect("lookup fencing must wake the long poll promptly")
+                    .unwrap();
+                assert_eq!(response.status, 404);
+                assert!(stream.file_path.exists(), "paced retirement is still held");
+
+                drop(appender);
+                reaper.shutdown().await;
+                crate::handlers::set_long_poll_timeout(30_000);
+                drop(stream);
+                drop(store);
+                let _ = std::fs::remove_dir_all(&dir);
+            });
+    }
+
+    #[test]
+    fn lazy_expiry_fence_ends_inline_sse_before_an_open_heartbeat() {
+        const CHILD: &str = "DS_TEST_EXPIRY_SSE_WAKE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "handlers::memory_mode_tests::lazy_expiry_fence_ends_inline_sse_before_an_open_heartbeat",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child lazy-expiry SSE regression failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+                let dir = tmp("lazy-expiry-sse-wake");
+                let store =
+                    Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+                let config = crate::expiry_reaper::Config {
+                    delete_rate: 100_000,
+                    delete_concurrency: 1,
+                    ..crate::expiry_reaper::Config::default()
+                };
+                let reaper = crate::expiry_reaper::spawn(store.clone(), config);
+                let mut put = put_req("ttl/sse-wake", "application/octet-stream");
+                put.headers.push(("stream-ttl".into(), "1".into()));
+                assert_eq!(handle(store.clone(), put).await.status, 201);
+                let stream = store.streams.get("ttl/sse-wake").unwrap().clone();
+                let mut source = SseSource {
+                    st: stream.clone(),
+                    rxw: stream.tail_tx.subscribe(),
+                    deleted: stream.subscribe_deleted(),
+                    pos: 0,
+                    start: 0,
+                    deadline: Instant::now() + Duration::from_millis(50),
+                    client_cursor: None,
+                    encoding: sse_encoding(&stream),
+                    sent_initial: false,
+                    done: false,
+                };
+                assert!(source.next().await.is_some(), "initial control event");
+                let waiting = tokio::spawn(async move { source.next().await });
+
+                let appender = stream.appender.lock().await;
+                stream.shared.write().unwrap().last_access =
+                    SystemTime::now() - Duration::from_secs(2);
+                assert_eq!(
+                    handle(
+                        store.clone(),
+                        Req {
+                            method: Method::Head,
+                            path: "ttl/sse-wake".into(),
+                            query: None,
+                            headers: vec![],
+                            body: Bytes::new(),
+                        },
+                    )
+                    .await
+                    .status,
+                    404
+                );
+                let next = tokio::time::timeout(Duration::from_millis(500), waiting)
+                    .await
+                    .expect("lookup fencing must wake the SSE source promptly")
+                    .unwrap();
+                assert!(
+                    next.is_none(),
+                    "a fenced stream must terminate instead of emitting an open heartbeat"
+                );
+                assert!(stream.file_path.exists(), "paced retirement is still held");
+
+                drop(appender);
+                reaper.shutdown().await;
+                drop(stream);
+                drop(store);
+                let _ = std::fs::remove_dir_all(&dir);
+            });
+    }
+
+    #[tokio::test]
+    async fn fenced_hard_stream_is_404_and_persisted_soft_tombstone_is_410() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("fenced-status");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                put_req("status/hard", "application/octet-stream"),
+            )
+            .await
+            .status,
+            201
+        );
+        let hard = store.streams.get("status/hard").unwrap().clone();
+        assert_eq!(store.prepare_delete(&hard).await, PrepareRetirement::Ready);
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                post_req("status/hard", "application/octet-stream", b"x"),
+            )
+            .await
+            .status,
+            404
+        );
+
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                put_req("status/parent", "application/octet-stream"),
+            )
+            .await
+            .status,
+            201
+        );
+        let parent = store.streams.get("status/parent").unwrap().clone();
+        let child_config = StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: Some("status/parent".into()),
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        };
+        assert!(matches!(
+            store
+                .create("status/child", child_config, Some(parent), 0)
+                .unwrap(),
+            CreateResult::Created(_)
+        ));
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                Req {
+                    method: Method::Delete,
+                    path: "status/parent".into(),
+                    query: None,
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+            )
+            .await
+            .status,
+            204
+        );
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                post_req("status/parent", "application/octet-stream", b"x"),
+            )
+            .await
+            .status,
+            410
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn head_does_not_touch_ttl_but_get_touches_it_atomically() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("ttl-read-admission");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let mut put = put_req("ttl/read", "application/octet-stream");
+        put.headers.push(("stream-ttl".into(), "60".into()));
+        assert_eq!(handle(Arc::clone(&store), put).await.status, 201);
+
+        let stream = store.streams.get("ttl/read").unwrap().clone();
+        let before = SystemTime::now() - Duration::from_millis(500);
+        stream.shared.write().unwrap().last_access = before;
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                Req {
+                    method: Method::Head,
+                    path: "ttl/read".into(),
+                    query: None,
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+            )
+            .await
+            .status,
+            200
+        );
+        assert_eq!(stream.shared.read().unwrap().last_access, before);
+
+        assert_eq!(
+            handle(
+                Arc::clone(&store),
+                Req {
+                    method: Method::Get,
+                    path: "ttl/read".into(),
+                    query: Some("offset=0000000000000000_0000000000000000".into()),
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+            )
+            .await
+            .status,
+            200
+        );
+        assert!(stream.shared.read().unwrap().last_access > before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn expired_put_retires_the_old_incarnation_before_recreating_once() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("expired-put-retry");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let expiring_put = || {
+            let mut put = put_req("ttl/recreate", "application/octet-stream");
+            put.headers.push(("stream-ttl".into(), "1".into()));
+            put
+        };
+        assert_eq!(handle(Arc::clone(&store), expiring_put()).await.status, 201);
+        let old = store.streams.get("ttl/recreate").unwrap().clone();
+        old.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(2);
+
+        assert_eq!(handle(Arc::clone(&store), expiring_put()).await.status, 201);
+        let replacement = store.streams.get("ttl/recreate").unwrap().clone();
+        assert_ne!(replacement.id, old.id);
+        assert!(!old.file_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_put_joins_an_exact_retirement_already_queued_by_get() {
+        const CHILD: &str = "DS_TEST_EXPIRED_PUT_JOIN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The process coordinator is intentionally process-global. Run the
+            // scenario in a child test process so this regression cannot poison
+            // the coordinator-free unit tests that exercise the direct fallback.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "handlers::memory_mode_tests::expired_put_joins_an_exact_retirement_already_queued_by_get",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child coordinator regression failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+                let dir = tmp("expired-put-join-queued");
+                let store =
+                    Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+                let config = crate::expiry_reaper::Config {
+                    delete_rate: 100_000,
+                    delete_concurrency: 1,
+                    ..crate::expiry_reaper::Config::default()
+                };
+                let reaper = crate::expiry_reaper::spawn(store.clone(), config);
+                let expiring_put = || {
+                    let mut put = put_req("ttl/join", "application/octet-stream");
+                    put.headers.push(("stream-ttl".into(), "1".into()));
+                    put
+                };
+                assert_eq!(handle(store.clone(), expiring_put()).await.status, 201);
+                let old = store.streams.get("ttl/join").unwrap().clone();
+                old.shared.write().unwrap().last_access =
+                    SystemTime::now() - Duration::from_secs(2);
+
+                // Hold retirement before its first physical step. GET fences
+                // and queues this exact incarnation; the recreate PUT must join
+                // that work instead of treating AlreadyQueued as a fresh 503.
+                let appender = old.appender.lock().await;
+                assert_eq!(
+                    handle(
+                        store.clone(),
+                        Req {
+                            method: Method::Get,
+                            path: "ttl/join".into(),
+                            query: Some("offset=0000000000000000_0000000000000000".into()),
+                            headers: vec![],
+                            body: Bytes::new(),
+                        },
+                    )
+                    .await
+                    .status,
+                    404
+                );
+                let mut recreate = tokio::spawn(handle(store.clone(), expiring_put()));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), &mut recreate)
+                        .await
+                        .is_err(),
+                    "recreate must wait for the exact queued retirement"
+                );
+
+                drop(appender);
+                let response = tokio::time::timeout(Duration::from_secs(3), recreate)
+                    .await
+                    .expect("queued retirement and recreate timed out")
+                    .unwrap();
+                assert_eq!(response.status, 201);
+                let replacement = store.streams.get("ttl/join").unwrap().clone();
+                assert_ne!(replacement.id, old.id);
+                assert!(!old.file_path.exists());
+
+                reaper.shutdown().await;
+                drop(replacement);
+                drop(old);
+                drop(store);
+                let _ = std::fs::remove_dir_all(&dir);
+            });
+    }
+
+    #[tokio::test]
+    async fn request_discovered_expiry_retires_before_returning_not_found() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("lazy-expiry-retirement");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+
+        for (name, method) in [
+            ("get", Method::Get),
+            ("head", Method::Head),
+            ("post", Method::Post),
+        ] {
+            let path = format!("lazy/{name}");
+            let mut put = put_req(&path, "application/octet-stream");
+            put.headers.push(("stream-ttl".into(), "1".into()));
+            assert_eq!(handle(Arc::clone(&store), put).await.status, 201);
+            let old = store.streams.get(&path).unwrap().clone();
+            old.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(2);
+            let request = match method {
+                Method::Get => Req {
+                    method,
+                    path: path.clone(),
+                    query: Some("offset=0000000000000000_0000000000000000".into()),
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+                Method::Head => Req {
+                    method,
+                    path: path.clone(),
+                    query: None,
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+                Method::Post => post_req(&path, "application/octet-stream", b"x"),
+                _ => unreachable!(),
+            };
+            assert_eq!(handle(Arc::clone(&store), request).await.status, 404);
+            assert!(
+                !old.file_path.exists(),
+                "{name} must finish lazy retirement"
+            );
+        }
+
+        let source_path = "lazy/fork-source";
+        let mut source_put = put_req(source_path, "application/octet-stream");
+        source_put.headers.push(("stream-ttl".into(), "1".into()));
+        assert_eq!(handle(Arc::clone(&store), source_put).await.status, 201);
+        let source = store.streams.get(source_path).unwrap().clone();
+        source.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(2);
+        let fork = Req {
+            method: Method::Put,
+            path: "lazy/fork-child".into(),
+            query: None,
+            headers: vec![
+                ("content-type".into(), "application/octet-stream".into()),
+                ("stream-forked-from".into(), source_path.into()),
+            ],
+            body: Bytes::new(),
+        };
+        assert_eq!(handle(Arc::clone(&store), fork).await.status, 404);
+        assert!(!source.file_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_retires_a_zero_reference_fork_parent_cascade() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("fallback-fork-cascade");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            handle(
+                store.clone(),
+                put_req("cascade/parent", "application/octet-stream")
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            handle(
+                store.clone(),
+                Req {
+                    method: Method::Put,
+                    path: "cascade/child".into(),
+                    query: None,
+                    headers: vec![
+                        ("content-type".into(), "application/octet-stream".into()),
+                        ("stream-forked-from".into(), "cascade/parent".into()),
+                        ("stream-fork-offset".into(), "now".into()),
+                    ],
+                    body: Bytes::new(),
+                },
+            )
+            .await
+            .status,
+            201
+        );
+        let parent = store.streams.get("cascade/parent").unwrap().clone();
+        let child = store.streams.get("cascade/child").unwrap().clone();
+
+        for path in ["cascade/parent", "cascade/child"] {
+            assert_eq!(
+                handle(
+                    store.clone(),
+                    Req {
+                        method: Method::Delete,
+                        path: path.into(),
+                        query: None,
+                        headers: vec![],
+                        body: Bytes::new(),
+                    },
+                )
+                .await
+                .status,
+                204
+            );
+        }
+
+        assert!(!child.file_path.exists());
+        assert!(
+            !parent.file_path.exists(),
+            "the fallback must finish the newly eligible parent continuation"
+        );
+        assert!(store.streams.get("cascade/parent").is_none());
+        assert!(store.streams.get("cascade/child").is_none());
+
+        drop(parent);
+        drop(child);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fork_creation_does_not_fail_for_ordinary_source_appender_contention() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("fork-source-busy");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            handle(
+                store.clone(),
+                put_req("fork/source", "application/octet-stream")
+            )
+            .await
+            .status,
+            201
+        );
+        let source = store.streams.get("fork/source").unwrap().clone();
+        let source_appender = source.appender.lock().await;
+
+        let response = handle(
+            store.clone(),
+            Req {
+                method: Method::Put,
+                path: "fork/child".into(),
+                query: None,
+                headers: vec![
+                    ("stream-forked-from".into(), "fork/source".into()),
+                    ("stream-fork-offset".into(), "now".into()),
+                ],
+                body: Bytes::new(),
+            },
+        )
+        .await;
+        assert_eq!(response.status, 201);
+        let child = store.streams.get("fork/child").unwrap().clone();
+        assert_eq!(
+            child.parent.as_ref().map(|parent| parent.id),
+            Some(source.id)
+        );
+
+        drop(source_appender);
+        drop(child);
+        drop(source);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expiry_fence_prevents_append_from_refreshing_last_access() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("append-expiry-fence");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let mut put = put_req("ttl/append-race", "application/octet-stream");
+        put.headers.push(("stream-ttl".into(), "1".into()));
+        assert_eq!(handle(store.clone(), put).await.status, 201);
+        let stream = store.streams.get("ttl/append-race").unwrap().clone();
+        let hook = crate::handlers::test_support::install_append_hook(
+            crate::handlers::test_support::AppendHookPoint::AfterAdmission,
+        );
+        let append = tokio::spawn(handle(
+            store.clone(),
+            post_req("ttl/append-race", "application/octet-stream", b"x"),
+        ));
+        hook.reached().await;
+
+        stream.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(2);
+        let fence_now = SystemTime::now();
+        let candidate = match store.lookup_at("ttl/append-race", fence_now, false) {
+            StreamLookup::Expired(candidate) => candidate,
+            _ => panic!("the request-time lookup must win the expiry fence"),
+        };
+        hook.release();
+        assert_eq!(append.await.unwrap().status, 404);
+        assert!(
+            stream.is_expired_at(SystemTime::now()),
+            "a fenced append must not renew last_access"
+        );
+        enqueue_expired_before_not_found(&store, &candidate, fence_now).await;
+        assert!(
+            !stream.file_path.exists(),
+            "the fenced candidate must remain reapable"
+        );
+
+        drop(hook);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_fence_winning_before_tail_publication_keeps_tail_hidden() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("post-publish-fence");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            handle(
+                store.clone(),
+                put_req("publish/post", "application/octet-stream")
+            )
+            .await
+            .status,
+            201
+        );
+        let stream = store.streams.get("publish/post").unwrap().clone();
+        let hook = crate::handlers::test_support::install_append_hook(
+            crate::handlers::test_support::AppendHookPoint::BeforeTailPublication,
+        );
+        let append = tokio::spawn(handle(
+            store.clone(),
+            post_req("publish/post", "application/octet-stream", b"x"),
+        ));
+        hook.reached().await;
+        let store2 = store.clone();
+        let stream2 = stream.clone();
+        let retirement = tokio::spawn(async move { store2.prepare_delete(&stream2).await });
+        while !stream.is_fenced() {
+            tokio::task::yield_now().await;
+        }
+        hook.release();
+
+        assert_eq!(append.await.unwrap().status, 404);
+        assert_eq!(stream.tail().bytes, 0);
+        assert_eq!(
+            retirement.await.unwrap(),
+            crate::store::PrepareRetirement::Ready
+        );
+
+        drop(hook);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initial_put_fence_winning_before_tail_publication_keeps_tail_hidden() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("put-publish-fence");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let hook = crate::handlers::test_support::install_append_hook(
+            crate::handlers::test_support::AppendHookPoint::BeforeTailPublication,
+        );
+        let create = tokio::spawn(handle(
+            store.clone(),
+            Req {
+                method: Method::Put,
+                path: "publish/put".into(),
+                query: None,
+                headers: vec![("content-type".into(), "application/octet-stream".into())],
+                body: Bytes::from_static(b"x"),
+            },
+        ));
+        hook.reached().await;
+        let stream = store.streams.get("publish/put").unwrap().clone();
+        let store2 = store.clone();
+        let stream2 = stream.clone();
+        let retirement = tokio::spawn(async move { store2.prepare_delete(&stream2).await });
+        while !stream.is_fenced() {
+            tokio::task::yield_now().await;
+        }
+        hook.release();
+
+        assert_eq!(create.await.unwrap().status, 404);
+        assert_eq!(stream.tail().bytes, 0);
+        assert_eq!(
+            retirement.await.unwrap(),
+            crate::store::PrepareRetirement::Ready
+        );
+
+        drop(hook);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_fence_winning_after_meta_keeps_eof_hidden() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("close-publish-fence");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            handle(
+                store.clone(),
+                put_req("publish/close", "application/octet-stream")
+            )
+            .await
+            .status,
+            201
+        );
+        let stream = store.streams.get("publish/close").unwrap().clone();
+        let hook = crate::handlers::test_support::install_append_hook(
+            crate::handlers::test_support::AppendHookPoint::BeforeClosePublication,
+        );
+        let close = tokio::spawn(handle(
+            store.clone(),
+            Req {
+                method: Method::Post,
+                path: "publish/close".into(),
+                query: None,
+                headers: vec![("stream-closed".into(), "true".into())],
+                body: Bytes::new(),
+            },
+        ));
+        hook.reached().await;
+        let store2 = store.clone();
+        let stream2 = stream.clone();
+        let retirement = tokio::spawn(async move { store2.prepare_delete(&stream2).await });
+        while !stream.is_fenced() {
+            tokio::task::yield_now().await;
+        }
+        hook.release();
+
+        assert_eq!(close.await.unwrap().status, 404);
+        assert!(!stream.tail().closed);
+        assert_eq!(
+            retirement.await.unwrap(),
+            crate::store::PrepareRetirement::Ready
+        );
+
+        drop(hook);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_close_fence_before_atomic_publication_keeps_bytes_and_eof_hidden() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("body-close-publish-fence");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            handle(
+                store.clone(),
+                put_req("publish/body-close", "application/octet-stream")
+            )
+            .await
+            .status,
+            201
+        );
+        let stream = store.streams.get("publish/body-close").unwrap().clone();
+        let hook = crate::handlers::test_support::install_append_hook(
+            crate::handlers::test_support::AppendHookPoint::BeforeClosePublication,
+        );
+        let append = tokio::spawn(handle(
+            store.clone(),
+            Req {
+                method: Method::Post,
+                path: "publish/body-close".into(),
+                query: None,
+                headers: vec![
+                    ("content-type".into(), "application/octet-stream".into()),
+                    ("stream-closed".into(), "true".into()),
+                ],
+                body: Bytes::from_static(b"x"),
+            },
+        ));
+        hook.reached().await;
+        let store2 = store.clone();
+        let stream2 = stream.clone();
+        let retirement = tokio::spawn(async move { store2.prepare_delete(&stream2).await });
+        while !stream.is_fenced() {
+            tokio::task::yield_now().await;
+        }
+        hook.release();
+
+        assert_eq!(append.await.unwrap().status, 404);
+        assert_eq!(stream.tail().bytes, 0);
+        assert!(!stream.tail().closed);
+        assert_eq!(
+            retirement.await.unwrap(),
+            crate::store::PrepareRetirement::Ready
+        );
+
+        drop(hook);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_publication_winner_is_acked_if_delete_fences_next() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("post-publication-wins");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        assert_eq!(
+            handle(
+                store.clone(),
+                put_req("publish/post-winner", "application/octet-stream")
+            )
+            .await
+            .status,
+            201
+        );
+        let stream = store.streams.get("publish/post-winner").unwrap().clone();
+        let hook = crate::handlers::test_support::install_append_hook(
+            crate::handlers::test_support::AppendHookPoint::AfterPublication,
+        );
+        let append = tokio::spawn(handle(
+            store.clone(),
+            post_req("publish/post-winner", "application/octet-stream", b"x"),
+        ));
+        hook.reached().await;
+        assert_eq!(stream.tail().bytes, 1);
+        let store2 = store.clone();
+        let stream2 = stream.clone();
+        let retirement = tokio::spawn(async move { store2.prepare_delete(&stream2).await });
+        while !stream.is_fenced() {
+            tokio::task::yield_now().await;
+        }
+        hook.release();
+
+        assert_eq!(append.await.unwrap().status, 204);
+        assert_eq!(
+            retirement.await.unwrap(),
+            crate::store::PrepareRetirement::Ready
+        );
+
+        drop(hook);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initial_put_publication_winner_is_acked_if_delete_fences_next() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("put-publication-wins");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let hook = crate::handlers::test_support::install_append_hook(
+            crate::handlers::test_support::AppendHookPoint::AfterPublication,
+        );
+        let create = tokio::spawn(handle(
+            store.clone(),
+            Req {
+                method: Method::Put,
+                path: "publish/put-winner".into(),
+                query: None,
+                headers: vec![("content-type".into(), "application/octet-stream".into())],
+                body: Bytes::from_static(b"x"),
+            },
+        ));
+        hook.reached().await;
+        let stream = store.streams.get("publish/put-winner").unwrap().clone();
+        assert_eq!(stream.tail().bytes, 1);
+        let store2 = store.clone();
+        let stream2 = stream.clone();
+        let retirement = tokio::spawn(async move { store2.prepare_delete(&stream2).await });
+        while !stream.is_fenced() {
+            tokio::task::yield_now().await;
+        }
+        hook.release();
+
+        assert_eq!(create.await.unwrap().status, 201);
+        assert_eq!(
+            retirement.await.unwrap(),
+            crate::store::PrepareRetirement::Ready
+        );
+
+        drop(hook);
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

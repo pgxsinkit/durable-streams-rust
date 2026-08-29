@@ -11,14 +11,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 
 pub const MAX_SAFE_INT: u64 = (1u64 << 53) - 1;
+const CREATE_PATH_LOCK_STRIPES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tail {
@@ -285,6 +286,24 @@ pub struct StreamState {
     pub appender: AsyncMutex<Appender>,
     pub shared: RwLock<Shared>,
     pub tail_tx: watch::Sender<Tail>,
+    /// Retirement fence. Once set, no new append guard or request-time touch may
+    /// succeed. This is transient; recovery reconstructs expiry from the sidecar.
+    fenced: AtomicBool,
+    /// Appends that have left `appender` but have not yet completed their full
+    /// durability/publication/notification/response path.
+    inflight_appends: AtomicUsize,
+    inflight_appends_zero: Notify,
+    /// Dedupe latch used by the bounded runtime retirement queue.
+    retirement_queued: AtomicBool,
+    /// Set after physical hard unlink when WAL bookkeeping begins forgetting
+    /// this stream. Checkpoint/dirty registration uses it to avoid restoring a
+    /// retired stream to the WAL tail proof after the forget operation starts.
+    wal_forgotten: AtomicBool,
+    /// Ensures retrying a partially completed hard retirement releases its
+    /// parent reference at most once.
+    parent_released: AtomicBool,
+    /// Sticky deletion wake: new subscribers also observe an already-fired wake.
+    deleted_tx: watch::Sender<bool>,
     /// The sidecar's persisted `durable_tail` as read at BOOT (None for sidecars
     /// written by older servers). Consumed once by WAL recovery as this stream's
     /// truncation-proof seed; never updated afterwards (the live value lives in
@@ -332,6 +351,132 @@ pub struct StreamState {
     /// are attached. See sse_reactor.rs.
     #[cfg(target_os = "linux")]
     pub sse_subs: StdMutex<Option<Box<StreamSubs>>>,
+}
+
+/// RAII coverage for the complete append acknowledgment path. The handler must
+/// create this while it still holds `StreamState::appender`, and keep it alive
+/// through the final publish/notification/response decision.
+pub struct AppendGuard {
+    stream: Arc<StreamState>,
+}
+
+impl AppendGuard {
+    /// Recheck after WAL durability and immediately before visibility or 2xx.
+    pub fn may_publish(&self) -> bool {
+        !self.stream.fenced.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for AppendGuard {
+    fn drop(&mut self) {
+        if self.stream.inflight_appends.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.stream.inflight_appends_zero.notify_waiters();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamAccessError {
+    Gone,
+    Expired,
+}
+
+#[derive(Clone)]
+pub struct ExpiryCandidate {
+    stream_id: u64,
+    stream: Arc<StreamState>,
+}
+
+impl ExpiryCandidate {
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    pub fn stream(&self) -> Arc<StreamState> {
+        Arc::clone(&self.stream)
+    }
+
+    pub fn try_mark_queued(&self) -> bool {
+        self.stream
+            .retirement_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn clear_queued(&self) {
+        self.stream
+            .retirement_queued
+            .store(false, Ordering::Release);
+    }
+}
+
+#[derive(Default)]
+pub struct ExpiryScanCursor {
+    after: Option<u64>,
+}
+
+impl ExpiryScanCursor {
+    pub fn after(&self) -> Option<u64> {
+        self.after
+    }
+}
+
+pub struct ExpiryScanPage {
+    pub checked: usize,
+    pub due: Vec<ExpiryCandidate>,
+    pub completed_pass: bool,
+    /// Oldest deadline found due in this bounded page. Runtime telemetry derives
+    /// scheduling lag from this without adding an unbounded global walk.
+    pub oldest_due_deadline: Option<SystemTime>,
+}
+
+pub enum StreamLookup {
+    Missing,
+    Gone(#[allow(dead_code)] Arc<StreamState>),
+    Expired(ExpiryCandidate),
+    Live(Arc<StreamState>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrepareRetirement {
+    Ready,
+    Renewed,
+    Stale,
+    Gone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetirementDurability {
+    Expiry,
+    Explicit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetirementOutcome {
+    SoftDeleted,
+    Reaped,
+}
+
+pub struct RetirementStep {
+    pub outcome: RetirementOutcome,
+    /// A zero-reference soft fork parent made eligible by this hard retirement.
+    /// It is fenced but deliberately not queue-marked; the bounded runtime must
+    /// admit and pace it as a distinct physical cleanup step.
+    pub cascade: Option<ExpiryCandidate>,
+    /// Data-file and sidecar bytes successfully unlinked by this step. Local
+    /// tier segments are currently reclaimed asynchronously and are not included.
+    pub reclaimed_local_bytes: u64,
+}
+
+struct PhysicalRetirementStep {
+    outcome: RetirementOutcome,
+    cascade: Option<ExpiryCandidate>,
+    reclaimed_local_bytes: u64,
+}
+
+#[derive(Default)]
+struct ExpiringStreams {
+    by_id: BTreeMap<u64, Weak<StreamState>>,
 }
 
 /// Reactor subscriber list for one stream — populated only while subscribers are
@@ -399,6 +544,10 @@ pub fn tail_cache_bytes() -> usize {
 }
 
 impl StreamState {
+    fn has_expiration_policy(&self) -> bool {
+        self.config.ttl_seconds.is_some() || self.config.expires_at.is_some()
+    }
+
     /// Record the just-appended wire chunk as the resident tail. `start` is the
     /// logical offset where `bytes` begins. Chunks larger than the tail-cache cap
     /// (or any append when the cache is disabled) are not cached (the entry is
@@ -443,25 +592,186 @@ impl StreamState {
         }
     }
 
-    pub fn touch(&self) {
-        let mut s = self.shared.write().unwrap();
-        s.last_access = SystemTime::now();
+    fn expiry_deadline_for(&self, last_access: SystemTime) -> Option<SystemTime> {
+        if let Some(expires_at) = self.config.expires_at {
+            return Some(expires_at);
+        }
+        self.config
+            .ttl_seconds
+            .and_then(|ttl| last_access.checked_add(Duration::from_secs(ttl)))
+    }
+
+    #[allow(dead_code)]
+    pub fn expiry_deadline(&self) -> Option<SystemTime> {
+        self.expiry_deadline_for(self.shared.read().unwrap().last_access)
+    }
+
+    fn is_expired_with(&self, shared: &Shared, now: SystemTime) -> bool {
+        self.expiry_deadline_for(shared.last_access)
+            .is_some_and(|deadline| now > deadline)
+    }
+
+    pub fn is_expired_at(&self, now: SystemTime) -> bool {
+        self.is_expired_with(&self.shared.read().unwrap(), now)
     }
 
     pub fn is_expired(&self) -> bool {
-        let now = SystemTime::now();
-        if let Some(exp) = self.config.expires_at {
-            if now > exp {
-                return true;
-            }
+        self.is_expired_at(SystemTime::now())
+    }
+
+    /// Atomically validate request-time liveness and refresh a sliding TTL.
+    /// The shared write guard also serializes this decision with retirement's
+    /// final expiry recheck + fence.
+    #[allow(dead_code)]
+    pub fn touch_if_live_at(&self, now: SystemTime) -> bool {
+        let mut shared = self.shared.write().unwrap();
+        if self.fenced.load(Ordering::Acquire)
+            || shared.soft_deleted
+            || self.is_expired_with(&shared, now)
+        {
+            return false;
         }
-        if let Some(ttl) = self.config.ttl_seconds {
-            let last = self.shared.read().unwrap().last_access;
-            if now > last + Duration::from_secs(ttl) {
-                return true;
-            }
+        if self.config.ttl_seconds.is_some() {
+            shared.last_access = now;
         }
-        false
+        true
+    }
+
+    /// Begin full-path append accounting. Must be called while `appender` is
+    /// held, after request validation and before releasing that mutex.
+    pub fn begin_append_at(
+        self: &Arc<Self>,
+        now: SystemTime,
+    ) -> Result<AppendGuard, StreamAccessError> {
+        let shared = self.shared.read().unwrap();
+        if shared.soft_deleted {
+            return Err(StreamAccessError::Gone);
+        }
+        if self.fenced.load(Ordering::Acquire) || self.is_expired_with(&shared, now) {
+            return Err(StreamAccessError::Expired);
+        }
+        self.inflight_appends.fetch_add(1, Ordering::AcqRel);
+        Ok(AppendGuard {
+            stream: Arc::clone(self),
+        })
+    }
+
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::Acquire)
+    }
+
+    pub fn mark_wal_forgotten(&self) {
+        self.wal_forgotten.store(true, Ordering::Release);
+    }
+
+    pub fn is_wal_forgotten(&self) -> bool {
+        self.wal_forgotten.load(Ordering::Acquire)
+    }
+
+    /// Mutate request-visible stream state only while it is live. The fence
+    /// decision and mutation share retirement's `shared` lock, so neither a
+    /// durable publication nor a last-access update can land after fencing.
+    pub fn with_live_shared_mut<R>(
+        &self,
+        f: impl FnOnce(&mut Shared) -> R,
+    ) -> Result<R, StreamAccessError> {
+        let mut shared = self.shared.write().unwrap();
+        if shared.soft_deleted {
+            return Err(StreamAccessError::Gone);
+        }
+        if self.fenced.load(Ordering::Acquire) {
+            return Err(StreamAccessError::Expired);
+        }
+        Ok(f(&mut shared))
+    }
+
+    /// Atomically advance the reader-visible durable tail if retirement has not
+    /// fenced the stream. The caller publishes the returned exact tail to
+    /// watches/inventory after releasing this lock.
+    pub fn publish_durable_tail_if_live(
+        &self,
+        tail: u64,
+    ) -> Result<Option<Tail>, StreamAccessError> {
+        self.with_live_shared_mut(|shared| {
+            if tail <= shared.durable_tail {
+                return None;
+            }
+            shared.durable_tail = tail;
+            Some(Tail {
+                bytes: tail,
+                closed: shared.closed_durable,
+            })
+        })
+    }
+
+    /// Atomically publish durable EOF if retirement has not fenced the stream.
+    pub fn publish_durable_close_if_live(&self) -> Result<Tail, StreamAccessError> {
+        self.with_live_shared_mut(|shared| {
+            shared.closed_durable = true;
+            Tail {
+                bytes: shared.durable_tail,
+                closed: true,
+            }
+        })
+    }
+
+    /// Atomically publish a body append and its durable close. Delaying both
+    /// visibility transitions until close metadata commits prevents retirement
+    /// from fencing between a visible body and EOF publication.
+    pub fn publish_durable_tail_and_close_if_live(
+        &self,
+        tail: u64,
+    ) -> Result<(Tail, bool), StreamAccessError> {
+        self.with_live_shared_mut(|shared| {
+            let advanced = tail > shared.durable_tail;
+            if advanced {
+                shared.durable_tail = tail;
+            }
+            shared.closed_durable = true;
+            (
+                Tail {
+                    bytes: shared.durable_tail,
+                    closed: true,
+                },
+                advanced,
+            )
+        })
+    }
+
+    pub fn subscribe_deleted(&self) -> watch::Receiver<bool> {
+        self.deleted_tx.subscribe()
+    }
+
+    /// Publish the request-time fence transition after releasing `shared`.
+    /// Deletion is sticky for future subscribers; the tail/reactor wakes end
+    /// existing long-poll and SSE readers before paced cleanup is admitted.
+    fn publish_retirement_fence_wake(&self) {
+        let first = self.deleted_tx.send_if_modified(|deleted| {
+            if *deleted {
+                false
+            } else {
+                *deleted = true;
+                true
+            }
+        });
+        if !first {
+            return;
+        }
+        let _ = self.tail_tx.send(self.tail());
+        #[cfg(target_os = "linux")]
+        crate::sse_reactor::wake_stream(self);
+    }
+
+    async fn wait_for_inflight_appends(&self) {
+        loop {
+            // Register before observing zero so the final guard transition
+            // cannot be missed between the check and the await.
+            let notified = self.inflight_appends_zero.notified();
+            if self.inflight_appends.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn etag(&self, start: u64, end: u64, closed: bool) -> String {
@@ -475,6 +785,10 @@ impl StreamState {
 
 pub struct Store {
     pub streams: DashMap<String, Arc<StreamState>>,
+    /// Serializes creation of the same logical path without retaining a
+    /// DashMap shard guard across data/sidecar I/O. Lookups never take these
+    /// locks; unrelated creates contend only when their path hashes collide.
+    creation_stripes: [StdMutex<()>; CREATE_PATH_LOCK_STRIPES],
     pub data_dir: PathBuf,
     next_id: AtomicU64,
     /// Hot/cold tiering config (Off by default → fully inert).
@@ -497,11 +811,21 @@ pub struct Store {
     pub meta_sweep: StdMutex<Vec<Arc<StreamState>>>,
     pub subscriptions: Arc<crate::subscriptions::SubscriptionManager>,
     inventory: RwLock<InventoryProjection>,
+    expiring: StdMutex<ExpiringStreams>,
+    recovered_retirements: StdMutex<ExpiringStreams>,
+    /// Sticky recovery quarantine summary. WAL recovery uses this to refuse a
+    /// replay/reset that could otherwise discard records for a stream whose
+    /// sidecar could not be decoded. Memory mode may still boot for operator
+    /// repair, so this state remains queryable for the Store lifetime.
+    quarantined_streams: AtomicBool,
+    quarantined_stream_ids_complete: AtomicBool,
+    quarantined_stream_ids: RwLock<HashSet<u64>>,
 }
 
 /// A read-only stream projection used by the bounded administrative inventory.
 #[derive(Clone, Debug)]
 pub struct InventoryEntry {
+    stream_id: u64,
     pub path: String,
     pub closed: bool,
     pub deleted: bool,
@@ -520,13 +844,94 @@ pub enum InventoryPageError {
 pub enum CreateResult {
     Created(Arc<StreamState>),
     Exists(Arc<StreamState>),
+    /// The old incarnation remains fenced in the registry. The caller must run
+    /// prepare → subscription transition → finish, then retry creation once.
+    Expired(ExpiryCandidate),
+    /// The requested fork source became fenced, deleted, or expired while the
+    /// child reservation was being established.
+    SourceUnavailable,
     Conflict,
 }
 
 impl Store {
+    pub fn has_quarantined_streams(&self) -> bool {
+        self.quarantined_streams.load(Ordering::Acquire)
+    }
+
+    /// Whether every quarantined sidecar's data filename contained a valid
+    /// stream id. `false` means callers cannot safely narrow a WAL preflight to
+    /// the ids returned by [`Store::quarantined_stream_ids`].
+    pub fn quarantined_stream_ids_complete(&self) -> bool {
+        self.quarantined_stream_ids_complete.load(Ordering::Acquire)
+    }
+
+    pub fn quarantined_stream_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<_> = self
+            .quarantined_stream_ids
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn record_quarantined_stream(&self, data_path: &std::path::Path) -> Option<u64> {
+        self.quarantined_streams.store(true, Ordering::Release);
+        let id = data_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.rsplit_once('~'))
+            .and_then(|(_, id)| id.parse::<u64>().ok())
+            .filter(|id| *id <= MAX_SAFE_INT);
+        match id {
+            Some(id) => {
+                self.quarantined_stream_ids
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(id);
+            }
+            None => self
+                .quarantined_stream_ids_complete
+                .store(false, Ordering::Release),
+        }
+        id
+    }
+
+    fn evaluate_existing_create(
+        &self,
+        existing: Arc<StreamState>,
+        requested: &StreamConfig,
+        now: SystemTime,
+    ) -> CreateResult {
+        let mut shared = existing.shared.write().unwrap();
+        if shared.soft_deleted {
+            return CreateResult::Conflict;
+        }
+        if existing.fenced.load(Ordering::Acquire) || existing.is_expired_with(&shared, now) {
+            existing.fenced.store(true, Ordering::Release);
+            existing.meta_dirty.store(false, Ordering::Release);
+            drop(shared);
+            existing.publish_retirement_fence_wake();
+            return CreateResult::Expired(self.candidate_for(&existing));
+        }
+        let matches = config_matches_with_closed(&existing, requested, shared.closed);
+        if matches && existing.config.ttl_seconds.is_some() {
+            shared.last_access = now;
+        }
+        drop(shared);
+        if matches {
+            CreateResult::Exists(existing)
+        } else {
+            CreateResult::Conflict
+        }
+    }
+
     fn publish_inventory(&self, st: &StreamState) {
         let s = st.shared.read().unwrap();
         let entry = InventoryEntry {
+            stream_id: st.id,
             path: st.path.clone(),
             closed: s.closed_durable,
             deleted: s.soft_deleted,
@@ -547,6 +952,7 @@ impl Store {
             entries.insert(
                 stream.path.clone(),
                 InventoryEntry {
+                    stream_id: stream.id,
                     path: stream.path.clone(),
                     closed: shared.closed_durable,
                     deleted: shared.soft_deleted,
@@ -558,9 +964,13 @@ impl Store {
         inventory.entries = entries;
         inventory.generation = inventory.generation.wrapping_add(1);
     }
-    fn remove_inventory(&self, path: &str) {
+    fn remove_inventory(&self, path: &str, expected_stream_id: u64) {
         let mut inventory = self.inventory.write().unwrap();
-        if inventory.entries.remove(path).is_some() {
+        let matches = inventory
+            .entries
+            .get(path)
+            .is_some_and(|entry| entry.stream_id == expected_stream_id);
+        if matches && inventory.entries.remove(path).is_some() {
             inventory.generation = inventory.generation.wrapping_add(1);
         }
     }
@@ -726,6 +1136,7 @@ impl Store {
         let subscriptions = Arc::new(crate::subscriptions::SubscriptionManager::new(&data_dir)?);
         let store = Store {
             streams: DashMap::new(),
+            creation_stripes: std::array::from_fn(|_| StdMutex::new(())),
             data_dir,
             next_id: AtomicU64::new(seed & MAX_SAFE_INT),
             tier_config,
@@ -737,6 +1148,11 @@ impl Store {
                 generation: 0,
                 entries: BTreeMap::new(),
             }),
+            expiring: StdMutex::new(ExpiringStreams::default()),
+            recovered_retirements: StdMutex::new(ExpiringStreams::default()),
+            quarantined_streams: AtomicBool::new(false),
+            quarantined_stream_ids_complete: AtomicBool::new(true),
+            quarantined_stream_ids: RwLock::new(HashSet::new()),
         };
         store.recover(&streams_dir)?;
         Ok(store)
@@ -758,6 +1174,7 @@ impl Store {
         let mut metas: HashMap<String, (Meta, PathBuf)> = HashMap::new();
         let mut data_files: Vec<PathBuf> = Vec::new();
         let mut quarantined: Vec<PathBuf> = Vec::new();
+        let mut max_id = 0u64;
         let mut entries: Vec<PathBuf> = Vec::new();
         for lane in 0..stream_lanes() {
             for entry in std::fs::read_dir(lane_dir(&self.data_dir, lane))? {
@@ -778,6 +1195,27 @@ impl Store {
                 // durable residual for a pending intent, else removed there). Do
                 // NOT treat it as an orphan data file — that would delete the
                 // durable residual before recovery can promote it.
+            } else if name.ends_with(".meta.corrupt") {
+                // A prior boot deliberately parked an unreadable sidecar. Keep
+                // recognizing that quarantine marker forever: otherwise the
+                // next boot would classify both the marker and its paired data
+                // as disposable orphans, and could also lower a soft fork
+                // parent's refcount using an incomplete child graph.
+                let data_path = PathBuf::from(
+                    p.as_os_str()
+                        .to_str()
+                        .unwrap()
+                        .trim_end_matches(".meta.corrupt"),
+                );
+                eprintln!(
+                    "WARN: retaining quarantined stream sidecar {} \
+                     (stream skipped this boot; paired data kept)",
+                    p.display()
+                );
+                if let Some(id) = self.record_quarantined_stream(&data_path) {
+                    max_id = max_id.max(id);
+                }
+                quarantined.push(data_path);
             } else if name.ends_with(".meta") {
                 let data_path =
                     PathBuf::from(p.as_os_str().to_str().unwrap().trim_end_matches(".meta"));
@@ -800,6 +1238,9 @@ impl Store {
                                     p.display()
                                 );
                                 let _ = std::fs::rename(&p, p.with_extension("meta.corrupt"));
+                                if let Some(id) = self.record_quarantined_stream(&data_path) {
+                                    max_id = max_id.max(id);
+                                }
                                 quarantined.push(data_path);
                             }
                         }
@@ -828,7 +1269,6 @@ impl Store {
                 let _ = std::fs::remove_file(&p);
             }
         }
-        let mut max_id = 0u64;
         let paths: Vec<String> = metas.keys().cloned().collect();
         // `visiting` tracks the active recursion stack to break cyclic
         // forked_from chains in corrupt sidecars (would otherwise overflow the
@@ -837,12 +1277,116 @@ impl Store {
         for path in paths {
             self.recover_one(&path, &metas, &mut visiting);
         }
+        // Refcounts are denormalized lifecycle metadata. A crash can durably
+        // remove the last child before persisting its parent's decrement, so
+        // the recovered child->parent graph is authoritative when it is
+        // complete. Persist reconciliation before seeding cleanup: another
+        // crash must not restore a phantom reference and lose the tombstone
+        // from the bounded recovery index again.
+        self.reconcile_recovered_ref_counts(&metas, !quarantined.is_empty())?;
+        // Recovered tombstones remain fenced. Zero-reference tombstones are
+        // seeded into a bounded index for the runtime coordinator; recovery
+        // never performs an unbounded synchronous unlink walk.
+        for entry in self.streams.iter() {
+            let st = entry.value();
+            let shared = st.shared.read().unwrap();
+            if shared.soft_deleted {
+                st.fenced.store(true, Ordering::Release);
+                st.deleted_tx.send_replace(true);
+                if shared.ref_count == 0 {
+                    self.recovered_retirements
+                        .lock()
+                        .unwrap()
+                        .by_id
+                        .insert(st.id, Arc::downgrade(st));
+                }
+            }
+        }
         for (m, _) in metas.values() {
             max_id = max_id.max(m.id);
         }
         // Keep ids unique across restarts (they feed ETags).
         let cur = self.next_id.load(Ordering::Relaxed);
         self.next_id.store(cur.max(max_id + 1), Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn reconcile_recovered_ref_counts(
+        &self,
+        metas: &HashMap<String, (Meta, PathBuf)>,
+        has_quarantined_streams: bool,
+    ) -> std::io::Result<()> {
+        let mut actual = HashMap::<String, u32>::new();
+        let mut ambiguous = HashMap::<String, u32>::new();
+
+        for (child_path, (meta, _)) in metas {
+            let Some(parent_path) = meta.forked_from.as_ref() else {
+                continue;
+            };
+            let Some(parent) = self.streams.get(parent_path).map(|entry| entry.clone()) else {
+                continue;
+            };
+            let resolved = self
+                .streams
+                .get(child_path)
+                .and_then(|child| child.parent.clone())
+                .is_some_and(|source| Arc::ptr_eq(&source, &parent));
+            if !resolved {
+                // A parseable but corrupt/missing graph edge may still depend
+                // on this parent. Never lower its persisted count from
+                // incomplete evidence; raising to cover known edges is safe.
+                let count = ambiguous.entry(parent_path.clone()).or_default();
+                *count = count.checked_add(1).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("recovery: too many ambiguous fork references to {parent_path}"),
+                    )
+                })?;
+                continue;
+            }
+            let count = actual.entry(parent_path.clone()).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("recovery: too many fork references to {parent_path}"),
+                )
+            })?;
+        }
+
+        for entry in self.streams.iter() {
+            let st = entry.value().clone();
+            let recovered = actual.get(&st.path).copied().unwrap_or(0);
+            let ambiguous = ambiguous.get(&st.path).copied().unwrap_or(0);
+            let conservatively_recovered = recovered.checked_add(ambiguous).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("recovery: too many total fork references to {}", st.path),
+                )
+            })?;
+            let mut shared = st.shared.write().unwrap();
+            let reconciled = if has_quarantined_streams || ambiguous != 0 {
+                // An unreadable sidecar could hide an edge to any parent. This
+                // may retain storage until operator repair, but cannot free
+                // bytes still needed by a skipped child.
+                shared.ref_count.max(conservatively_recovered)
+            } else {
+                recovered
+            };
+            if shared.ref_count == reconciled {
+                continue;
+            }
+            shared.ref_count = reconciled;
+            drop(shared);
+            write_meta_sync_allow_fenced(&st, true).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "recovery: cannot durably reconcile fork references for {}: {error}",
+                        st.path
+                    ),
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -969,6 +1513,7 @@ impl Store {
             bytes: tail,
             closed: meta.closed,
         });
+        let (deleted_tx, _) = watch::channel(meta.soft_deleted);
         let state = Arc::new(StreamState {
             id: meta.id,
             path: path.to_string(),
@@ -997,6 +1542,13 @@ impl Store {
                 soft_deleted: meta.soft_deleted,
             }),
             tail_tx,
+            fenced: AtomicBool::new(meta.soft_deleted),
+            inflight_appends: AtomicUsize::new(0),
+            inflight_appends_zero: Notify::new(),
+            retirement_queued: AtomicBool::new(false),
+            wal_forgotten: AtomicBool::new(false),
+            parent_released: AtomicBool::new(false),
+            deleted_tx,
             meta_dirty: AtomicBool::new(false),
             // Epoch 0 < the shard's initial epoch (1), so the first append
             // registers this stream into the dirty set.
@@ -1040,7 +1592,7 @@ impl Store {
         // the appended delta (silent corruption). Persisting now closes that
         // double-crash window; a persist failure fails the boot loudly.
         if meta.pending_compaction.is_some() {
-            write_meta_sync(&state, true).unwrap_or_else(|e| {
+            write_meta_sync_inner(&state, true, meta.soft_deleted).unwrap_or_else(|e| {
                 panic!(
                     "recovery: cannot durably clear the compaction intent for {} ({e}); \
                      booting without it risks a mis-derived file_base after another crash",
@@ -1049,24 +1601,398 @@ impl Store {
             });
         }
         self.streams.insert(path.to_string(), state.clone());
+        if !meta.soft_deleted && state.has_expiration_policy() {
+            self.register_expiring(&state);
+        }
         Some(state)
+    }
+
+    fn register_expiring(&self, st: &Arc<StreamState>) {
+        if !st.has_expiration_policy() {
+            return;
+        }
+        self.expiring
+            .lock()
+            .unwrap()
+            .by_id
+            .insert(st.id, Arc::downgrade(st));
+    }
+
+    fn unregister_expiring(&self, stream_id: u64) {
+        self.expiring.lock().unwrap().by_id.remove(&stream_id);
+    }
+
+    pub fn expiring_stream_count(&self) -> usize {
+        self.expiring.lock().unwrap().by_id.len()
+    }
+
+    pub fn recovered_retirement_count(&self) -> usize {
+        self.recovered_retirements.lock().unwrap().by_id.len()
+    }
+
+    fn select_index_page(
+        index: &StdMutex<ExpiringStreams>,
+        cursor: &mut ExpiryScanCursor,
+        limit: usize,
+    ) -> (Vec<(u64, Weak<StreamState>)>, bool) {
+        if limit == 0 {
+            return (Vec::new(), false);
+        }
+        let index = index.lock().unwrap();
+        let total = index.by_id.len();
+        if total == 0 {
+            cursor.after = None;
+            return (Vec::new(), true);
+        }
+        let want = limit.min(total);
+        let mut selected = Vec::with_capacity(want);
+        match cursor.after {
+            None => selected.extend(
+                index
+                    .by_id
+                    .iter()
+                    .take(want)
+                    .map(|(&id, weak)| (id, weak.clone())),
+            ),
+            Some(after) => {
+                selected.extend(
+                    index
+                        .by_id
+                        .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                        .take(want)
+                        .map(|(&id, weak)| (id, weak.clone())),
+                );
+                if selected.len() < want {
+                    selected.extend(
+                        index
+                            .by_id
+                            .range((std::ops::Bound::Unbounded, std::ops::Bound::Included(after)))
+                            .take(want - selected.len())
+                            .map(|(&id, weak)| (id, weak.clone())),
+                    );
+                }
+            }
+        }
+        let completed = selected.len() == total
+            || cursor
+                .after
+                .is_some_and(|after| selected.iter().any(|(id, _)| *id <= after));
+        cursor.after = selected.last().map(|(id, _)| *id);
+        (selected, completed)
+    }
+
+    /// Inspect at most `limit` indexed streams, starting after the cursor and
+    /// wrapping once. Weak references are cloned under the index lock; deadline
+    /// evaluation and registry validation happen after it is released.
+    pub fn scan_expiring(
+        &self,
+        cursor: &mut ExpiryScanCursor,
+        limit: usize,
+        now: SystemTime,
+    ) -> ExpiryScanPage {
+        let (selected, completed_pass) = Self::select_index_page(&self.expiring, cursor, limit);
+        let checked = selected.len();
+        let mut due = Vec::new();
+        let mut oldest_due_deadline: Option<SystemTime> = None;
+        for (stream_id, weak) in selected {
+            let Some(stream) = weak.upgrade() else {
+                self.unregister_expiring(stream_id);
+                continue;
+            };
+            let deadline = {
+                let shared = stream.shared.read().unwrap();
+                stream.expiry_deadline_for(shared.last_access)
+            };
+            if deadline.is_some_and(|deadline| now > deadline) {
+                oldest_due_deadline = match (oldest_due_deadline, deadline) {
+                    (Some(oldest), Some(deadline)) => Some(oldest.min(deadline)),
+                    (None, deadline) => deadline,
+                    (oldest, None) => oldest,
+                };
+                due.push(ExpiryCandidate { stream_id, stream });
+            }
+        }
+        ExpiryScanPage {
+            checked,
+            due,
+            completed_pass,
+            oldest_due_deadline,
+        }
+    }
+
+    /// Page recovered zero-reference tombstones into the same bounded runtime
+    /// coordinator used for live expiry. Candidates stay indexed until their
+    /// exact hard-retirement step finalizes.
+    pub fn scan_recovered_retirements(
+        &self,
+        cursor: &mut ExpiryScanCursor,
+        limit: usize,
+    ) -> ExpiryScanPage {
+        let (selected, completed_pass) =
+            Self::select_index_page(&self.recovered_retirements, cursor, limit);
+        let checked = selected.len();
+        let mut due = Vec::with_capacity(checked);
+        for (stream_id, weak) in selected {
+            let Some(stream) = weak.upgrade() else {
+                self.recovered_retirements
+                    .lock()
+                    .unwrap()
+                    .by_id
+                    .remove(&stream_id);
+                continue;
+            };
+            due.push(ExpiryCandidate { stream_id, stream });
+        }
+        ExpiryScanPage {
+            checked,
+            due,
+            completed_pass,
+            oldest_due_deadline: None,
+        }
+    }
+
+    pub fn candidate_for(&self, st: &Arc<StreamState>) -> ExpiryCandidate {
+        ExpiryCandidate {
+            stream_id: st.id,
+            stream: Arc::clone(st),
+        }
+    }
+
+    pub(crate) fn is_current(&self, candidate: &ExpiryCandidate) -> bool {
+        self.streams
+            .get(&candidate.stream.path)
+            .is_some_and(|current| {
+                current.id == candidate.stream_id && Arc::ptr_eq(current.value(), &candidate.stream)
+            })
+    }
+
+    /// Retain the exact registry owner's queue marker when a completed soft
+    /// delete concurrently became a durable zero-reference tombstone. The
+    /// registry mutex serializes this with joins and cascade ownership; the
+    /// shared lock makes the soft-delete/refcount observation one snapshot.
+    pub(crate) fn retain_zero_ref_soft_retirement(&self, candidate: &ExpiryCandidate) -> bool {
+        let Some(current) = self.streams.get(&candidate.stream.path) else {
+            return false;
+        };
+        if current.id != candidate.stream_id || !Arc::ptr_eq(current.value(), &candidate.stream) {
+            return false;
+        }
+        let shared = candidate.stream.shared.read().unwrap();
+        if !candidate.stream.fenced.load(Ordering::Acquire)
+            || !shared.soft_deleted
+            || shared.ref_count != 0
+        {
+            return false;
+        }
+        candidate
+            .stream
+            .retirement_queued
+            .store(true, Ordering::Release);
+        true
+    }
+
+    /// Atomic request lookup. `touch_ttl` is true for successful GET and
+    /// compatible PUT, false for HEAD and control-path validation.
+    pub fn lookup_at(&self, path: &str, now: SystemTime, touch_ttl: bool) -> StreamLookup {
+        let Some(st) = self.streams.get(path).map(|entry| entry.clone()) else {
+            return StreamLookup::Missing;
+        };
+        if touch_ttl && st.config.ttl_seconds.is_some() {
+            // TTL renewal and retirement's final deadline/fence decision must
+            // use the same exclusive guard.
+            let mut shared = st.shared.write().unwrap();
+            if shared.soft_deleted {
+                drop(shared);
+                return StreamLookup::Gone(st);
+            }
+            if st.fenced.load(Ordering::Acquire) || st.is_expired_with(&shared, now) {
+                let _ =
+                    st.fenced
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+                st.meta_dirty.store(false, Ordering::Release);
+                drop(shared);
+                st.publish_retirement_fence_wake();
+                return StreamLookup::Expired(self.candidate_for(&st));
+            }
+            shared.last_access = now;
+            drop(shared);
+            return StreamLookup::Live(st);
+        }
+
+        // HEAD/control paths and streams without a sliding TTL stay on the
+        // shared read lock in the overwhelmingly common live case.
+        let shared = st.shared.read().unwrap();
+        if shared.soft_deleted {
+            drop(shared);
+            return StreamLookup::Gone(st);
+        }
+        if st.fenced.load(Ordering::Acquire) {
+            drop(shared);
+            st.publish_retirement_fence_wake();
+            return StreamLookup::Expired(self.candidate_for(&st));
+        }
+        if !st.is_expired_with(&shared, now) {
+            drop(shared);
+            return StreamLookup::Live(st);
+        }
+        drop(shared);
+
+        // Upgrade only for the due case, then recheck. A racing TTL touch may
+        // have renewed between locks; fencing under this write guard preserves
+        // the touch-vs-retirement linearization.
+        let shared = st.shared.write().unwrap();
+        if shared.soft_deleted {
+            drop(shared);
+            return StreamLookup::Gone(st);
+        }
+        if !st.fenced.load(Ordering::Acquire) && !st.is_expired_with(&shared, now) {
+            drop(shared);
+            return StreamLookup::Live(st);
+        }
+        let _ = st
+            .fenced
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+        st.meta_dirty.store(false, Ordering::Release);
+        drop(shared);
+        st.publish_retirement_fence_wake();
+        StreamLookup::Expired(self.candidate_for(&st))
+    }
+
+    #[allow(dead_code)]
+    pub fn get_at(&self, path: &str, now: SystemTime) -> Option<Arc<StreamState>> {
+        match self.lookup_at(path, now, false) {
+            StreamLookup::Missing => None,
+            StreamLookup::Gone(st) | StreamLookup::Live(st) => Some(st),
+            StreamLookup::Expired(candidate) => {
+                // Compatibility path for synchronous internal callers. New HTTP
+                // paths use lookup_at + prepare/transition/finish so a path is not
+                // reused before subscription deletion persists.
+                if candidate.stream.inflight_appends.load(Ordering::Acquire) == 0 {
+                    candidate.stream.publish_retirement_fence_wake();
+                    let _ =
+                        self.finish_retirement_blocking(&candidate, RetirementDurability::Expiry);
+                }
+                None
+            }
+        }
+    }
+
+    pub async fn prepare_expiry_retirement(
+        &self,
+        candidate: &ExpiryCandidate,
+        now: SystemTime,
+    ) -> PrepareRetirement {
+        if !self.is_current(candidate) {
+            candidate.clear_queued();
+            return PrepareRetirement::Stale;
+        }
+        {
+            let shared = candidate.stream.shared.read().unwrap();
+            if shared.soft_deleted
+                && !(shared.ref_count == 0 && candidate.stream.fenced.load(Ordering::Acquire))
+            {
+                candidate.clear_queued();
+                return PrepareRetirement::Gone;
+            }
+            if !candidate.stream.fenced.load(Ordering::Acquire)
+                && !candidate.stream.is_expired_with(&shared, now)
+            {
+                candidate.clear_queued();
+                return PrepareRetirement::Renewed;
+            }
+        }
+
+        let appender = candidate.stream.appender.lock().await;
+        if !self.is_current(candidate) {
+            candidate.clear_queued();
+            return PrepareRetirement::Stale;
+        }
+        {
+            let shared = candidate.stream.shared.read().unwrap();
+            if shared.soft_deleted
+                && !(shared.ref_count == 0 && candidate.stream.fenced.load(Ordering::Acquire))
+            {
+                candidate.clear_queued();
+                return PrepareRetirement::Gone;
+            }
+            if !candidate.stream.fenced.load(Ordering::Acquire) {
+                if !candidate.stream.is_expired_with(&shared, now) {
+                    candidate.clear_queued();
+                    return PrepareRetirement::Renewed;
+                }
+                // Hold shared through the final check and the fence store so a
+                // request-time TTL touch cannot interleave between them.
+                candidate.stream.fenced.store(true, Ordering::Release);
+            }
+        }
+        candidate.stream.meta_dirty.store(false, Ordering::Release);
+        drop(appender);
+        candidate.stream.publish_retirement_fence_wake();
+        candidate.stream.wait_for_inflight_appends().await;
+        PrepareRetirement::Ready
+    }
+
+    pub async fn prepare_delete(&self, st: &Arc<StreamState>) -> PrepareRetirement {
+        let candidate = self.candidate_for(st);
+        if !self.is_current(&candidate) {
+            return PrepareRetirement::Stale;
+        }
+        let appender = st.appender.lock().await;
+        if !self.is_current(&candidate) {
+            return PrepareRetirement::Stale;
+        }
+        {
+            let shared = st.shared.read().unwrap();
+            if shared.soft_deleted {
+                return PrepareRetirement::Gone;
+            }
+            st.fenced.store(true, Ordering::Release);
+        }
+        st.meta_dirty.store(false, Ordering::Release);
+        drop(appender);
+        st.publish_retirement_fence_wake();
+        st.wait_for_inflight_appends().await;
+        PrepareRetirement::Ready
+    }
+
+    /// Complete retirement after the caller has persisted the path-scoped
+    /// subscription transition. Physical work is isolated on the blocking pool;
+    /// WAL bookkeeping is forgotten only for a hard retirement.
+    pub async fn finish_retirement(
+        self: &Arc<Self>,
+        candidate: &ExpiryCandidate,
+        durability: RetirementDurability,
+    ) -> std::io::Result<RetirementStep> {
+        let store = Arc::clone(self);
+        let work = candidate.clone();
+        let physical = tokio::task::spawn_blocking(move || {
+            store.finish_retirement_blocking_once(&work, durability)
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("retirement worker failed: {error}")))??;
+
+        if physical.outcome == RetirementOutcome::Reaped {
+            // The data and sidecar must be gone before WAL tail proof is
+            // forgotten. Until both succeed, keep the exact fenced entry mapped
+            // and queued so retry is identity-safe and idempotent.
+            if let Some(wal) = self.wal.get() {
+                wal.forget_stream(&candidate.stream).await?;
+            }
+            self.finalize_hard_retirement(candidate);
+        }
+        Ok(RetirementStep {
+            outcome: physical.outcome,
+            cascade: physical.cascade,
+            reclaimed_local_bytes: physical.reclaimed_local_bytes,
+        })
     }
 
     /// Look up a stream. Expired streams are removed (or soft-deleted when forks
     /// still reference them). Soft-deleted entries ARE returned — callers decide
     /// between 410 (direct ops) and 409 (PUT re-create / fork source).
+    #[allow(dead_code)]
     pub fn get(&self, path: &str) -> Option<Arc<StreamState>> {
-        let st = self.streams.get(path)?.clone();
-        if st.shared.read().unwrap().soft_deleted {
-            return Some(st);
-        }
-        if st.is_expired() {
-            // Expiry is a removal too: retain the inventory projection until
-            // unlink + parent fsync succeeds, just like an acknowledged DELETE.
-            let _ = self.delete_or_soft_delete_durable(&st);
-            return None;
-        }
-        Some(st)
+        self.get_at(path, SystemTime::now())
     }
 
     /// Hard-delete when nothing references the stream; soft-delete otherwise.
@@ -1087,11 +2013,85 @@ impl Store {
     /// soft-delete meta flag — are durable on disk before this returns, so a
     /// post-ack crash can never resurrect the stream. Synchronous file I/O +
     /// fsync: call from a blocking context.
+    #[allow(dead_code)]
     pub fn delete_or_soft_delete_durable(&self, st: &Arc<StreamState>) -> std::io::Result<()> {
         self.delete_impl(st, true)
     }
 
     fn delete_impl(&self, st: &Arc<StreamState>, durable: bool) -> std::io::Result<()> {
+        {
+            let shared = st.shared.read().unwrap();
+            st.fenced.store(true, Ordering::Release);
+            drop(shared);
+        }
+        st.meta_dirty.store(false, Ordering::Release);
+        st.publish_retirement_fence_wake();
+        if st.inflight_appends.load(Ordering::Acquire) != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "stream retirement is waiting for in-flight appends",
+            ));
+        }
+        let candidate = self.candidate_for(st);
+        self.finish_retirement_blocking(
+            &candidate,
+            if durable {
+                RetirementDurability::Explicit
+            } else {
+                RetirementDurability::Expiry
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_retirement_blocking(
+        &self,
+        candidate: &ExpiryCandidate,
+        durability: RetirementDurability,
+    ) -> std::io::Result<RetirementOutcome> {
+        let mut current = candidate.clone();
+        let mut hard = Vec::new();
+        loop {
+            let step = self.finish_retirement_blocking_once(&current, durability)?;
+            match step.outcome {
+                RetirementOutcome::SoftDeleted => return Ok(step.outcome),
+                RetirementOutcome::Reaped => hard.push(current),
+            }
+            match step.cascade {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        for retired in hard {
+            self.finalize_hard_retirement(&retired);
+        }
+        Ok(RetirementOutcome::Reaped)
+    }
+
+    fn finish_retirement_blocking_once(
+        &self,
+        candidate: &ExpiryCandidate,
+        durability: RetirementDurability,
+    ) -> std::io::Result<PhysicalRetirementStep> {
+        let st = &candidate.stream;
+        if !st.fenced.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "retirement completion requires a fenced stream",
+            ));
+        }
+        if st.inflight_appends.load(Ordering::Acquire) != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "stream retirement is waiting for in-flight appends",
+            ));
+        }
+
+        // Serialize the refcount decision with fork source reservation and all
+        // sidecar writers. A reservation that won before the fence completes
+        // (or rolls back) before this decision; ordinary appender activity is
+        // deliberately unrelated.
+        let _meta = st.meta_lock.lock().unwrap_or_else(|e| e.into_inner());
         let soft = {
             let mut s = st.shared.write().unwrap();
             if s.ref_count > 0 {
@@ -1102,86 +2102,147 @@ impl Store {
             }
         };
         if soft {
-            if durable {
-                #[cfg(test)]
-                if DELETE_FAULT.load(Ordering::Relaxed) == 1 {
-                    st.shared.write().unwrap().soft_deleted = false;
-                    return Err(std::io::Error::other(
-                        "injected soft-delete metadata failure",
-                    ));
-                }
-                if let Err(error) = write_meta_sync(st, true) {
-                    st.shared.write().unwrap().soft_deleted = false;
-                    return Err(error);
-                }
-                self.publish_inventory(st);
-            } else {
-                let st2 = st.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = write_meta_sync(&st2, true);
-                });
+            #[cfg(test)]
+            if DELETE_FAULT.load(Ordering::Relaxed) == 1 {
+                st.shared.write().unwrap().soft_deleted = false;
+                return Err(std::io::Error::other(
+                    "injected soft-delete metadata failure",
+                ));
             }
+            if let Err(error) =
+                write_meta_sync_locked(st, durability == RetirementDurability::Explicit, true)
+            {
+                st.shared.write().unwrap().soft_deleted = false;
+                return Err(error);
+            }
+            self.publish_inventory(st);
+            self.unregister_expiring(candidate.stream_id);
+            candidate.clear_queued();
+            Ok(PhysicalRetirementStep {
+                outcome: RetirementOutcome::SoftDeleted,
+                cascade: None,
+                reclaimed_local_bytes: 0,
+            })
         } else {
-            // Reclaim this stream's offloaded segments (remote objects + any
-            // staged local chunk files) — safe only here, on a true hard delete
-            // with no remaining fork references.
-            self.gc_remote_segments(st);
             let fp = st.file_path.clone();
-            if durable {
+            let reclaimed_local_bytes = {
+                // The metadata barrier acquired above stays held through unlink
+                // so no deferred writer can recreate the sidecar afterwards.
                 #[cfg(test)]
                 if DELETE_FAULT.load(Ordering::Relaxed) == 2 {
                     return Err(std::io::Error::other(
                         "injected hard-delete durability failure",
                     ));
                 }
-                // Both unlinks live in the same directory; one dir fsync makes
-                // them crash-durable together.
-                let _ = std::fs::remove_file(meta_path(&fp));
-                let _ = std::fs::remove_file(&fp);
-                fsync_parent_dir(&fp)?;
-                self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
-                self.remove_inventory(&st.path);
-            } else {
-                tokio::task::spawn_blocking(move || {
-                    let _ = std::fs::remove_file(meta_path(&fp));
-                    let _ = std::fs::remove_file(fp);
-                });
-                self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
-                self.remove_inventory(&st.path);
-            }
-            self.release_parent(st);
+                let mut reclaimed = remove_file_if_present_measured(&meta_path(&fp))?;
+                reclaimed = reclaimed.saturating_add(remove_file_if_present_measured(&fp)?);
+                if durability == RetirementDurability::Explicit {
+                    fsync_parent_dir(&fp)?;
+                }
+                reclaimed
+            };
+            // Safe only after a true hard delete with no remaining fork refs.
+            self.gc_remote_segments(st);
+            let cascade = self.release_parent_once(st, durability)?;
+            Ok(PhysicalRetirementStep {
+                outcome: RetirementOutcome::Reaped,
+                cascade,
+                reclaimed_local_bytes,
+            })
         }
-        Ok(())
     }
 
-    /// Decrement the parent's fork refcount; cascade-collect soft-deleted parents
-    /// whose last fork just went away.
-    pub fn release_parent(&self, st: &Arc<StreamState>) {
-        let mut cur = st.parent.clone();
-        while let Some(parent) = cur {
-            let gone = {
-                let mut s = parent.shared.write().unwrap();
-                s.ref_count = s.ref_count.saturating_sub(1);
-                s.soft_deleted && s.ref_count == 0
-            };
-            if !gone {
-                // Persist the decremented refcount.
-                let p2 = parent.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = write_meta_sync(&p2, true);
-                });
-                break;
-            }
-            self.streams
-                .remove_if(&parent.path, |_, v| Arc::ptr_eq(v, &parent));
-            self.gc_remote_segments(&parent);
-            let fp = parent.file_path.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = std::fs::remove_file(meta_path(&fp));
-                let _ = std::fs::remove_file(fp);
-            });
-            cur = parent.parent.clone();
+    fn finalize_hard_retirement(&self, candidate: &ExpiryCandidate) {
+        let st = &candidate.stream;
+        self.streams
+            .remove_if(&st.path, |_, current| Arc::ptr_eq(current, st));
+        self.remove_inventory(&st.path, candidate.stream_id);
+        self.unregister_expiring(candidate.stream_id);
+        self.recovered_retirements
+            .lock()
+            .unwrap()
+            .by_id
+            .remove(&candidate.stream_id);
+        candidate.clear_queued();
+    }
+
+    /// Decrement one parent's fork refcount. A zero-reference soft parent is
+    /// returned as the next exact candidate; the bounded coordinator performs
+    /// its WAL and physical cleanup before any path in the chain is reusable.
+    fn release_parent_once(
+        &self,
+        st: &Arc<StreamState>,
+        durability: RetirementDurability,
+    ) -> std::io::Result<Option<ExpiryCandidate>> {
+        let Some(parent) = st.parent.clone() else {
+            return Ok(None);
+        };
+        if st
+            .parent_released
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            let shared = parent.shared.read().unwrap();
+            return Ok(
+                (shared.soft_deleted && shared.ref_count == 0).then(|| self.candidate_for(&parent))
+            );
         }
+        // Child retirement already holds the child's metadata barrier. Taking
+        // the parent's barrier here is the established leaf-to-root lifecycle
+        // order; fork creation can take source then child only while that child
+        // is still unpublished, so no live operation can acquire the reverse
+        // pair. Besides serializing retirement and fork reservations, this lets
+        // us merge only the authoritative refcount into the durable sidecar:
+        // a live parent append may have speculative close/dedupe/TTL fields in
+        // `Shared` while it is still waiting for WAL durability.
+        let _parent_meta = parent
+            .meta_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let gone = {
+            let mut shared = parent.shared.write().unwrap();
+            shared.ref_count = shared.ref_count.saturating_sub(1);
+            shared.soft_deleted && shared.ref_count == 0
+        };
+        if gone {
+            let was_meta_dirty = parent.meta_dirty.swap(false, Ordering::AcqRel);
+            // Expiry normally permits an unlink to be undone by a crash. The
+            // zero-ref parent transition is different: once persisted, recovery
+            // may collect the parent. Make the child's prior unlink durable
+            // first (important when stream lanes put child and parent in
+            // different directories), so recovery can never observe a live
+            // child beside a durably zero-reference parent.
+            if durability == RetirementDurability::Expiry {
+                if let Err(error) = fsync_parent_dir(&st.file_path) {
+                    parent.shared.write().unwrap().ref_count += 1;
+                    parent.meta_dirty.store(was_meta_dirty, Ordering::Release);
+                    st.parent_released.store(false, Ordering::Release);
+                    return Err(error);
+                }
+            }
+            // This is the authoritative transition that makes a recovered soft
+            // tombstone independently collectible. Persist and directory-sync
+            // it before handing the parent to a separately paced cascade step;
+            // a crash in that gap must not restore a phantom reference.
+            if let Err(error) = write_ref_count_meta_sync_locked(&parent, true) {
+                parent.shared.write().unwrap().ref_count += 1;
+                parent.meta_dirty.store(was_meta_dirty, Ordering::Release);
+                st.parent_released.store(false, Ordering::Release);
+                return Err(error);
+            }
+            return Ok(Some(self.candidate_for(&parent)));
+        }
+        // Persist only the decremented refcount. This also works for a retained
+        // fenced parent because the narrow lifecycle merge intentionally does
+        // not apply the ordinary full-snapshot fence check.
+        if let Err(error) =
+            write_ref_count_meta_sync_locked(&parent, durability == RetirementDurability::Explicit)
+        {
+            parent.shared.write().unwrap().ref_count += 1;
+            st.parent_released.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(None)
     }
 
     pub fn create(
@@ -1192,16 +2253,25 @@ impl Store {
         base_offset: u64,
     ) -> std::io::Result<CreateResult> {
         use dashmap::mapref::entry::Entry;
-        // Fast path: existing stream → config comparison.
-        if let Some(existing) = self.get(path) {
-            if existing.shared.read().unwrap().soft_deleted {
-                return Ok(CreateResult::Conflict);
-            }
-            return Ok(if config_matches(&existing, &config) {
-                CreateResult::Exists(existing)
-            } else {
-                CreateResult::Conflict
-            });
+        // Published streams need no creation serialization.
+        if let Some(existing) = self.streams.get(path).map(|entry| entry.clone()) {
+            return Ok(self.evaluate_existing_create(existing, &config, SystemTime::now()));
+        }
+
+        // The path stripe, not the DashMap shard, serializes same-path PUTs.
+        // Retain it through durable sidecar publication so no second creator
+        // can observe the path as absent and start a competing transaction.
+        let stripe = self.streams.hash_usize(&path) & (CREATE_PATH_LOCK_STRIPES - 1);
+        let _creation = self.creation_stripes[stripe]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        // Recheck after acquiring the stripe: a creator that won while this
+        // thread was waiting has now durably published its state. A retiring
+        // incarnation stays mapped and fenced until exact finalization, so this
+        // check also prevents path reuse from racing physical retirement.
+        if let Some(existing) = self.streams.get(path).map(|entry| entry.clone()) {
+            return Ok(self.evaluate_existing_create(existing, &config, SystemTime::now()));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let fname = format!("{}~{}", encode_path(path), id);
@@ -1219,6 +2289,7 @@ impl Store {
             bytes: base_offset,
             closed,
         });
+        let (deleted_tx, _) = watch::channel(false);
         let state = Arc::new(StreamState {
             id,
             path: path.to_string(),
@@ -1248,6 +2319,13 @@ impl Store {
                 soft_deleted: false,
             }),
             tail_tx,
+            fenced: AtomicBool::new(false),
+            inflight_appends: AtomicUsize::new(0),
+            inflight_appends_zero: Notify::new(),
+            retirement_queued: AtomicBool::new(false),
+            wal_forgotten: AtomicBool::new(false),
+            parent_released: AtomicBool::new(false),
+            deleted_tx,
             meta_dirty: AtomicBool::new(false),
             // Epoch 0 < the shard's initial epoch (1), so the first append
             // registers this stream into the dirty set.
@@ -1261,66 +2339,322 @@ impl Store {
             sse_subs: StdMutex::new(None),
             config,
         });
-        match self.streams.entry(path.to_string()) {
-            Entry::Occupied(e) => {
-                // Lost a race; compare against the winner.
-                let existing = e.get().clone();
-                let fp = state.file_path.clone();
-                let _ = std::fs::remove_file(fp);
-                if existing.shared.read().unwrap().soft_deleted {
-                    return Ok(CreateResult::Conflict);
-                }
-                Ok(if config_matches(&existing, &state.config) {
-                    CreateResult::Exists(existing)
-                } else {
-                    CreateResult::Conflict
-                })
+        // Serialize the source refcount sidecar transaction with physical
+        // retirement, but never with ordinary appends. The shared write lock is
+        // the fence/ref reservation linearization: if this increment wins,
+        // retirement later observes the ref and soft-deletes; if the fence
+        // wins, creation rejects the source.
+        let _parent_meta = parent.as_ref().map(|parent| {
+            parent
+                .meta_lock
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        });
+        if let Some(parent) = &parent {
+            let mut shared = parent.shared.write().unwrap();
+            let unavailable = parent.fenced.load(Ordering::Acquire)
+                || shared.soft_deleted
+                || parent.is_expired_with(&shared, SystemTime::now());
+            if unavailable {
+                drop(shared);
+                let _ = std::fs::remove_file(&state.file_path);
+                return Ok(CreateResult::SourceUnavailable);
             }
-            Entry::Vacant(v) => {
-                v.insert(state.clone());
-                // Take the fork reference only once insertion has succeeded, so
-                // rejected/raced creates never leak a refcount on the source.
-                let created = (|| -> std::io::Result<()> {
-                    if let Some(p) = &parent {
-                        p.shared.write().unwrap().ref_count += 1;
-                        if let Err(e) = write_meta_sync(p, true) {
-                            p.shared.write().unwrap().ref_count -= 1;
-                            return Err(e);
-                        }
-                    }
-                    if let Err(e) = write_meta_sync(&state, true) {
-                        if let Some(p) = &parent {
-                            p.shared.write().unwrap().ref_count -= 1;
-                            let _ = write_meta_sync(p, true);
-                        }
-                        return Err(e);
-                    }
-                    Ok(())
-                })();
-                if let Err(e) = created {
-                    // UNDO the create: without a durable sidecar the stream must
-                    // not stay live — WAL mode would happily ack appends to it,
-                    // and the next boot would treat the sidecar-less data file as
-                    // an orphan and delete it (acked appends destroyed after a
-                    // create the client saw fail).
-                    self.streams
-                        .remove_if(&state.path, |_, cur| Arc::ptr_eq(cur, &state));
-                    let _ = std::fs::remove_file(&state.file_path);
+            shared.ref_count += 1;
+            drop(shared);
+        }
+        #[cfg(test)]
+        pause_create_before_meta_and_inject_failure(&state);
+        // Persist only the source's refcount field from its existing durable
+        // sidecar. An admitted append may already have mutated close/dedupe/TTL
+        // fields in `Shared` while it waits for WAL durability; a full
+        // Meta::capture here would make that unacknowledged snapshot durable as
+        // a side effect of forking. The source metadata barrier still
+        // serializes this narrow merge with retirement and every other sidecar
+        // writer.
+        //
+        // The child remains unpublished until both writes are durable, so
+        // rollback cannot erase an acknowledged child append. A reservation
+        // that linearized just before a retirement fence is still authoritative:
+        // the narrow writer deliberately does not reject a now-fenced source.
+        let created = (|| -> std::io::Result<()> {
+            if let Some(p) = &parent {
+                if let Err(e) = write_ref_count_meta_sync_locked(p, true) {
+                    let mut shared = p.shared.write().unwrap();
+                    shared.ref_count = shared.ref_count.saturating_sub(1);
+                    drop(shared);
+                    let _ = write_ref_count_meta_sync_locked(p, true);
                     return Err(e);
                 }
-                self.publish_inventory(&state);
-                Ok(CreateResult::Created(state))
+            }
+            if let Err(e) = write_meta_sync(&state, true) {
+                if let Some(p) = &parent {
+                    let mut shared = p.shared.write().unwrap();
+                    shared.ref_count = shared.ref_count.saturating_sub(1);
+                    drop(shared);
+                    let _ = write_ref_count_meta_sync_locked(p, true);
+                }
+                return Err(e);
+            }
+            Ok(())
+        })();
+        if let Err(e) = created {
+            // The state was never published, so rollback only has unpublished
+            // local artifacts to undo.
+            let _ = std::fs::remove_file(&state.file_path);
+            return Err(e);
+        }
+
+        // Make the short registry + projection publication atomic with respect
+        // to physical retirement. Once the state enters `streams`, retirement
+        // can discover and fence it, but cannot pass its metadata barrier until
+        // inventory and expiration registration are both visible.
+        let publication_meta = state
+            .meta_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match self.streams.entry(path.to_string()) {
+            Entry::Vacant(v) => {
+                v.insert(state.clone());
+            }
+            Entry::Occupied(e) => {
+                // All runtime creators take the same path stripe, so this is a
+                // defensive no-replacement branch rather than an expected race.
+                // Release the short DashMap guard before rolling back I/O.
+                let existing = e.get().clone();
+                drop(e);
+                let mut first_error = None;
+                if let Err(error) = remove_file_if_present_measured(&meta_path(&state.file_path)) {
+                    first_error = Some(error);
+                }
+                if let Err(error) = remove_file_if_present_measured(&state.file_path) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                if let Err(error) = fsync_parent_dir(&state.file_path) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                if let Some(p) = &parent {
+                    let previous_ref_count = {
+                        let mut shared = p.shared.write().unwrap();
+                        let previous = shared.ref_count;
+                        shared.ref_count = shared.ref_count.saturating_sub(1);
+                        previous
+                    };
+                    if let Err(error) = write_ref_count_meta_sync_locked(p, true) {
+                        p.shared.write().unwrap().ref_count = previous_ref_count;
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+                if let Some(error) = first_error {
+                    return Err(error);
+                }
+                return Ok(self.evaluate_existing_create(
+                    existing,
+                    &state.config,
+                    SystemTime::now(),
+                ));
             }
         }
+        // Fork source reservation is fully durable, and physical retirement of
+        // the now-visible child remains excluded by `publication_meta`. Release
+        // source-before-child nesting before any test pause or projection work.
+        drop(_parent_meta);
+        #[cfg(test)]
+        pause_create_after_insert(&state);
+        self.publish_inventory(&state);
+        self.register_expiring(&state);
+        drop(publication_meta);
+        Ok(CreateResult::Created(state))
     }
 }
 
 #[cfg(test)]
 static DELETE_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-fn config_matches(existing: &StreamState, requested: &StreamConfig) -> bool {
+#[cfg(test)]
+struct CreateBeforeMetaHook {
+    data_dir: PathBuf,
+    path: String,
+    claimed: AtomicBool,
+    reached: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+static CREATE_BEFORE_META_HOOKS: StdMutex<Vec<Arc<CreateBeforeMetaHook>>> =
+    StdMutex::new(Vec::new());
+
+#[cfg(test)]
+struct CreateBeforeMetaHookGuard {
+    hook: Arc<CreateBeforeMetaHook>,
+}
+
+#[cfg(test)]
+impl CreateBeforeMetaHookGuard {
+    fn reached(&self) {
+        self.hook.reached.wait();
+    }
+
+    fn release(&self) {
+        self.hook.release.wait();
+    }
+}
+
+#[cfg(test)]
+impl Drop for CreateBeforeMetaHookGuard {
+    fn drop(&mut self) {
+        let mut installed = CREATE_BEFORE_META_HOOKS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        installed.retain(|hook| !Arc::ptr_eq(hook, &self.hook));
+    }
+}
+
+#[cfg(test)]
+fn install_create_before_meta_failure_hook(
+    data_dir: &std::path::Path,
+    path: &str,
+) -> CreateBeforeMetaHookGuard {
+    let hook = Arc::new(CreateBeforeMetaHook {
+        data_dir: data_dir.to_path_buf(),
+        path: path.to_owned(),
+        claimed: AtomicBool::new(false),
+        reached: std::sync::Barrier::new(2),
+        release: std::sync::Barrier::new(2),
+    });
+    let mut installed = CREATE_BEFORE_META_HOOKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(
+        !installed.iter().any(|installed| {
+            installed.data_dir == hook.data_dir && installed.path == hook.path
+        }),
+        "a create test hook is already installed for this store and path"
+    );
+    installed.push(Arc::clone(&hook));
+    CreateBeforeMetaHookGuard { hook }
+}
+
+#[cfg(test)]
+fn pause_create_before_meta_and_inject_failure(st: &StreamState) {
+    let hook = CREATE_BEFORE_META_HOOKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .find(|hook| {
+            st.path == hook.path
+                && st.file_path.starts_with(hook.data_dir.join("streams"))
+                && hook
+                    .claimed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+        })
+        .cloned();
+    if let Some(hook) = hook {
+        let tmp = meta_path(&st.file_path).with_extension("meta.tmp");
+        std::fs::create_dir(&tmp).expect("create hook injects a sidecar temp-path failure");
+        hook.reached.wait();
+        hook.release.wait();
+    }
+}
+
+#[cfg(test)]
+struct CreateAfterInsertHook {
+    data_dir: PathBuf,
+    path: String,
+    claimed: AtomicBool,
+    reached: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+static CREATE_AFTER_INSERT_HOOKS: StdMutex<Vec<Arc<CreateAfterInsertHook>>> =
+    StdMutex::new(Vec::new());
+
+#[cfg(test)]
+struct CreateAfterInsertHookGuard {
+    hook: Arc<CreateAfterInsertHook>,
+}
+
+#[cfg(test)]
+impl CreateAfterInsertHookGuard {
+    fn reached(&self) {
+        self.hook.reached.wait();
+    }
+
+    fn release(&self) {
+        self.hook.release.wait();
+    }
+}
+
+#[cfg(test)]
+impl Drop for CreateAfterInsertHookGuard {
+    fn drop(&mut self) {
+        let mut installed = CREATE_AFTER_INSERT_HOOKS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        installed.retain(|hook| !Arc::ptr_eq(hook, &self.hook));
+    }
+}
+
+#[cfg(test)]
+fn install_create_after_insert_hook(
+    data_dir: &std::path::Path,
+    path: &str,
+) -> CreateAfterInsertHookGuard {
+    let hook = Arc::new(CreateAfterInsertHook {
+        data_dir: data_dir.to_path_buf(),
+        path: path.to_owned(),
+        claimed: AtomicBool::new(false),
+        reached: std::sync::Barrier::new(2),
+        release: std::sync::Barrier::new(2),
+    });
+    let mut installed = CREATE_AFTER_INSERT_HOOKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(
+        !installed.iter().any(|installed| {
+            installed.data_dir == hook.data_dir && installed.path == hook.path
+        }),
+        "an after-insert hook is already installed for this store and path"
+    );
+    installed.push(Arc::clone(&hook));
+    CreateAfterInsertHookGuard { hook }
+}
+
+#[cfg(test)]
+fn pause_create_after_insert(st: &StreamState) {
+    let hook = CREATE_AFTER_INSERT_HOOKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .find(|hook| {
+            st.path == hook.path
+                && st.file_path.starts_with(hook.data_dir.join("streams"))
+                && hook
+                    .claimed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+        })
+        .cloned();
+    if let Some(hook) = hook {
+        hook.reached.wait();
+        hook.release.wait();
+    }
+}
+
+fn config_matches_with_closed(
+    existing: &StreamState,
+    requested: &StreamConfig,
+    closed_now: bool,
+) -> bool {
     let ex = &existing.config;
-    let closed_now = existing.shared.read().unwrap().closed;
     media_type(&ex.content_type) == media_type(&requested.content_type)
         && ex.ttl_seconds == requested.ttl_seconds
         && ex.expires_at_raw == requested.expires_at_raw
@@ -1582,11 +2916,78 @@ pub fn meta_path(file_path: &std::path::Path) -> PathBuf {
 
 /// Write the metadata sidecar. `durable` forces an fsync (create/close/delete).
 pub fn write_meta_sync(st: &StreamState, durable: bool) -> std::io::Result<()> {
+    write_meta_sync_inner(st, durable, false)
+}
+
+fn write_meta_sync_allow_fenced(st: &StreamState, durable: bool) -> std::io::Result<()> {
+    write_meta_sync_inner(st, durable, true)
+}
+
+fn write_meta_sync_inner(
+    st: &StreamState,
+    durable: bool,
+    allow_fenced: bool,
+) -> std::io::Result<()> {
     // Serialize per stream so concurrent writers don't race on the temp file or
     // reorder renames (a stale flush must not clobber a durable manifest flip).
     let _g = st.meta_lock.lock().unwrap_or_else(|e| e.into_inner());
+    write_meta_sync_locked(st, durable, allow_fenced)
+}
+
+/// Write metadata while the caller holds `st.meta_lock`. This is used only for
+/// a multi-sidecar lifecycle transaction (fork source reservation + child
+/// create), where retirement must not persist an intermediate refcount.
+fn write_meta_sync_locked(
+    st: &StreamState,
+    durable: bool,
+    allow_fenced: bool,
+) -> std::io::Result<()> {
+    // This check must happen inside `meta_lock`: retirement holds the same lock
+    // through unlink, closing check→unlink→rename sidecar resurrection races.
+    if st.fenced.load(Ordering::Acquire) && !allow_fenced {
+        return Ok(());
+    }
     let meta = Meta::capture(st);
-    let bytes = serde_json::to_vec(&meta).expect("meta serializes");
+    write_meta_value_sync_locked(st, &meta, durable)
+}
+
+/// Merge the in-memory fork refcount into the last durable sidecar without
+/// capturing any other live `Shared` fields. The caller holds `st.meta_lock`,
+/// which makes the read/modify/rename atomic with respect to every full sidecar
+/// writer and the retirement unlink decision.
+fn write_ref_count_meta_sync_locked(st: &StreamState, durable: bool) -> std::io::Result<()> {
+    let final_path = meta_path(&st.file_path);
+    let bytes = std::fs::read(&final_path)?;
+    let mut meta: Meta = serde_json::from_slice(&bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "cannot update fork refcount in {}: {error}",
+                final_path.display()
+            ),
+        )
+    })?;
+    if meta.id != st.id || meta.path != st.path {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "cannot update fork refcount in {}: sidecar identity does not match stream",
+                final_path.display()
+            ),
+        ));
+    }
+    meta.ref_count = st.shared.read().unwrap().ref_count;
+    write_meta_value_sync_locked(st, &meta, durable)
+}
+
+/// Serialize an already-selected metadata snapshot while the caller holds
+/// `st.meta_lock`.
+fn write_meta_value_sync_locked(
+    st: &StreamState,
+    meta: &Meta,
+    durable: bool,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(meta).expect("meta serializes");
     let tmp = meta_path(&st.file_path).with_extension("meta.tmp");
     let final_path = meta_path(&st.file_path);
     {
@@ -1620,6 +3021,19 @@ pub(crate) fn fsync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+fn remove_file_if_present_measured(path: &std::path::Path) -> std::io::Result<u64> {
+    let bytes = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
+    }
+}
+
 impl Store {
     /// Queue a non-durable meta sidecar flush (producer/access updates) for the
     /// next periodic sweep (#4691). Replaces the per-stream 100 ms debounce
@@ -1635,6 +3049,10 @@ impl Store {
     /// the checkpoint owns the flush and the CAS failing here avoids a
     /// duplicate write.
     pub fn mark_meta_dirty(&self, st: &Arc<StreamState>) {
+        if st.is_fenced() {
+            st.meta_dirty.store(false, Ordering::Release);
+            return;
+        }
         if st
             .meta_dirty
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1652,6 +3070,10 @@ impl Store {
         let drained: Vec<Arc<StreamState>> = std::mem::take(&mut *self.meta_sweep.lock().unwrap());
         let mut n = 0;
         for st in drained {
+            if st.is_fenced() {
+                st.meta_dirty.store(false, Ordering::Release);
+                continue;
+            }
             // A hard-deleted stream's files are already unlinked — flushing
             // would resurrect its sidecar. Same `Arc` identity check as
             // delete's `remove_if`. (Soft-deleted streams stay in the map and
@@ -2721,6 +4143,11 @@ mod meta_sweep_tests {
     use super::*;
     use crate::tier::TierConfig;
 
+    // DELETE_FAULT is a process-global test hook. Serialize the two tests that
+    // manipulate it so a parallel test cannot clear another test's injected
+    // failure between the operation and its publication-order assertion.
+    static DELETE_FAULT_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
     fn tmp_dir(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "ds-meta-sweep-{tag}-{}-{}",
@@ -2764,7 +4191,7 @@ mod meta_sweep_tests {
     #[tokio::test]
     async fn mark_dedupes_and_sweep_flushes() {
         let dir = tmp_dir("flush");
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         let st = create(&store, "s");
 
         st.shared.write().unwrap().producers.insert(
@@ -2823,6 +4250,9 @@ mod meta_sweep_tests {
 
     #[test]
     fn durable_delete_faults_preserve_inventory_publication_order() {
+        let _fault_guard = DELETE_FAULT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tmp_dir("inventory-delete-fault");
         let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
         let soft = create(&store, "soft");
@@ -2850,6 +4280,9 @@ mod meta_sweep_tests {
 
     #[test]
     fn expiry_keeps_inventory_until_durable_unlink_succeeds() {
+        let _fault_guard = DELETE_FAULT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tmp_dir("expiry-delete-fault");
         let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
         let mut config = octet_cfg();
@@ -2868,5 +4301,1441 @@ mod meta_sweep_tests {
         let (_, entries, _) = store.inventory_page(None, None, 10).unwrap();
         assert!(!entries.iter().any(|entry| entry.path == "expired"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------- expiration reaper tests ----------------
+
+#[cfg(test)]
+mod expiration_reaper_tests {
+    use super::*;
+    use crate::tier::TierConfig;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ds-expiry-reaper-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn config(ttl_seconds: Option<u64>, expires_at: Option<SystemTime>) -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds,
+            expires_at,
+            expires_at_raw: expires_at.map(|_| "test-time".into()),
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    fn create(
+        store: &Store,
+        path: &str,
+        ttl_seconds: Option<u64>,
+        expires_at: Option<SystemTime>,
+    ) -> Arc<StreamState> {
+        match store
+            .create(path, config(ttl_seconds, expires_at), None, 0)
+            .unwrap()
+        {
+            CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        }
+    }
+
+    #[test]
+    fn canonical_deadline_is_strict_and_overflow_safe() {
+        let dir = tmp_dir("deadlines");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let base = UNIX_EPOCH + Duration::from_secs(10);
+
+        let ttl = create(&store, "ttl", Some(5), None);
+        ttl.shared.write().unwrap().last_access = base;
+        assert_eq!(ttl.expiry_deadline(), Some(base + Duration::from_secs(5)));
+        assert!(!ttl.is_expired_at(base + Duration::from_secs(5)));
+        assert!(ttl.is_expired_at(base + Duration::from_secs(5) + Duration::from_nanos(1)));
+
+        let absolute = create(&store, "absolute", None, Some(base));
+        absolute.shared.write().unwrap().last_access = base + Duration::from_secs(100);
+        assert_eq!(absolute.expiry_deadline(), Some(base));
+        assert!(!absolute.is_expired_at(base));
+        assert!(absolute.is_expired_at(base + Duration::from_nanos(1)));
+
+        let before_epoch = UNIX_EPOCH - Duration::from_secs(10);
+        let ancient = create(&store, "ancient", None, Some(before_epoch));
+        assert!(ancient.is_expired_at(UNIX_EPOCH - Duration::from_secs(9)));
+
+        let huge = create(&store, "huge", Some(u64::MAX), None);
+        huge.shared.write().unwrap().last_access = UNIX_EPOCH + Duration::from_secs(1);
+        assert_eq!(huge.expiry_deadline(), None);
+        assert!(!huge.is_expired_at(SystemTime::now()));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn expiring_index_is_exact_and_scans_in_bounded_round_robin_pages() {
+        let dir = tmp_dir("index");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let permanent = create(&store, "permanent", None, None);
+        let a = create(&store, "a", Some(1), None);
+        let b = create(&store, "b", None, Some(now - Duration::from_secs(1)));
+        let c = create(&store, "c", Some(1), None);
+        a.shared.write().unwrap().last_access = now - Duration::from_secs(2);
+        c.shared.write().unwrap().last_access = now - Duration::from_secs(2);
+
+        assert_eq!(store.expiring_stream_count(), 3);
+        for _ in 0..100 {
+            assert!(a.touch_if_live_at(now - Duration::from_secs(2)));
+        }
+        assert_eq!(
+            store.expiring_stream_count(),
+            3,
+            "touches never grow the index"
+        );
+
+        let mut cursor = ExpiryScanCursor::default();
+        let first = store.scan_expiring(&mut cursor, 2, now);
+        assert_eq!(first.checked, 2);
+        assert!(first.due.len() <= 2);
+        if let Some(candidate) = first.due.first() {
+            assert!(candidate.try_mark_queued());
+            assert!(
+                !candidate.try_mark_queued(),
+                "queue admission is deduplicated"
+            );
+            candidate.clear_queued();
+        }
+        let second = store.scan_expiring(&mut cursor, 2, now);
+        assert!(second.checked <= 2);
+        assert!(second.completed_pass);
+        let seen: HashSet<_> = first
+            .due
+            .iter()
+            .chain(second.due.iter())
+            .map(ExpiryCandidate::stream_id)
+            .collect();
+        assert_eq!(seen, HashSet::from([a.id, b.id, c.id]));
+        assert!(!seen.contains(&permanent.id));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lazy_expiry_and_retirement_remove_the_same_index_entry() {
+        let dir = tmp_dir("lazy");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let st = create(&store, "lazy", Some(1), None);
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        st.shared.write().unwrap().last_access = now - Duration::from_secs(2);
+        assert_eq!(store.expiring_stream_count(), 1);
+
+        assert!(store.get_at("lazy", now).is_none());
+        assert!(st.is_fenced());
+        assert_eq!(store.expiring_stream_count(), 0);
+        assert!(!st.file_path.exists());
+        assert!(!meta_path(&st.file_path).exists());
+        write_meta_sync(&st, false).unwrap();
+        assert!(
+            !meta_path(&st.file_path).exists(),
+            "a deferred writer cannot resurrect sidecar after the fence"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lookup_fence_winner_immediately_publishes_sticky_deletion() {
+        let dir = tmp_dir("lookup-fence-wake");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let st = create(&store, "stream", None, Some(now - Duration::from_secs(1)));
+        let mut deleted = st.subscribe_deleted();
+        let mut tail = st.tail_tx.subscribe();
+        assert!(!*deleted.borrow_and_update());
+        let _ = tail.borrow_and_update();
+
+        assert!(matches!(
+            store.lookup_at("stream", now, false),
+            StreamLookup::Expired(_)
+        ));
+        assert!(st.is_fenced());
+        assert!(
+            *deleted.borrow_and_update(),
+            "lookup must publish sticky deletion before paced retirement admission"
+        );
+        assert!(
+            tail.has_changed().unwrap(),
+            "lookup must also wake tail-based long polls"
+        );
+
+        // A lookup that only observes an existing fence is not the transition
+        // winner and need not publish another wake.
+        let _ = tail.borrow_and_update();
+        assert!(matches!(
+            store.lookup_at("stream", now, false),
+            StreamLookup::Expired(_)
+        ));
+        assert!(!tail.has_changed().unwrap());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn prepare_fence_wakes_before_waiting_for_inflight_append_drain() {
+        let dir = tmp_dir("prepare-fence-wake");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let base = UNIX_EPOCH + Duration::from_secs(100);
+        let st = create(&store, "stream", Some(1), None);
+        st.shared.write().unwrap().last_access = base;
+        let appender = st.appender.lock().await;
+        let append = st.begin_append_at(base).unwrap();
+        drop(appender);
+        let candidate = store.candidate_for(&st);
+        let mut deleted = st.subscribe_deleted();
+
+        let mut prepare =
+            Box::pin(store.prepare_expiry_retirement(&candidate, base + Duration::from_secs(2)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut prepare)
+                .await
+                .is_err(),
+            "prepare must remain pending while the append guard is live"
+        );
+        assert!(st.is_fenced());
+        assert!(
+            *deleted.borrow_and_update(),
+            "the fence wake must not wait for append drain or paced cleanup"
+        );
+
+        drop(append);
+        assert_eq!(prepare.await, PrepareRetirement::Ready);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn expiry_fence_waits_for_full_append_guard_and_blocks_publication() {
+        let dir = tmp_dir("append-race");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let deadline = UNIX_EPOCH + Duration::from_secs(100);
+        let st = create(&store, "append-race", None, Some(deadline));
+
+        let appender = st.appender.lock().await;
+        let append = st
+            .begin_append_at(deadline)
+            .expect("append starts at the exact live boundary");
+        drop(appender);
+
+        let mut cursor = ExpiryScanCursor::default();
+        let candidate = store
+            .scan_expiring(&mut cursor, 1, deadline + Duration::from_nanos(1))
+            .due
+            .pop()
+            .unwrap();
+        let store2 = store.clone();
+        let fence = tokio::spawn(async move {
+            store2
+                .prepare_expiry_retirement(&candidate, deadline + Duration::from_nanos(1))
+                .await
+        });
+
+        while !st.is_fenced() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !fence.is_finished(),
+            "retirement waits for the ack-path guard"
+        );
+        assert!(
+            !append.may_publish(),
+            "a fenced append cannot publish or acknowledge"
+        );
+        drop(append);
+        assert_eq!(fence.await.unwrap(), PrepareRetirement::Ready);
+        assert!(
+            *st.subscribe_deleted().borrow(),
+            "deletion wake remains sticky for late subscribers"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn renewed_and_stale_candidates_cannot_retire_the_wrong_incarnation() {
+        let dir = tmp_dir("identity");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let old = create(&store, "same", Some(10), None);
+        old.shared.write().unwrap().last_access = now - Duration::from_secs(11);
+        let mut cursor = ExpiryScanCursor::default();
+        let candidate = store.scan_expiring(&mut cursor, 1, now).due.pop().unwrap();
+
+        assert!(old.touch_if_live_at(now - Duration::from_secs(1)));
+        assert_eq!(
+            store.prepare_expiry_retirement(&candidate, now).await,
+            PrepareRetirement::Renewed
+        );
+        assert!(!old.is_fenced());
+
+        old.shared.write().unwrap().last_access = now - Duration::from_secs(11);
+        let mut cursor = ExpiryScanCursor::default();
+        let stale = store.scan_expiring(&mut cursor, 1, now).due.pop().unwrap();
+        store.streams.remove("same");
+        let replacement = create(&store, "same", None, None);
+        assert_eq!(
+            store.prepare_expiry_retirement(&stale, now).await,
+            PrepareRetirement::Stale
+        );
+        assert!(!replacement.is_fenced());
+        let (_, inventory, _) = store.inventory_page(None, None, 10).unwrap();
+        assert!(inventory.iter().any(|entry| entry.path == "same"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn expiring_fork_parent_soft_deletes_and_leaves_child_live() {
+        let dir = tmp_dir("fork");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let parent = create(&store, "parent", Some(1), None);
+        let child = match store
+            .create("child", config(None, None), Some(parent.clone()), 0)
+            .unwrap()
+        {
+            CreateResult::Created(st) => st,
+            _ => panic!("fork create failed"),
+        };
+        parent.shared.write().unwrap().last_access = now - Duration::from_secs(2);
+        let mut cursor = ExpiryScanCursor::default();
+        let candidate = store.scan_expiring(&mut cursor, 1, now).due.pop().unwrap();
+        assert_eq!(
+            store.prepare_expiry_retirement(&candidate, now).await,
+            PrepareRetirement::Ready
+        );
+        assert_eq!(
+            store
+                .finish_retirement(&candidate, RetirementDurability::Expiry)
+                .await
+                .unwrap()
+                .outcome,
+            RetirementOutcome::SoftDeleted
+        );
+        assert!(parent.shared.read().unwrap().soft_deleted);
+        assert!(parent.file_path.exists());
+        assert!(store.get_at("child", now).is_some());
+        assert_eq!(store.expiring_stream_count(), 0);
+
+        store
+            .delete_or_soft_delete_durable(&child)
+            .expect("deleting final child collects parent");
+        assert!(!parent.file_path.exists());
+        assert!(!meta_path(&parent.file_path).exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn expired_create_keeps_old_incarnation_until_coordinated_finish() {
+        let dir = tmp_dir("create-expired");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let old = create(&store, "same", Some(1), None);
+        old.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(2);
+
+        let candidate = match store.create("same", config(None, None), None, 0).unwrap() {
+            CreateResult::Expired(candidate) => candidate,
+            _ => panic!("expired path must remain coordinated, not be recreated inline"),
+        };
+        assert_eq!(candidate.stream_id(), old.id);
+        assert!(store
+            .streams
+            .get("same")
+            .is_some_and(|current| Arc::ptr_eq(current.value(), &old)));
+
+        assert_eq!(
+            store
+                .prepare_expiry_retirement(&candidate, SystemTime::now())
+                .await,
+            PrepareRetirement::Ready
+        );
+        assert_eq!(
+            store
+                .finish_retirement(&candidate, RetirementDurability::Expiry)
+                .await
+                .unwrap()
+                .outcome,
+            RetirementOutcome::Reaped
+        );
+        let replacement = create(&store, "same", None, None);
+        assert_ne!(replacement.id, old.id);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn hard_retirement_reports_unlinked_local_bytes() {
+        use std::io::Write;
+
+        let dir = tmp_dir("reclaimed-bytes");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let st = create(&store, "bytes", None, None);
+        {
+            let mut appender = st.appender.lock().await;
+            (&*appender.file).write_all(b"reclaimed").unwrap();
+            appender.written = 9;
+            let mut shared = st.shared.write().unwrap();
+            shared.tail = 9;
+            shared.durable_tail = 9;
+        }
+        write_meta_sync(&st, true).unwrap();
+        let expected = std::fs::metadata(&st.file_path).unwrap().len()
+            + std::fs::metadata(meta_path(&st.file_path)).unwrap().len();
+
+        assert_eq!(store.prepare_delete(&st).await, PrepareRetirement::Ready);
+        let step = store
+            .finish_retirement(&store.candidate_for(&st), RetirementDurability::Explicit)
+            .await
+            .unwrap();
+        assert_eq!(step.outcome, RetirementOutcome::Reaped);
+        assert_eq!(step.reclaimed_local_bytes, expected);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn recovered_soft_parent_zero_transition_is_durable_and_pageable() {
+        let dir = tmp_dir("recovered-soft-parent");
+        let parent_file;
+        let child_file;
+
+        {
+            let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+            let parent = create(&store, "parent", None, None);
+            let mut child_config = config(None, None);
+            child_config.forked_from = Some("parent".into());
+            child_config.fork_offset_raw = Some("0".into());
+            let child = match store
+                .create("child", child_config, Some(parent.clone()), 0)
+                .unwrap()
+            {
+                CreateResult::Created(st) => st,
+                _ => panic!("fork create failed"),
+            };
+            parent_file = parent.file_path.clone();
+            child_file = child.file_path.clone();
+
+            assert_eq!(
+                store.prepare_delete(&parent).await,
+                PrepareRetirement::Ready
+            );
+            let step = store
+                .finish_retirement(
+                    &store.candidate_for(&parent),
+                    RetirementDurability::Explicit,
+                )
+                .await
+                .unwrap();
+            assert_eq!(step.outcome, RetirementOutcome::SoftDeleted);
+            assert!(step.cascade.is_none());
+        }
+
+        {
+            let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+            let parent = store.streams.get("parent").unwrap().clone();
+            let child = store.streams.get("child").unwrap().clone();
+            assert!(parent.is_fenced(), "recovered tombstones stay fenced");
+            assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+
+            assert_eq!(store.prepare_delete(&child).await, PrepareRetirement::Ready);
+            let step = store
+                .finish_retirement(&store.candidate_for(&child), RetirementDurability::Expiry)
+                .await
+                .unwrap();
+            assert_eq!(step.outcome, RetirementOutcome::Reaped);
+            let cascade = step.cascade.expect("last child releases soft parent");
+            assert_eq!(cascade.stream_id(), parent.id);
+
+            let meta: Meta = serde_json::from_slice(
+                &std::fs::read(meta_path(&parent_file)).expect("parent sidecar remains"),
+            )
+            .unwrap();
+            assert!(meta.soft_deleted);
+            assert_eq!(
+                meta.ref_count, 0,
+                "the zero transition is durable before cascade cleanup"
+            );
+        }
+
+        // Simulate a crash between the separately paced child and parent steps.
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let parent = store.streams.get("parent").unwrap().clone();
+        assert!(parent.is_fenced());
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+        let mut cursor = ExpiryScanCursor::default();
+        let page = store.scan_recovered_retirements(&mut cursor, 1);
+        assert_eq!(page.checked, 1);
+        assert!(page.completed_pass);
+        assert_eq!(store.recovered_retirement_count(), 1);
+        let candidate = page.due.into_iter().next().expect("recovered cleanup seed");
+        assert_eq!(
+            store
+                .prepare_expiry_retirement(&candidate, SystemTime::now())
+                .await,
+            PrepareRetirement::Ready
+        );
+        let step = store
+            .finish_retirement(&candidate, RetirementDurability::Expiry)
+            .await
+            .unwrap();
+        assert_eq!(step.outcome, RetirementOutcome::Reaped);
+        assert!(step.cascade.is_none());
+        assert_eq!(store.recovered_retirement_count(), 0);
+        assert!(!parent_file.exists());
+        assert!(!meta_path(&parent_file).exists());
+        assert!(!child_file.exists());
+        assert!(!meta_path(&child_file).exists());
+        assert!(!store.streams.contains_key("parent"));
+        assert!(!store.streams.contains_key("child"));
+        let (_, inventory, _) = store.inventory_page(None, None, 10).unwrap();
+        assert!(inventory.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn recovery_reconciles_a_soft_parents_stale_ref_after_child_unlink_crash() {
+        let dir = tmp_dir("recovered-soft-parent-stale-ref");
+        let parent_file;
+        let child_file;
+
+        {
+            let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+            let parent = create(&store, "parent", None, None);
+            let mut child_config = config(None, None);
+            child_config.forked_from = Some("parent".into());
+            child_config.fork_offset_raw = Some("0".into());
+            let child = match store
+                .create("child", child_config, Some(parent.clone()), 0)
+                .unwrap()
+            {
+                CreateResult::Created(st) => st,
+                _ => panic!("fork create failed"),
+            };
+            parent_file = parent.file_path.clone();
+            child_file = child.file_path.clone();
+
+            assert_eq!(
+                store.prepare_delete(&parent).await,
+                PrepareRetirement::Ready
+            );
+            assert_eq!(
+                store
+                    .finish_retirement(
+                        &store.candidate_for(&parent),
+                        RetirementDurability::Explicit,
+                    )
+                    .await
+                    .unwrap()
+                    .outcome,
+                RetirementOutcome::SoftDeleted
+            );
+            assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+
+            // Exact crash image: the last child's data and sidecar unlinks are
+            // directory-durable, but the parent still claims the old refcount.
+            std::fs::remove_file(meta_path(&child_file)).unwrap();
+            std::fs::remove_file(&child_file).unwrap();
+            fsync_parent_dir(&child_file).unwrap();
+            let disk_parent: Meta = serde_json::from_slice(
+                &std::fs::read(meta_path(&parent_file)).expect("parent sidecar remains"),
+            )
+            .unwrap();
+            assert!(disk_parent.soft_deleted);
+            assert_eq!(disk_parent.ref_count, 1);
+        }
+
+        // Boot must derive references from recovered child->parent edges, make
+        // the zero transition durable, and seed bounded cleanup without unlinking.
+        {
+            let recovered = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+            let parent = recovered.streams.get("parent").unwrap().clone();
+            assert!(parent.is_fenced());
+            assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+            assert!(!recovered.streams.contains_key("child"));
+            assert_eq!(recovered.recovered_retirement_count(), 1);
+            assert!(parent_file.exists(), "boot cleanup must remain bounded");
+            let disk_parent: Meta = serde_json::from_slice(
+                &std::fs::read(meta_path(&parent_file)).expect("parent sidecar remains"),
+            )
+            .unwrap();
+            assert_eq!(
+                disk_parent.ref_count, 0,
+                "authoritative zero must survive a second crash before admission"
+            );
+        }
+
+        let recovered = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let parent = recovered.streams.get("parent").unwrap().clone();
+        let mut cursor = ExpiryScanCursor::default();
+        let candidate = recovered
+            .scan_recovered_retirements(&mut cursor, 1)
+            .due
+            .into_iter()
+            .next()
+            .expect("reconciled tombstone is pageably collectible");
+        assert_eq!(
+            recovered
+                .prepare_expiry_retirement(&candidate, SystemTime::now())
+                .await,
+            PrepareRetirement::Ready
+        );
+        assert_eq!(
+            recovered
+                .finish_retirement(&candidate, RetirementDurability::Expiry)
+                .await
+                .unwrap()
+                .outcome,
+            RetirementOutcome::Reaped
+        );
+        assert!(!parent_file.exists());
+        assert!(!meta_path(&parent_file).exists());
+        assert!(!child_file.exists());
+        assert!(!meta_path(&child_file).exists());
+        assert!(!recovered.streams.contains_key("parent"));
+        assert!(!recovered.streams.contains_key("child"));
+        assert_eq!(recovered.recovered_retirement_count(), 0);
+        let (_, inventory, _) = recovered.inventory_page(None, None, 10).unwrap();
+        assert!(inventory.iter().all(|entry| entry.stream_id != parent.id));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_raises_a_stale_parent_undercount_from_actual_child_edges() {
+        let dir = tmp_dir("recovered-parent-undercount");
+        let parent_file;
+        {
+            let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+            let parent = create(&store, "parent", None, None);
+            let mut child_config = config(None, None);
+            child_config.forked_from = Some("parent".into());
+            child_config.fork_offset_raw = Some("0".into());
+            assert!(matches!(
+                store.create("child", child_config, Some(parent.clone()), 0),
+                Ok(CreateResult::Created(_))
+            ));
+            parent_file = parent.file_path.clone();
+        }
+
+        let sidecar = meta_path(&parent_file);
+        let mut stale: Meta = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        stale.ref_count = 0;
+        std::fs::write(&sidecar, serde_json::to_vec(&stale).unwrap()).unwrap();
+        File::open(&sidecar).unwrap().sync_all().unwrap();
+        fsync_parent_dir(&sidecar).unwrap();
+
+        let recovered = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let parent = recovered.streams.get("parent").unwrap().clone();
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+        let durable: Meta = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(durable.ref_count, 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parked_corrupt_child_quarantine_survives_a_second_boot() {
+        let dir = tmp_dir("persistent-corrupt-child-quarantine");
+        let parent_file;
+        let child_file;
+        {
+            let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+            let parent = create(&store, "parent", None, None);
+            let mut child_config = config(None, None);
+            child_config.forked_from = Some("parent".into());
+            child_config.fork_offset_raw = Some("0".into());
+            let child = match store
+                .create("child", child_config, Some(parent.clone()), 0)
+                .unwrap()
+            {
+                CreateResult::Created(child) => child,
+                _ => panic!("fork create failed"),
+            };
+            parent_file = parent.file_path.clone();
+            child_file = child.file_path.clone();
+            parent.shared.write().unwrap().soft_deleted = true;
+            write_meta_sync(&parent, true).unwrap();
+        }
+
+        let child_meta = meta_path(&child_file);
+        std::fs::write(&child_meta, b"{torn-child-sidecar").unwrap();
+        File::open(&child_meta).unwrap().sync_all().unwrap();
+        fsync_parent_dir(&child_meta).unwrap();
+        let parked = child_meta.with_extension("meta.corrupt");
+
+        // Boot 1 discovers and parks the torn sidecar. With an incomplete
+        // graph, the potentially linked soft parent must retain its refcount.
+        {
+            let boot1 = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+            let parent = boot1.streams.get("parent").unwrap().clone();
+            assert!(parked.exists());
+            assert!(child_file.exists());
+            assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+            assert_eq!(boot1.recovered_retirement_count(), 0);
+        }
+
+        // Boot 2 must classify the parked marker identically. Reclassifying it
+        // and its data as disposable orphans would erase the evidence, lower
+        // the parent to zero, and make it incorrectly collectible.
+        let boot2 = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let parent = boot2.streams.get("parent").unwrap().clone();
+        assert!(parked.exists(), "parked corruption evidence was deleted");
+        assert!(child_file.exists(), "quarantined child data was deleted");
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+        assert_eq!(boot2.recovered_retirement_count(), 0);
+        let disk_parent: Meta = serde_json::from_slice(
+            &std::fs::read(meta_path(&parent_file)).expect("parent sidecar remains"),
+        )
+        .unwrap();
+        assert_eq!(disk_parent.ref_count, 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quarantined_filename_id_is_reserved_before_the_next_create() {
+        let dir = tmp_dir("quarantined-id-reservation");
+        drop(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+
+        // Put the parked incarnation above any plausible rolled-back clock seed.
+        // Recovery must derive identity from the filename even though its JSON
+        // is intentionally unavailable.
+        let reserved = MAX_SAFE_INT - 2;
+        let filename = format!("parked~{reserved}");
+        let data = lane_dir(&dir, lane_of(&filename)).join(filename);
+        std::fs::write(&data, b"quarantined-bytes").unwrap();
+        std::fs::write(meta_path(&data).with_extension("meta.corrupt"), b"torn").unwrap();
+
+        let recovered = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        assert!(recovered.has_quarantined_streams());
+        assert!(recovered.quarantined_stream_ids_complete());
+        assert_eq!(recovered.quarantined_stream_ids(), vec![reserved]);
+        let created = create(&recovered, "fresh", None, None);
+        assert!(
+            created.id > reserved,
+            "new incarnation reused an id reserved by quarantine"
+        );
+        assert_ne!(created.file_path, data);
+        assert!(data.exists(), "quarantined data was overwritten or removed");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_fork_create_never_publishes_a_child_that_can_ack_appends() {
+        let _durability = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp_dir("failed-fork-create-publication");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let parent = create(&store, "parent", None, None);
+        let hook = install_create_before_meta_failure_hook(&dir, "child");
+
+        let create_store = Arc::clone(&store);
+        let create_parent = Arc::clone(&parent);
+        let create_task = tokio::task::spawn_blocking(move || {
+            let mut child_config = config(None, None);
+            child_config.forked_from = Some("parent".into());
+            child_config.fork_offset_raw = Some("0".into());
+            create_store.create("child", child_config, Some(create_parent), 0)
+        });
+        hook.reached();
+
+        let append_store = Arc::clone(&store);
+        let mut append_task = tokio::spawn(async move {
+            crate::handlers::handle(
+                append_store,
+                crate::api::Req {
+                    method: crate::api::Method::Post,
+                    path: "child".into(),
+                    query: None,
+                    headers: vec![("content-type".into(), "application/octet-stream".into())],
+                    body: bytes::Bytes::from_static(b"must-not-be-acked"),
+                },
+            )
+            .await
+            .status
+        });
+        let early = tokio::time::timeout(Duration::from_millis(150), &mut append_task).await;
+
+        // Always unblock and join both paths before asserting so a RED result
+        // cannot strand a blocking worker or leave the global hook installed.
+        hook.release();
+        let create_result = create_task.await.unwrap();
+        let append_status = match early {
+            Ok(result) => result.unwrap(),
+            Err(_) => append_task.await.unwrap(),
+        };
+
+        assert!(
+            create_result.is_err(),
+            "injected child sidecar failure must fail PUT"
+        );
+        assert_eq!(
+            append_status, 404,
+            "an uncommitted child became visible to a concurrent append"
+        );
+        assert!(store.get("child").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unpublished_create_does_not_lock_unrelated_live_lookup() {
+        let dir = tmp_dir("create-does-not-lock-lookup");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+
+        // Discover a different path in the same DashMap shard without relying
+        // on DashMap's private shard-selection implementation. A vacant entry
+        // guard locks the target shard, and try_get tells us which candidate
+        // maps to it without ever blocking.
+        let child = "paused-child";
+        let vacant = match store.streams.entry(child.to_owned()) {
+            dashmap::mapref::entry::Entry::Vacant(vacant) => vacant,
+            dashmap::mapref::entry::Entry::Occupied(_) => unreachable!(),
+        };
+        let witness = (0..100_000)
+            .map(|index| format!("unrelated-live-{index}"))
+            .find(|candidate| store.streams.try_get(candidate.as_str()).is_locked())
+            .expect("find an unrelated path in the paused create's DashMap shard");
+        drop(vacant);
+        let witness_state = create(&store, &witness, None, None);
+
+        let hook = install_create_before_meta_failure_hook(&dir, child);
+        let create_store = Arc::clone(&store);
+        let create_task = tokio::task::spawn_blocking(move || {
+            create_store.create(child, config(None, None), None, 0)
+        });
+        hook.reached();
+
+        let lookup_was_locked = store.streams.try_get(witness.as_str()).is_locked();
+
+        // Always unblock and join the writer before asserting so a RED result
+        // cannot strand a blocking worker or leave the hook installed.
+        hook.release();
+        assert!(create_task.await.unwrap().is_err());
+        assert!(Arc::ptr_eq(
+            &store.streams.get(witness.as_str()).unwrap(),
+            &witness_state
+        ));
+        assert!(
+            !lookup_was_locked,
+            "an unpublished create held the DashMap shard write lock across sidecar I/O"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_path_create_waits_for_unpublished_transaction() {
+        let dir = tmp_dir("same-path-create-serialization");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let path = "same-path";
+        let hook = install_create_before_meta_failure_hook(&dir, path);
+
+        let first_store = Arc::clone(&store);
+        let first = tokio::task::spawn_blocking(move || {
+            first_store.create(path, config(None, None), None, 0)
+        });
+        hook.reached();
+
+        let second_store = Arc::clone(&store);
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let mut second = tokio::task::spawn_blocking(move || {
+            let _ = second_started_tx.send(());
+            second_store.create(path, config(None, None), None, 0)
+        });
+        second_started_rx
+            .await
+            .expect("second create worker started");
+        let second_completed_early =
+            tokio::time::timeout(Duration::from_millis(150), &mut second).await;
+
+        hook.release();
+        assert!(first.await.unwrap().is_err());
+        assert!(
+            second_completed_early.is_err(),
+            "a competing same-path create bypassed the unpublished transaction"
+        );
+        let created = match second.await.unwrap().unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("the waiter must create after the failed transaction rolls back"),
+        };
+        assert!(Arc::ptr_eq(&store.streams.get(path).unwrap(), &created));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_publication_cannot_leave_phantom_projections_after_retirement() {
+        let dir = tmp_dir("create-publication-projections");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let path = "published-atomically";
+        let hook = install_create_after_insert_hook(&dir, path);
+
+        let create_store = Arc::clone(&store);
+        let create_task = tokio::task::spawn_blocking(move || {
+            create_store.create(path, config(Some(300), None), None, 0)
+        });
+        hook.reached();
+
+        let inserted = store
+            .streams
+            .get(path)
+            .expect("hook runs after registry insertion")
+            .clone();
+        assert_eq!(
+            store.prepare_delete(&inserted).await,
+            PrepareRetirement::Ready
+        );
+        let candidate = store.candidate_for(&inserted);
+        let retire_store = Arc::clone(&store);
+        let mut retire_task = tokio::task::spawn_blocking(move || {
+            retire_store.finish_retirement_blocking(&candidate, RetirementDurability::Explicit)
+        });
+        let retired_while_publication_paused =
+            tokio::time::timeout(Duration::from_millis(150), &mut retire_task).await;
+
+        // Always unblock and join both operations before asserting so RED
+        // cannot strand a blocking worker or leave the scoped hook installed.
+        hook.release();
+        assert!(matches!(
+            create_task.await.unwrap().unwrap(),
+            CreateResult::Created(_)
+        ));
+        let (completed_early, retirement) = match retired_while_publication_paused {
+            Ok(result) => (true, result.unwrap()),
+            Err(_) => (false, retire_task.await.unwrap()),
+        };
+        assert_eq!(retirement.unwrap(), RetirementOutcome::Reaped);
+
+        assert!(
+            !completed_early,
+            "retirement passed the create publication barrier before projections existed"
+        );
+        assert!(store.streams.get(path).is_none());
+        let (_, inventory, _) = store.inventory_page(None, None, 10).unwrap();
+        assert!(
+            !inventory.iter().any(|entry| entry.path == path),
+            "retirement left a phantom inventory row"
+        );
+        assert_eq!(
+            store.expiring_stream_count(),
+            0,
+            "retirement left a phantom expiration-index entry"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fenced_publication_helpers_do_not_advance_visibility() {
+        let dir = tmp_dir("fenced-publication");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let st = create(&store, "stream", None, None);
+
+        st.fenced.store(true, Ordering::Release);
+        assert_eq!(
+            st.publish_durable_tail_if_live(12),
+            Err(StreamAccessError::Expired)
+        );
+        assert_eq!(
+            st.publish_durable_close_if_live(),
+            Err(StreamAccessError::Expired)
+        );
+        assert_eq!(
+            st.publish_durable_tail_and_close_if_live(12),
+            Err(StreamAccessError::Expired)
+        );
+        assert_eq!(
+            st.with_live_shared_mut(|shared| shared.last_access = UNIX_EPOCH),
+            Err(StreamAccessError::Expired)
+        );
+        let shared = st.shared.read().unwrap();
+        assert_eq!(shared.durable_tail, 0);
+        assert!(!shared.closed_durable);
+        assert_ne!(shared.last_access, UNIX_EPOCH);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn body_close_publication_is_one_atomic_monotonic_transition() {
+        let dir = tmp_dir("body-close-publication");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let st = create(&store, "stream", None, None);
+
+        let (published, advanced) = st.publish_durable_tail_and_close_if_live(12).unwrap();
+        assert!(advanced);
+        assert_eq!(
+            published,
+            Tail {
+                bytes: 12,
+                closed: true
+            }
+        );
+        let (published, advanced) = st.publish_durable_tail_and_close_if_live(8).unwrap();
+        assert!(!advanced);
+        assert_eq!(published.bytes, 12, "durable visibility never regresses");
+        assert!(published.closed);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lookup_without_ttl_touch_stays_on_the_shared_read_path() {
+        let dir = tmp_dir("lookup-read-lock");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let st = create(&store, "stream", None, None);
+        let held_read = st.shared.read().unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let live = matches!(
+                    store.lookup_at("stream", SystemTime::now(), false),
+                    StreamLookup::Live(_)
+                );
+                tx.send(live).unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(1));
+            // Always unblock an accidentally exclusive implementation before
+            // joining, so the regression fails deterministically rather than
+            // hanging the test process.
+            drop(held_read);
+            assert!(result.unwrap());
+            handle.join().unwrap();
+        });
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_rebuilds_indexes_without_unbounded_tombstone_cleanup() {
+        let dir = tmp_dir("recovery");
+        let expiring_path;
+        let abandoned_path;
+        {
+            let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+            let expiring = create(&store, "expiring", Some(60), None);
+            let _permanent = create(&store, "permanent", None, None);
+            let abandoned = create(&store, "abandoned", Some(60), None);
+            abandoned.shared.write().unwrap().soft_deleted = true;
+            write_meta_sync(&abandoned, true).unwrap();
+            expiring_path = expiring.file_path.clone();
+            abandoned_path = abandoned.file_path.clone();
+        }
+
+        let recovered = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        assert_eq!(recovered.expiring_stream_count(), 1);
+        assert!(recovered.streams.contains_key("expiring"));
+        assert!(expiring_path.exists());
+        assert!(recovered.streams.contains_key("abandoned"));
+        assert!(abandoned_path.exists());
+        assert!(meta_path(&abandoned_path).exists());
+        let abandoned = recovered.streams.get("abandoned").unwrap().clone();
+        assert!(abandoned.is_fenced());
+        let mut cursor = ExpiryScanCursor::default();
+        let page = recovered.scan_recovered_retirements(&mut cursor, 1);
+        assert_eq!(page.checked, 1);
+        assert!(page.completed_pass);
+        assert_eq!(recovered.recovered_retirement_count(), 1);
+        assert_eq!(page.due[0].stream_id(), abandoned.id);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fork_reference_reservation_rejects_a_fenced_parent() {
+        let dir = tmp_dir("fork-fence");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let parent = create(&store, "parent", None, None);
+        parent.fenced.store(true, Ordering::Release);
+
+        assert!(matches!(
+            store
+                .create("child", config(None, None), Some(parent.clone()), 0)
+                .unwrap(),
+            CreateResult::SourceUnavailable
+        ));
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+        assert!(!store.streams.contains_key("child"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_reservation_does_not_persist_an_inflight_append_snapshot() {
+        let _durability = crate::handlers::test_support::DurabilityGuard::wal();
+        let dir = tmp_dir("fork-parent-inflight-meta");
+        let crash_dir = tmp_dir("fork-parent-inflight-meta-crash");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let wal = crate::wal::walset::WalSet::open(&dir, Some(1), 1).unwrap();
+        store.wal.set(Arc::clone(&wal)).unwrap_or_else(|_| panic!());
+        wal.spawn_committers();
+
+        let mut parent_config = config(Some(3_600), None);
+        parent_config.create_closed = false;
+        let parent = match store.create("parent", parent_config, None, 0).unwrap() {
+            CreateResult::Created(parent) => parent,
+            _ => panic!("parent create failed"),
+        };
+        let durable_last_access = UNIX_EPOCH
+            + Duration::from_secs(
+                unix_secs(SystemTime::now())
+                    .checked_sub(10)
+                    .expect("test clock is after the Unix epoch"),
+            );
+        parent.shared.write().unwrap().last_access = durable_last_access;
+        write_meta_sync(&parent, true).unwrap();
+
+        // Freeze the append at the WAL's first staging instruction. At this
+        // point write_wire + the close/dedupe mutations have happened under the
+        // appender, but no LSN has even been reserved and nothing can be durable.
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let shard = wal.shard_for(parent.id);
+        let parent_id = parent.id;
+        shard.set_on_stage_hook(Box::new({
+            let reached = Arc::clone(&reached);
+            let release = Arc::clone(&release);
+            move |stream_id| {
+                assert_eq!(stream_id, parent_id);
+                reached.notify_one();
+                let (lock, wake) = &*release;
+                let mut released = lock.lock().unwrap_or_else(|error| error.into_inner());
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+            }
+        }));
+        let staged = reached.notified();
+        let append = tokio::spawn(crate::handlers::handle(
+            Arc::clone(&store),
+            crate::api::Req {
+                method: crate::api::Method::Post,
+                path: "parent".into(),
+                query: None,
+                headers: vec![
+                    ("content-type".into(), "application/octet-stream".into()),
+                    ("stream-closed".into(), "true".into()),
+                    ("producer-id".into(), "producer-a".into()),
+                    ("producer-epoch".into(), "1".into()),
+                    ("producer-seq".into(), "0".into()),
+                    ("stream-seq".into(), "seq-a".into()),
+                ],
+                body: bytes::Bytes::from_static(b"unacknowledged"),
+            },
+        ));
+        staged.await;
+        assert_eq!(shard.durable_lsn(), 0, "paused append became durable");
+
+        let create_store = Arc::clone(&store);
+        let create_parent = Arc::clone(&parent);
+        let child = tokio::task::spawn_blocking(move || {
+            let mut child_config = config(None, None);
+            child_config.forked_from = Some("parent".into());
+            child_config.fork_offset_raw = Some("0".into());
+            create_store.create("child", child_config, Some(create_parent), 0)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(child, CreateResult::Created(_)));
+
+        // Copy the exact pre-ack parent data+sidecar into a separate boot image.
+        // Store recovery runs before WAL replay in production, so this proves
+        // which request state the fork reservation made crash-durable.
+        drop(Store::new_with_tier(crash_dir.clone(), TierConfig::default()).unwrap());
+        let relative = parent.file_path.strip_prefix(&dir).unwrap();
+        let crash_file = crash_dir.join(relative);
+        std::fs::create_dir_all(crash_file.parent().unwrap()).unwrap();
+        std::fs::copy(&parent.file_path, &crash_file).unwrap();
+        std::fs::copy(meta_path(&parent.file_path), meta_path(&crash_file)).unwrap();
+        let recovered = Store::new_with_tier(crash_dir.clone(), TierConfig::default()).unwrap();
+        let recovered_parent = recovered.streams.get("parent").unwrap().clone();
+        let recovered_state = {
+            let shared = recovered_parent.shared.read().unwrap();
+            (
+                shared.closed,
+                shared.producers.contains_key("producer-a"),
+                shared.last_seq_header.clone(),
+                shared.last_access,
+            )
+        };
+
+        // Always release and join the real request before asserting the crash
+        // image, so a RED result cannot strand a WAL committer or test worker.
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            wake.notify_all();
+        }
+        let response = append.await.unwrap();
+        shard.set_on_stage_hook(Box::new(|_| {}));
+        wal.stop_committers();
+
+        assert!((200..300).contains(&response.status));
+        assert_eq!(
+            recovered_state,
+            (false, false, None, durable_last_access),
+            "fork refcount persistence leaked unacknowledged append metadata"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(crash_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parent_refcount_release_does_not_persist_an_inflight_append_snapshot() {
+        let _durability = crate::handlers::test_support::DurabilityGuard::wal();
+        let dir = tmp_dir("parent-release-inflight-meta");
+        let crash_dir = tmp_dir("parent-release-inflight-meta-crash");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let wal = crate::wal::walset::WalSet::open(&dir, Some(1), 1).unwrap();
+        store.wal.set(Arc::clone(&wal)).unwrap_or_else(|_| panic!());
+        wal.spawn_committers();
+
+        let mut parent_config = config(Some(3_600), None);
+        parent_config.create_closed = false;
+        let parent = match store.create("parent", parent_config, None, 0).unwrap() {
+            CreateResult::Created(parent) => parent,
+            _ => panic!("parent create failed"),
+        };
+        let durable_last_access = UNIX_EPOCH
+            + Duration::from_secs(
+                unix_secs(SystemTime::now())
+                    .checked_sub(10)
+                    .expect("test clock is after the Unix epoch"),
+            );
+        parent.shared.write().unwrap().last_access = durable_last_access;
+        write_meta_sync(&parent, true).unwrap();
+
+        let mut child_config = config(None, None);
+        child_config.forked_from = Some("parent".into());
+        child_config.fork_offset_raw = Some("0".into());
+        let child = match store
+            .create("child", child_config, Some(parent.clone()), 0)
+            .unwrap()
+        {
+            CreateResult::Created(child) => child,
+            _ => panic!("child create failed"),
+        };
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+
+        // Freeze a parent append after write_wire and its close/dedupe/TTL
+        // mutations, but before it reserves an LSN or reaches durability.
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let shard = wal.shard_for(parent.id);
+        let parent_id = parent.id;
+        shard.set_on_stage_hook(Box::new({
+            let reached = Arc::clone(&reached);
+            let release = Arc::clone(&release);
+            move |stream_id| {
+                assert_eq!(stream_id, parent_id);
+                reached.notify_one();
+                let (lock, wake) = &*release;
+                let mut released = lock.lock().unwrap_or_else(|error| error.into_inner());
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+            }
+        }));
+        let staged = reached.notified();
+        let append = tokio::spawn(crate::handlers::handle(
+            Arc::clone(&store),
+            crate::api::Req {
+                method: crate::api::Method::Post,
+                path: "parent".into(),
+                query: None,
+                headers: vec![
+                    ("content-type".into(), "application/octet-stream".into()),
+                    ("stream-closed".into(), "true".into()),
+                    ("producer-id".into(), "producer-a".into()),
+                    ("producer-epoch".into(), "1".into()),
+                    ("producer-seq".into(), "0".into()),
+                    ("stream-seq".into(), "seq-a".into()),
+                ],
+                body: bytes::Bytes::from_static(b"unacknowledged"),
+            },
+        ));
+        staged.await;
+        assert_eq!(shard.durable_lsn(), 0, "paused append became durable");
+
+        // Hard-retiring the only child releases the live parent's final fork
+        // reference. That lifecycle write may persist ref_count=0, but must not
+        // snapshot any of the parent's unacknowledged append state.
+        assert_eq!(store.prepare_delete(&child).await, PrepareRetirement::Ready);
+        let retired = store
+            .finish_retirement(&store.candidate_for(&child), RetirementDurability::Explicit)
+            .await
+            .unwrap();
+        assert_eq!(retired.outcome, RetirementOutcome::Reaped);
+        assert!(retired.cascade.is_none());
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+
+        // Copy the exact pre-ack parent image and recover it independently.
+        drop(Store::new_with_tier(crash_dir.clone(), TierConfig::default()).unwrap());
+        let relative = parent.file_path.strip_prefix(&dir).unwrap();
+        let crash_file = crash_dir.join(relative);
+        std::fs::create_dir_all(crash_file.parent().unwrap()).unwrap();
+        std::fs::copy(&parent.file_path, &crash_file).unwrap();
+        std::fs::copy(meta_path(&parent.file_path), meta_path(&crash_file)).unwrap();
+        let recovered = Store::new_with_tier(crash_dir.clone(), TierConfig::default()).unwrap();
+        let recovered_parent = recovered.streams.get("parent").unwrap().clone();
+        let recovered_state = {
+            let shared = recovered_parent.shared.read().unwrap();
+            (
+                shared.ref_count,
+                shared.closed,
+                shared.producers.contains_key("producer-a"),
+                shared.last_seq_header.clone(),
+                shared.last_access,
+            )
+        };
+
+        // Always release and join the real append before asserting, so a RED
+        // result cannot strand a WAL committer or test worker.
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            wake.notify_all();
+        }
+        let response = append.await.unwrap();
+        shard.set_on_stage_hook(Box::new(|_| {}));
+        wal.stop_committers();
+
+        assert!((200..300).contains(&response.status));
+        assert_eq!(
+            recovered_state,
+            (0, false, false, None, durable_last_access),
+            "parent refcount release leaked unacknowledged append metadata"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(crash_dir);
+    }
+
+    #[test]
+    fn parent_refcount_release_rolls_back_when_the_narrow_merge_fails() {
+        let dir = tmp_dir("parent-release-refcount-rollback");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let parent = create(&store, "parent", None, None);
+        let child = match store
+            .create("child", config(None, None), Some(parent.clone()), 0)
+            .unwrap()
+        {
+            CreateResult::Created(child) => child,
+            _ => panic!("child create failed"),
+        };
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+
+        // A missing durable parent sidecar makes the narrow merge fail after
+        // the in-memory decrement. The lifecycle reservation must become
+        // retryable again and the reference must remain authoritative.
+        std::fs::remove_file(meta_path(&parent.file_path)).unwrap();
+        let error = match store.release_parent_once(&child, RetirementDurability::Explicit) {
+            Ok(_) => panic!("missing parent sidecar must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+        assert!(!child.parent_released.load(Ordering::Acquire));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn fork_reference_reservation_does_not_contend_on_parent_appender() {
+        let dir = tmp_dir("fork-appender-contention");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let parent = create(&store, "parent", None, None);
+        let _ordinary_append = parent.appender.lock().await;
+        let mut child_config = config(None, None);
+        child_config.forked_from = Some("parent".into());
+        child_config.fork_offset_raw = Some("0".into());
+
+        let child = match store
+            .create("child", child_config, Some(parent.clone()), 0)
+            .expect("ordinary source append contention must not reject a fork reservation")
+        {
+            CreateResult::Created(child) => child,
+            _ => panic!("valid fork reservation was rejected"),
+        };
+        assert_eq!(
+            child.parent.as_ref().map(|source| source.id),
+            Some(parent.id)
+        );
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fork_reservation_rollback_precedes_retirement_soft_delete_decision() {
+        let dir = tmp_dir("fork-rollback-retirement");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let parent = create(&store, "parent", None, None);
+
+        // Model create after it owns the source metadata transaction and has
+        // reserved one ref, immediately before a child-sidecar failure.
+        let source_meta = parent
+            .meta_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        parent.shared.write().unwrap().ref_count = 1;
+        parent.fenced.store(true, Ordering::Release);
+        let candidate = store.candidate_for(&parent);
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_store = Arc::clone(&store);
+        let worker_start = Arc::clone(&start);
+        let worker = std::thread::spawn(move || {
+            worker_start.wait();
+            let outcome = worker_store
+                .finish_retirement_blocking_once(&candidate, RetirementDurability::Explicit)
+                .unwrap()
+                .outcome;
+            done_tx.send(outcome).unwrap();
+        });
+        start.wait();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        // Child metadata failed: rollback wins while retirement is blocked on
+        // the same barrier. It must observe the final zero, not leak a
+        // same-process zero-ref SoftDeleted tombstone.
+        parent.shared.write().unwrap().ref_count = 0;
+        drop(source_meta);
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RetirementOutcome::Reaped
+        );
+        worker.join().unwrap();
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

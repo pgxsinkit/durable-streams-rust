@@ -21,7 +21,7 @@
 mod imp {
     use std::sync::OnceLock;
 
-    use opentelemetry::metrics::{Counter, Histogram, Meter};
+    use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
     use opentelemetry::{global, KeyValue};
     use opentelemetry_otlp::{MetricExporter, SpanExporter};
     use opentelemetry_sdk::metrics::{
@@ -39,6 +39,8 @@ mod imp {
     ];
     /// Batch-size histogram bucket boundaries (count).
     const BATCH_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
+    /// Wall/monotonic clock divergence bucket boundaries (seconds).
+    const CLOCK_DRIFT_BUCKETS: &[f64] = &[0.001, 0.01, 0.1, 1.0, 5.0, 30.0, 60.0, 300.0, 1800.0];
 
     /// Pre-resolved instrument handles. Resolving an instrument is cheap but not
     /// free, so we do it once at startup and store the handles here.
@@ -53,6 +55,21 @@ mod imp {
         // Recorded only from the Linux-only blocking-sendfile offload path.
         #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         read_offload_wait: Histogram<f64>,
+        expiry_index_entries: Gauge<u64>,
+        expiry_scan_checked: Counter<u64>,
+        expiry_scan_duration: Histogram<f64>,
+        expiry_due: Counter<u64>,
+        expiry_completed_pass_due_fraction: Gauge<f64>,
+        expiry_oldest_due_lag: Gauge<f64>,
+        expiry_outcome: Counter<u64>,
+        expiry_cleanup_duration: Histogram<f64>,
+        expiry_reclaimed_local_bytes: Counter<u64>,
+        expiry_queue_depth: Gauge<u64>,
+        expiry_cleanup_active: Gauge<u64>,
+        expiry_queue_retries: Counter<u64>,
+        expiry_bulk_guard_paused: Gauge<u64>,
+        expiry_clock_guard_paused: Gauge<u64>,
+        expiry_clock_drift: Histogram<f64>,
     }
 
     impl Metrics {
@@ -94,6 +111,74 @@ mod imp {
                     .f64_histogram("ds.read.offload.wait")
                     .with_unit("s")
                     .with_description("Blocking-pool queue wait before a cold offloaded read runs.")
+                    .build(),
+                expiry_index_entries: meter
+                    .u64_gauge("ds.expiry.index.entries")
+                    .with_description("Current entries in the expiring-stream index.")
+                    .build(),
+                expiry_scan_checked: meter
+                    .u64_counter("ds.expiry.scan.checked")
+                    .with_description("Expiring-index entries checked by proactive scans.")
+                    .build(),
+                expiry_scan_duration: meter
+                    .f64_histogram("ds.expiry.scan.duration")
+                    .with_unit("s")
+                    .with_description("Duration of a bounded proactive expiry scan page.")
+                    .build(),
+                expiry_due: meter
+                    .u64_counter("ds.expiry.due")
+                    .with_description("Expired streams found by proactive scans.")
+                    .build(),
+                expiry_completed_pass_due_fraction: meter
+                    .f64_gauge("ds.expiry.pass.due_fraction")
+                    .with_unit("1")
+                    .with_description("Due fraction in the most recently completed scan pass.")
+                    .build(),
+                expiry_oldest_due_lag: meter
+                    .f64_gauge("ds.expiry.lag")
+                    .with_unit("s")
+                    .with_description(
+                        "Age past deadline of the oldest stream due in the current scan.",
+                    )
+                    .build(),
+                expiry_outcome: meter
+                    .u64_counter("ds.expiry.outcome")
+                    .with_description("Expiration decisions, by bounded outcome.")
+                    .build(),
+                expiry_cleanup_duration: meter
+                    .f64_histogram("ds.expiry.cleanup.duration")
+                    .with_unit("s")
+                    .with_description("End-to-end duration of one expiration cleanup attempt.")
+                    .build(),
+                expiry_reclaimed_local_bytes: meter
+                    .u64_counter("ds.expiry.reclaimed.local_bytes")
+                    .with_unit("By")
+                    .with_description("Local stream bytes successfully reclaimed by expiration.")
+                    .build(),
+                expiry_queue_depth: meter
+                    .u64_gauge("ds.expiry.queue.depth")
+                    .with_description("Current queued expiration cleanup jobs.")
+                    .build(),
+                expiry_cleanup_active: meter
+                    .u64_gauge("ds.expiry.cleanup.active")
+                    .with_description("Current active expiration cleanup workers.")
+                    .build(),
+                expiry_queue_retries: meter
+                    .u64_counter("ds.expiry.queue.retries")
+                    .with_description("Expiration cleanup attempts requeued for retry.")
+                    .build(),
+                expiry_bulk_guard_paused: meter
+                    .u64_gauge("ds.expiry.bulk_guard.paused")
+                    .with_description("Sticky bulk-expiry safety pause (1 paused, 0 clear).")
+                    .build(),
+                expiry_clock_guard_paused: meter
+                    .u64_gauge("ds.expiry.clock_guard.paused")
+                    .with_description("Sticky clock-drift safety pause (1 paused, 0 clear).")
+                    .build(),
+                expiry_clock_drift: meter
+                    .f64_histogram("ds.expiry.clock_drift")
+                    .with_unit("s")
+                    .with_description("Absolute wall/monotonic clock divergence.")
                     .build(),
             }
         }
@@ -226,6 +311,9 @@ mod imp {
                     .with_view(bucket_view("ds.append.duration", LATENCY_BUCKETS))
                     .with_view(bucket_view("ds.read.duration", LATENCY_BUCKETS))
                     .with_view(bucket_view("ds.read.offload.wait", LATENCY_BUCKETS))
+                    .with_view(bucket_view("ds.expiry.scan.duration", LATENCY_BUCKETS))
+                    .with_view(bucket_view("ds.expiry.cleanup.duration", LATENCY_BUCKETS))
+                    .with_view(bucket_view("ds.expiry.clock_drift", CLOCK_DRIFT_BUCKETS))
                     .with_view(bucket_view("ds.append.fsync.batch_size", BATCH_BUCKETS))
                     .build();
                 Some(provider)
@@ -325,6 +413,104 @@ mod imp {
         }
     }
 
+    pub fn record_expiry_index_entries(entries: u64) {
+        if let Some(m) = metrics() {
+            m.expiry_index_entries.record(entries, &[]);
+        }
+    }
+
+    pub fn record_expiry_scan(checked: u64, due: u64, secs: f64) {
+        if let Some(m) = metrics() {
+            m.expiry_scan_checked.add(checked, &[]);
+            m.expiry_due.add(due, &[]);
+            m.expiry_scan_duration.record(secs, &[]);
+        }
+    }
+
+    pub fn record_expiry_completed_pass(checked: u64, due: u64) {
+        if let Some(m) = metrics() {
+            m.expiry_completed_pass_due_fraction
+                .record(expiry_due_fraction(checked, due), &[]);
+        }
+    }
+
+    pub(super) fn expiry_due_fraction(checked: u64, due: u64) -> f64 {
+        match checked {
+            0 if due == 0 => 0.0,
+            0 => 1.0,
+            _ => (due as f64 / checked as f64).min(1.0),
+        }
+    }
+
+    pub fn record_expiry_oldest_due_lag(secs: Option<f64>) {
+        if let Some(m) = metrics() {
+            let secs = secs
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .unwrap_or(0.0);
+            m.expiry_oldest_due_lag.record(secs, &[]);
+        }
+    }
+
+    pub fn record_expiry_outcome(outcome: &'static str) {
+        if let Some(m) = metrics() {
+            m.expiry_outcome.add(
+                1,
+                &[KeyValue::new("outcome", expiry_outcome_label(outcome))],
+            );
+        }
+    }
+
+    pub(super) fn expiry_outcome_label(outcome: &'static str) -> &'static str {
+        match outcome {
+            "renewed" | "observe" | "fenced" | "soft_deleted" | "reaped" | "stale" | "failed" => {
+                outcome
+            }
+            // Keep accidental future call-site values from expanding metric
+            // cardinality. New outcomes must be explicitly added here.
+            _ => "failed",
+        }
+    }
+
+    pub fn record_expiry_cleanup(secs: f64) {
+        if let Some(m) = metrics() {
+            m.expiry_cleanup_duration.record(secs, &[]);
+        }
+    }
+
+    pub fn record_expiry_reclaimed_local_bytes(bytes: u64) {
+        if let Some(m) = metrics() {
+            m.expiry_reclaimed_local_bytes.add(bytes, &[]);
+        }
+    }
+
+    pub fn record_expiry_queue(depth: u64, active: u64) {
+        if let Some(m) = metrics() {
+            m.expiry_queue_depth.record(depth, &[]);
+            m.expiry_cleanup_active.record(active, &[]);
+        }
+    }
+
+    pub fn record_expiry_retry() {
+        if let Some(m) = metrics() {
+            m.expiry_queue_retries.add(1, &[]);
+        }
+    }
+
+    pub fn set_expiry_safety_pauses(bulk_paused: bool, clock_paused: bool) {
+        if let Some(m) = metrics() {
+            m.expiry_bulk_guard_paused
+                .record(u64::from(bulk_paused), &[]);
+            m.expiry_clock_guard_paused
+                .record(u64::from(clock_paused), &[]);
+        }
+    }
+
+    pub fn record_expiry_clock_drift(secs: f64) {
+        if let Some(m) = metrics() {
+            m.expiry_clock_drift.record(secs, &[]);
+        }
+    }
+
     // Called only from the Linux-only blocking-sendfile offload path.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn record_offload_wait(secs: f64) {
@@ -386,6 +572,28 @@ mod imp {
     pub fn record_tail_cache(_hit: bool, _live: &'static str) {}
     #[inline(always)]
     pub fn record_offload_wait(_secs: f64) {}
+    #[inline(always)]
+    pub fn record_expiry_index_entries(_entries: u64) {}
+    #[inline(always)]
+    pub fn record_expiry_scan(_checked: u64, _due: u64, _secs: f64) {}
+    #[inline(always)]
+    pub fn record_expiry_completed_pass(_checked: u64, _due: u64) {}
+    #[inline(always)]
+    pub fn record_expiry_oldest_due_lag(_secs: Option<f64>) {}
+    #[inline(always)]
+    pub fn record_expiry_outcome(_outcome: &'static str) {}
+    #[inline(always)]
+    pub fn record_expiry_cleanup(_secs: f64) {}
+    #[inline(always)]
+    pub fn record_expiry_reclaimed_local_bytes(_bytes: u64) {}
+    #[inline(always)]
+    pub fn record_expiry_queue(_depth: u64, _active: u64) {}
+    #[inline(always)]
+    pub fn record_expiry_retry() {}
+    #[inline(always)]
+    pub fn set_expiry_safety_pauses(_bulk_paused: bool, _clock_paused: bool) {}
+    #[inline(always)]
+    pub fn record_expiry_clock_drift(_secs: f64) {}
 
     /// Zero-sized no-op timer: `start`/`elapsed_secs` compile to nothing, so a
     /// default build reads no clock on hot paths.
@@ -407,6 +615,60 @@ mod imp {
 // but are part of the stable public surface — keep the re-export complete.
 #[allow(unused_imports)]
 pub use imp::{
-    init, record_append, record_append_lock_wait, record_fsync, record_offload_wait, record_read,
-    record_request, record_tail_cache, Guard, Timer,
+    init, record_append, record_append_lock_wait, record_expiry_cleanup, record_expiry_clock_drift,
+    record_expiry_completed_pass, record_expiry_index_entries, record_expiry_oldest_due_lag,
+    record_expiry_outcome, record_expiry_queue, record_expiry_reclaimed_local_bytes,
+    record_expiry_retry, record_expiry_scan, record_fsync, record_offload_wait, record_read,
+    record_request, record_tail_cache, set_expiry_safety_pauses, Guard, Timer,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Keeps the feature-on and feature-off reaper call surface identical. The
+    /// feature-enabled build additionally proves every OTel instrument type and
+    /// builder compiles against the pinned SDK version.
+    #[test]
+    fn expiry_reaper_metrics_surface_is_callable_without_identifiers() {
+        record_expiry_index_entries(12);
+        record_expiry_scan(10, 2, 0.001);
+        record_expiry_completed_pass(10, 2);
+        record_expiry_oldest_due_lag(Some(4.5));
+        record_expiry_oldest_due_lag(None);
+        for outcome in [
+            "renewed",
+            "observe",
+            "fenced",
+            "soft_deleted",
+            "reaped",
+            "stale",
+            "failed",
+        ] {
+            record_expiry_outcome(outcome);
+        }
+        record_expiry_cleanup(0.002);
+        record_expiry_queue(3, 1);
+        record_expiry_retry();
+        set_expiry_safety_pauses(true, false);
+        record_expiry_clock_drift(0.25);
+        record_expiry_reclaimed_local_bytes(4096);
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn expiry_outcome_label_set_is_closed() {
+        assert_eq!(imp::expiry_outcome_label("reaped"), "reaped");
+        assert_eq!(imp::expiry_outcome_label("/raw/path"), "failed");
+        assert_eq!(imp::expiry_outcome_label("stream-id"), "failed");
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn expiry_completed_pass_due_fraction_is_bounded_and_defined_for_empty_passes() {
+        assert_eq!(imp::expiry_due_fraction(0, 0), 0.0);
+        assert_eq!(imp::expiry_due_fraction(0, 1), 1.0);
+        assert_eq!(imp::expiry_due_fraction(4, 3), 0.75);
+        assert_eq!(imp::expiry_due_fraction(2, 3), 1.0);
+    }
+}

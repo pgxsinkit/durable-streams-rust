@@ -331,6 +331,12 @@ pub struct Shard {
     /// racing the drain sees a stale stream epoch and re-registers into the next
     /// interval's collection — no touched stream is ever dropped.
     dirty_epoch: AtomicU64,
+    /// Serializes checkpoint against checkpoint. Forget deliberately does not
+    /// take this lock: a hard retirement must not wait behind stream syncfs /
+    /// fdatasync, recycle, or deferred sidecar fanout. The per-stream
+    /// `wal_forgotten` marker plus `dirty`/`tails_cache` critical sections provide
+    /// the narrower checkpoint-vs-forget exclusion.
+    checkpoint_serial: Arc<tokio::sync::Mutex<()>>,
     /// Resident copy of the CUMULATIVE per-stream durable-tail map persisted at
     /// `<shard_dir>/tails` (task 11b). `None` until the first checkpoint needs it
     /// (then seeded from disk once); afterwards `persist_durable_tails` merges and
@@ -351,6 +357,22 @@ pub struct Shard {
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     on_stage: Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>,
+    /// One-shot deterministic race seam used to hold a checkpoint after its dirty
+    /// drain while it owns checkpoint serialization but before stream barriers.
+    #[cfg(test)]
+    checkpoint_after_drain: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-only one-shot pause after a checkpoint has merged into the resident
+    /// tails map while still holding the lock that covers its complete disk write.
+    #[cfg(test)]
+    checkpoint_tails_locked: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-only one-shot notification immediately before forget begins blocking
+    /// cleanup, preventing serialization tests from passing vacuously.
+    #[cfg(test)]
+    on_forget_attempt: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-only one-shot failure after the dirty drain, exercising checkpoint's
+    /// error re-registration against a concurrent forgotten marker.
+    #[cfg(test)]
+    fail_checkpoint_after_drain: std::sync::atomic::AtomicBool,
     /// Test-only fault injection: when set, the NEXT `reserve_and_stage`'s
     /// `write_at` is simulated as failing (returns an `io::Error` instead of
     /// writing). Lets a test prove a transient WAL write error FAILS the ack
@@ -508,10 +530,19 @@ impl Shard {
             // Epoch starts at 1; StreamStates start at dirty_epoch 0, so the first
             // append on every stream registers it (0 != 1).
             dirty_epoch: AtomicU64::new(1),
+            checkpoint_serial: Arc::new(tokio::sync::Mutex::new(())),
             tails_cache: Mutex::new(None),
             stats: ShardStats::default(),
             #[cfg(test)]
             on_stage: Mutex::new(None),
+            #[cfg(test)]
+            checkpoint_after_drain: Mutex::new(None),
+            #[cfg(test)]
+            checkpoint_tails_locked: Mutex::new(None),
+            #[cfg(test)]
+            on_forget_attempt: Mutex::new(None),
+            #[cfg(test)]
+            fail_checkpoint_after_drain: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
         }))
@@ -566,6 +597,11 @@ impl Shard {
                 }
             }
         }
+        // The file unlink above is only half of the reset: a checkpoint in this
+        // process may already have populated the cumulative resident map. If it
+        // survives, the first post-recovery checkpoint merges into that old map
+        // and recreates stale IDs in a brand-new `tails` file.
+        *self.tails_cache.lock().unwrap() = None;
         // Re-create a fresh, zero-filled active segment at lsn 1 and reset the
         // in-memory cursor to match (open already set lsn 1 / pos 0, but the active
         // FileSegment handle still points at the now-unlinked old inode).
@@ -801,6 +837,9 @@ impl Shard {
     /// (the hot path records nothing). `reserve_and_stage` stays ignorant of
     /// `StreamState`; the `StreamState` is needed solely by `checkpoint`.
     pub fn register_dirty(&self, _stream_id: u64, st: Arc<StreamState>) {
+        if st.is_wal_forgotten() {
+            return;
+        }
         let epoch = self.dirty_epoch.load(Ordering::Relaxed);
         // Hot path: already registered for the current checkpoint interval. Pure
         // relaxed loads + a branch — never touches the `dirty` lock.
@@ -827,7 +866,13 @@ impl Shard {
                 |ns| self.stats.record_dirty_lock_wait(ns),
                 || self.dirty.lock().unwrap(),
             );
-            g.push(st);
+            // Recheck under the same dirty lock forget uses for `retain`. Either
+            // this push wins first and forget removes it, or forget publishes the
+            // marker first and this branch suppresses the push. An early check
+            // alone leaves a check→retain→push resurrection race.
+            if !st.is_wal_forgotten() {
+                g.push(st);
+            }
         }
     }
 
@@ -854,6 +899,10 @@ impl Shard {
     ///
     /// Returns the `checkpoint_lsn` persisted.
     pub async fn checkpoint(self: &Arc<Self>) -> io::Result<u64> {
+        // Checkpoints share fixed tmp names and recycle state, so they remain
+        // fully serialized with one another. Forget does not take this lock.
+        let checkpoint_serial = Arc::clone(&self.checkpoint_serial).lock_owned().await;
+
         // 1. Snapshot the recycle floor = the highest durably-acked lsn.
         let checkpoint_lsn = self.durable_lsn.load(Ordering::Acquire);
 
@@ -897,7 +946,22 @@ impl Shard {
         // checkpoint_lsn → recycle. Acks never gate on any of this.
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || -> io::Result<u64> {
-            let result = Self::checkpoint_blocking(&this, &drained, checkpoint_lsn);
+            let _checkpoint_serial = checkpoint_serial;
+            #[cfg(test)]
+            if let Some(hook) = this.checkpoint_after_drain.lock().unwrap().take() {
+                hook();
+            }
+            #[cfg(test)]
+            let injected_failure = this
+                .fail_checkpoint_after_drain
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let injected_failure = false;
+            let result = if injected_failure {
+                Err(io::Error::other("injected checkpoint failure after drain"))
+            } else {
+                Self::checkpoint_blocking(&this, &drained, checkpoint_lsn)
+            };
             if result.is_err() {
                 // A failed checkpoint must NOT drop the drained dirty set: these
                 // streams' tails proofs were never persisted, and nothing
@@ -917,6 +981,42 @@ impl Shard {
         .expect("checkpoint task panicked")
     }
 
+    /// Forget all checkpoint bookkeeping for a truly hard-retired stream.
+    ///
+    /// Store calls this only after append admission is fenced and every in-flight
+    /// append has completed. In particular, soft-deleted fork parents must retain
+    /// their WAL bookkeeping and must never reach this method. The prune is kept
+    /// in the resident cumulative map; the next checkpoint rewrites it durably to
+    /// `<shard>/tails` using the normal tmp+fsync+rename protocol.
+    pub async fn forget_stream(self: &Arc<Self>, st: Arc<StreamState>) -> io::Result<()> {
+        // Store calls this only after successful physical hard unlink. Publish the
+        // marker synchronously before any await so a checkpoint already between
+        // dirty drain and tails merge/error re-registration must ignore this Arc.
+        st.mark_wal_forgotten();
+        let stream_id = st.id;
+        #[cfg(test)]
+        if let Some(hook) = self.on_forget_attempt.lock().unwrap().take() {
+            hook();
+        }
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            // `mark_wal_forgotten` happens before this lock. A racing dirty push
+            // either lands before retain and is removed, or observes the marker
+            // under this same lock and is suppressed.
+            this.dirty.lock().unwrap().retain(|st| st.id != stream_id);
+
+            // This lock covers a checkpoint's complete tails snapshot + durable
+            // rewrite (not just cache mutation), so after forget returns no older
+            // checkpoint body can rename a stale ID back onto disk.
+            let mut cache = this.tails_cache.lock().unwrap();
+            let map = cache.get_or_insert_with(|| Self::read_durable_tails_at(&this.dir));
+            map.remove(&stream_id);
+            Ok(())
+        })
+        .await
+        .expect("WAL forget task panicked")
+    }
+
     /// The blocking body of [`Self::checkpoint`]: capture → barrier → tails →
     /// checkpoint_lsn → recycle → sidecars. Split out so the caller can
     /// re-register `drained` on error (see checkpoint()).
@@ -934,11 +1034,11 @@ impl Shard {
             // already in the file's cache, so the file is durable up to AT LEAST
             // this tail afterwards (a later concurrent append only extends past
             // it and lands in the next checkpoint). Conservative-safe.
-            let touched: Vec<(u64, u64, Arc<std::fs::File>)> = drained
+            let touched: Vec<(Arc<StreamState>, u64, Arc<std::fs::File>)> = drained
                 .iter()
                 .map(|st| {
                     let s = st.shared.read().unwrap();
-                    (st.id, s.tail, Arc::clone(&s.file))
+                    (Arc::clone(st), s.tail, Arc::clone(&s.file))
                 })
                 .collect();
             let n_touched = touched.len();
@@ -991,7 +1091,10 @@ impl Shard {
             //     so when recycle deletes the WAL records below the floor,
             //     recovery can still truncate a recycled stream's torn
             //     per-stream-file tail to its durable tail.
-            let tails: Vec<(u64, u64)> = touched.iter().map(|(id, tail, _)| (*id, *tail)).collect();
+            let tails: Vec<(Arc<StreamState>, u64)> = touched
+                .iter()
+                .map(|(st, tail, _)| (Arc::clone(st), *tail))
+                .collect();
             let n_tails = this.persist_durable_tails(&tails)?;
             let t_tails = t_start.elapsed();
 
@@ -1045,7 +1148,7 @@ impl Shard {
         }
     }
 
-    /// Merge `touched` `(stream_id, durable_tail)` pairs into the persisted
+    /// Merge `touched` `(StreamState, durable_tail)` pairs into the persisted
     /// CUMULATIVE per-shard durable-tail map (`<shard_dir>/tails`) and rewrite it
     /// durably (`tmp` + rename + fsync the dir-synced file). Called from
     /// `checkpoint` AFTER the touched per-stream files are fdatasync'd and BEFORE
@@ -1053,22 +1156,31 @@ impl Shard {
     /// to its durable tail even after its WAL records are gone (task 11b).
     ///
     /// Cumulative-merge: merge into the RESIDENT map (`tails_cache`, seeded from
-    /// disk once on first use), overwrite each touched stream's entry with its
+    /// disk once on first use), skip hard-forgotten states, and overwrite each
+    /// remaining touched stream's entry with its
     /// newest durable tail (`max`, so a re-checkpointed earlier tail can never
     /// regress the recorded value), keep every untouched stream's last recorded
     /// tail. Serializing from memory avoids re-reading + re-parsing the whole
     /// file every checkpoint (O(total streams per shard) each ~3 s).
     /// Returns the number of entries in the persisted map (for `WAL_CKPT`).
-    fn persist_durable_tails(&self, touched: &[(u64, u64)]) -> io::Result<usize> {
+    fn persist_durable_tails(&self, touched: &[(Arc<StreamState>, u64)]) -> io::Result<usize> {
         if touched.is_empty() && !self.dir.join(TAILS_FILE).exists() {
             // Nothing touched and no prior map: nothing to persist.
             return Ok(0);
         }
         let mut cache = self.tails_cache.lock().unwrap();
         let map = cache.get_or_insert_with(|| Self::read_durable_tails_at(&self.dir));
-        for &(id, tail) in touched {
-            let slot = map.entry(id).or_insert(0);
-            *slot = (*slot).max(tail);
+        for (st, tail) in touched {
+            // Forget may have completed while this checkpoint was blocked in the
+            // stream barrier. Never merge an already-drained retired Arc.
+            if !st.is_wal_forgotten() {
+                let slot = map.entry(st.id).or_insert(0);
+                *slot = (*slot).max(*tail);
+            }
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.checkpoint_tails_locked.lock().unwrap().take() {
+            hook();
         }
         // Serialize as `stream_id durable_tail` lines (sorted for a deterministic,
         // diff-friendly file). Plain decimal text, matching the `checkpoint` file.
@@ -1082,10 +1194,9 @@ impl Shard {
                 let _ = writeln!(body, "{id} {tail}");
             }
         }
-        // The resident map is fully merged and serialized; release it before the
-        // file IO below (nothing else contends today, but don't hold a lock over
-        // a write+fsync+rename gratuitously).
-        drop(cache);
+        // Keep `cache` locked through the complete disk rewrite. Forget now
+        // contends here by design: releasing after snapshot would allow an older
+        // checkpoint body to rename a stale entry after forget removed it.
         let path = self.dir.join(TAILS_FILE);
         let tmp = self.dir.join(format!("{TAILS_FILE}.tmp"));
         std::fs::write(&tmp, &body)?;
@@ -1098,6 +1209,7 @@ impl Shard {
         // this barrier a crash could persist the unlinks but not the rename:
         // stale tails proof + WAL gone = recovery truncates acked bytes.
         crate::store::fsync_parent_dir(&path)?;
+        drop(cache);
         Ok(n)
     }
 
@@ -1653,6 +1765,33 @@ impl Shard {
         *self.on_stage.lock().unwrap() = Some(cb);
     }
 
+    /// Test-only: pause once immediately after checkpoint drains `dirty`, before
+    /// it enters stream capture/barrier work.
+    #[cfg(test)]
+    pub fn set_checkpoint_after_drain_hook(&self, cb: Box<dyn FnOnce() + Send>) {
+        *self.checkpoint_after_drain.lock().unwrap() = Some(cb);
+    }
+
+    /// Test-only: pause once while the checkpoint owns the full tails writer
+    /// critical section, after merge and before serialization/write.
+    #[cfg(test)]
+    pub fn set_checkpoint_tails_locked_hook(&self, cb: Box<dyn FnOnce() + Send>) {
+        *self.checkpoint_tails_locked.lock().unwrap() = Some(cb);
+    }
+
+    /// Test-only: notify once immediately before forget enters blocking cleanup.
+    #[cfg(test)]
+    pub fn set_on_forget_attempt_hook(&self, cb: Box<dyn FnOnce() + Send>) {
+        *self.on_forget_attempt.lock().unwrap() = Some(cb);
+    }
+
+    /// Test-only: make the next checkpoint fail after draining dirty state.
+    #[cfg(test)]
+    pub fn fail_checkpoint_after_drain(&self) {
+        self.fail_checkpoint_after_drain
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Test-only: assign the next lsn + reserve its segment range, but write **no
     /// bytes** — deliberately leaving a gap so the watermark/gap test can prove
     /// the committer will not advance `durable_lsn` past an unwritten lsn.
@@ -2090,6 +2229,323 @@ mod tests {
         }
         h.stop();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reset_after_recovery_clears_resident_tails_cache() {
+        let root = tmp("reset-tails-cache");
+        let shard_dir = root.join("shard");
+        let sh = Shard::open(shard_dir.clone()).unwrap();
+        let store = crate::store::Store::new_with_tier(
+            root.join("data"),
+            crate::tier::TierConfig::default(),
+        )
+        .unwrap();
+        let old = match store.create("old", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(s) => s,
+            _ => panic!("create failed"),
+        };
+        let new = match store.create("new", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(s) => s,
+            _ => panic!("create failed"),
+        };
+
+        // Populate both the on-disk tails file and the resident cache with `old`.
+        sh.register_dirty(old.id, Arc::clone(&old));
+        sh.checkpoint().await.unwrap();
+        assert!(sh.read_durable_tails().contains_key(&old.id));
+
+        // Recovery reset unlinks the old tails file. The next checkpoint must not
+        // repersist an entry retained only by the pre-reset in-memory cache.
+        sh.reset_after_recovery().unwrap();
+        sh.register_dirty(new.id, Arc::clone(&new));
+        sh.checkpoint().await.unwrap();
+        let tails = sh.read_durable_tails();
+        assert!(tails.contains_key(&new.id), "new generation tail persisted");
+        assert!(
+            !tails.contains_key(&old.id),
+            "reset must clear the resident cache as well as unlinking tails"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn forget_stream_removes_dirty_and_prunes_tails_on_next_checkpoint() {
+        let root = tmp("forget-prune");
+        let sh = Shard::open(root.join("shard")).unwrap();
+        let store = crate::store::Store::new_with_tier(
+            root.join("data"),
+            crate::tier::TierConfig::default(),
+        )
+        .unwrap();
+        let retired = match store.create("retired", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(s) => s,
+            _ => panic!("create failed"),
+        };
+        let live = match store.create("live", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(s) => s,
+            _ => panic!("create failed"),
+        };
+
+        sh.register_dirty(retired.id, Arc::clone(&retired));
+        sh.register_dirty(live.id, Arc::clone(&live));
+        sh.checkpoint().await.unwrap();
+        assert!(sh.read_durable_tails().contains_key(&retired.id));
+        assert!(sh.read_durable_tails().contains_key(&live.id));
+
+        // Put the retired stream back into the next checkpoint's dirty set. A
+        // hard-retirement forget must remove it from both sources of resurrection.
+        sh.register_dirty(retired.id, Arc::clone(&retired));
+        assert!(sh.is_dirty(retired.id));
+        assert!(!retired.is_wal_forgotten());
+        sh.forget_stream(Arc::clone(&retired)).await.unwrap();
+        assert!(retired.is_wal_forgotten());
+        assert!(
+            !sh.is_dirty(retired.id),
+            "hard retirement removes pending checkpoint work"
+        );
+        sh.register_dirty(retired.id, Arc::clone(&retired));
+        assert!(
+            !sh.is_dirty(retired.id),
+            "future registration is suppressed after hard retirement"
+        );
+
+        // Forget changes the resident map; the following checkpoint is the
+        // durability boundary that rewrites that prune to the tails file.
+        sh.checkpoint().await.unwrap();
+        let tails = sh.read_durable_tails();
+        assert!(!tails.contains_key(&retired.id));
+        assert_eq!(tails.get(&live.id), Some(&0), "unrelated live proof kept");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forget_stream_does_not_wait_for_paused_stream_barrier() {
+        use std::sync::Barrier;
+
+        let root = tmp("forget-checkpoint-serialization");
+        let sh = Shard::open(root.join("shard")).unwrap();
+        let store = crate::store::Store::new_with_tier(
+            root.join("data"),
+            crate::tier::TierConfig::default(),
+        )
+        .unwrap();
+        let retired = match store.create("retired", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(s) => s,
+            _ => panic!("create failed"),
+        };
+        let retired_id = retired.id;
+        sh.register_dirty(retired_id, Arc::clone(&retired));
+
+        // Pause after the dirty drain but before capture/fsync. A hard-retirement
+        // forget must finish while this expensive stream-barrier phase is paused;
+        // the forgotten marker makes the later tails merge/error path ignore the
+        // already-drained Arc.
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        sh.set_checkpoint_after_drain_hook(Box::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+            }
+        }));
+        let checkpoint = tokio::spawn({
+            let sh = Arc::clone(&sh);
+            async move { sh.checkpoint().await }
+        });
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .unwrap();
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        sh.set_on_forget_attempt_hook(Box::new(move || {
+            attempted_tx.send(()).unwrap();
+        }));
+        let mut forget = tokio::spawn({
+            let sh = Arc::clone(&sh);
+            let retired = Arc::clone(&retired);
+            async move { sh.forget_stream(retired).await }
+        });
+        tokio::task::spawn_blocking(move || attempted_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let completed_before_release =
+            match tokio::time::timeout(std::time::Duration::from_millis(200), &mut forget).await {
+                Ok(result) => {
+                    result.unwrap().unwrap();
+                    true
+                }
+                Err(_) => false,
+            };
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        checkpoint.await.unwrap().unwrap();
+        if !completed_before_release {
+            forget.await.unwrap().unwrap();
+        }
+        assert!(
+            completed_before_release,
+            "forget must not wait for stream fdatasync/syncfs work"
+        );
+        assert!(!sh.read_durable_tails().contains_key(&retired_id));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forget_waits_only_for_inflight_tails_snapshot_and_prunes_afterward() {
+        use std::sync::Barrier;
+
+        let root = tmp("forget-tails-serialization");
+        let sh = Shard::open(root.join("shard")).unwrap();
+        let store = crate::store::Store::new_with_tier(
+            root.join("data"),
+            crate::tier::TierConfig::default(),
+        )
+        .unwrap();
+        let retired = match store.create("retired", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(s) => s,
+            _ => panic!("create failed"),
+        };
+        let retired_id = retired.id;
+        sh.register_dirty(retired_id, Arc::clone(&retired));
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        sh.set_checkpoint_tails_locked_hook(Box::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+            }
+        }));
+        let checkpoint = tokio::spawn({
+            let sh = Arc::clone(&sh);
+            async move { sh.checkpoint().await }
+        });
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .unwrap();
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        sh.set_on_forget_attempt_hook(Box::new(move || {
+            attempted_tx.send(()).unwrap();
+        }));
+        let mut forget = tokio::spawn({
+            let sh = Arc::clone(&sh);
+            let retired = Arc::clone(&retired);
+            async move { sh.forget_stream(retired).await }
+        });
+        tokio::task::spawn_blocking(move || attempted_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let waited_for_tails =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut forget)
+                .await
+                .is_err();
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        checkpoint.await.unwrap().unwrap();
+        if waited_for_tails {
+            forget.await.unwrap().unwrap();
+        }
+        assert!(waited_for_tails, "forget serializes with the tails writer");
+
+        // The paused checkpoint was allowed to finish its older snapshot first;
+        // forget removed the ID afterward, and the next checkpoint durably
+        // rewrites that prune without any dirty work.
+        sh.checkpoint().await.unwrap();
+        assert!(!sh.read_durable_tails().contains_key(&retired_id));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forget_prevents_failed_checkpoint_reregistration() {
+        use std::sync::Barrier;
+
+        let root = tmp("forget-checkpoint-error");
+        let sh = Shard::open(root.join("shard")).unwrap();
+        let store = crate::store::Store::new_with_tier(
+            root.join("data"),
+            crate::tier::TierConfig::default(),
+        )
+        .unwrap();
+        let retired = match store.create("retired", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(s) => s,
+            _ => panic!("create failed"),
+        };
+        let retired_id = retired.id;
+        sh.register_dirty(retired_id, Arc::clone(&retired));
+        sh.fail_checkpoint_after_drain();
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        sh.set_checkpoint_after_drain_hook(Box::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+            }
+        }));
+        let checkpoint = tokio::spawn({
+            let sh = Arc::clone(&sh);
+            async move { sh.checkpoint().await }
+        });
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .unwrap();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        sh.set_on_forget_attempt_hook(Box::new(move || {
+            attempted_tx.send(()).unwrap();
+        }));
+        let mut forget = tokio::spawn({
+            let sh = Arc::clone(&sh);
+            let retired = Arc::clone(&retired);
+            async move { sh.forget_stream(retired).await }
+        });
+        tokio::task::spawn_blocking(move || attempted_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let completed_before_release =
+            match tokio::time::timeout(std::time::Duration::from_millis(200), &mut forget).await {
+                Ok(result) => {
+                    result.unwrap().unwrap();
+                    true
+                }
+                Err(_) => false,
+            };
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        assert!(
+            checkpoint.await.unwrap().is_err(),
+            "fault seam drives checkpoint's error re-registration path"
+        );
+        if !completed_before_release {
+            forget.await.unwrap().unwrap();
+        }
+        assert!(
+            completed_before_release,
+            "forget does not wait for a checkpoint that later fails"
+        );
+        assert!(
+            !sh.is_dirty(retired_id),
+            "the failed checkpoint cannot re-register a forgotten stream"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

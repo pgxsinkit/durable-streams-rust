@@ -7,7 +7,7 @@
 use std::process::{Child, Command, Stdio};
 use std::{
     io::{Read, Write},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
 };
 
 fn server() -> Command {
@@ -110,6 +110,14 @@ fn http_response(port: u16, request: &str) -> String {
             Err(error) => panic!("server did not listen: {error}"),
         }
     }
+}
+
+fn unused_local_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("reserve test port")
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// Spawn and give the process a bounded chance to exit on its own. `Some(code)` = it refused
@@ -231,6 +239,169 @@ fn wal_reserve_floor_cannot_be_lowered() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("reserve"));
     assert!(!dir.join("wal").exists());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn expiry_reaper_cli_rejects_invalid_mode_and_unbounded_controls() {
+    for (flag, value, expected) in [
+        (
+            "--expiry-reaper-mode",
+            "eager",
+            "--expiry-reaper-mode must be off|observe|delete",
+        ),
+        (
+            "--expiry-scan-rate",
+            "0",
+            "--expiry-scan-rate must be at least 1",
+        ),
+        (
+            "--expiry-delete-rate",
+            "0",
+            "--expiry-delete-rate must be at least 1",
+        ),
+        (
+            "--expiry-delete-concurrency",
+            "0",
+            "--expiry-delete-concurrency must be at least 1",
+        ),
+        (
+            "--expiry-scan-rate",
+            "1000001",
+            "--expiry-scan-rate must be at most 1000000",
+        ),
+        (
+            "--expiry-delete-rate",
+            "100001",
+            "--expiry-delete-rate must be at most 100000",
+        ),
+        (
+            "--expiry-delete-concurrency",
+            "1025",
+            "--expiry-delete-concurrency must be at most 1024",
+        ),
+        (
+            "--expiry-bulk-fraction",
+            "1.1",
+            "--expiry-bulk-fraction must be between 0 and 1",
+        ),
+        (
+            "--expiry-clock-jump-seconds",
+            "0",
+            "--expiry-clock-jump-seconds must be at least 1",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = server()
+            .args([
+                "--durability",
+                "memory",
+                "--data-dir",
+                dir.path().to_str().unwrap(),
+                flag,
+                value,
+            ])
+            .output()
+            .expect("expiry option validation");
+        assert_eq!(out.status.code(), Some(2), "{flag}={value}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{flag}={value} should report {expected:?}; got {stderr:?}"
+        );
+    }
+}
+
+#[test]
+fn proactive_expiry_reaping_rejects_s3_tiering() {
+    let dir = std::env::temp_dir().join("ds-rust-expiry-tier-guard");
+    let _ = std::fs::remove_dir_all(&dir);
+    bootstrap(&dir);
+    let mut args = wal_args(&dir, "14983");
+    args.extend(
+        [
+            "--expiry-reaper-mode",
+            "delete",
+            "--tier",
+            "s3",
+            "--tier-endpoint",
+            "https://objects.example",
+            "--tier-bucket",
+            "test",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    let out = server().args(args).output().expect("tier guard");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("--expiry-reaper-mode delete cannot be combined with --tier s3"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn delete_mode_reaps_an_expired_stream_without_a_request_to_that_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let port = unused_local_port();
+    let port_text = port.to_string();
+    let mut child = server()
+        .args([
+            "--durability",
+            "memory",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--port",
+            port_text.as_str(),
+            "--expiry-reaper-mode",
+            "delete",
+            "--expiry-startup-grace-seconds",
+            "0",
+            "--expiry-scan-rate",
+            "1000",
+            "--expiry-delete-rate",
+            "1000",
+            "--expiry-delete-concurrency",
+            "1",
+            "--expiry-bulk-fraction",
+            "1.0",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("server");
+
+    let created = http_response(
+        port,
+        "PUT /expires-unobserved HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nStream-TTL: 1\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+
+    let streams = dir.join("streams");
+    let stream_artifact_count = || {
+        std::fs::read_dir(&streams)
+            .expect("streams directory")
+            .filter_map(Result::ok)
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .count()
+    };
+    assert!(
+        stream_artifact_count() >= 2,
+        "data and metadata were created"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while stream_artifact_count() != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let remaining = stream_artifact_count();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(remaining, 0, "expired stream artifacts were not reaped");
 }
 
 #[test]

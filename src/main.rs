@@ -3,6 +3,7 @@ mod api;
 mod blobstore;
 mod data_dir_lock;
 mod engine_raw;
+mod expiry_reaper;
 mod handlers;
 mod http1;
 mod reserved_paths;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
+use expiry_reaper::{Config as ExpiryReaperConfig, Mode as ExpiryReaperMode};
 use store::Store;
 
 const DEFAULT_MINIMUM_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
@@ -245,6 +247,7 @@ fn main() {
     let mut minimum_free_bytes = DEFAULT_MINIMUM_FREE_BYTES;
     let mut minimum_free_inodes = DEFAULT_MINIMUM_FREE_INODES;
     let mut stream_lanes: Option<u32> = None;
+    let mut expiry_reaper = ExpiryReaperConfig::default();
     let mut args = raw_args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -276,6 +279,65 @@ fn main() {
             }
             "--long-poll-timeout-ms" => {
                 handlers::set_long_poll_timeout(parse_val(args.next(), "--long-poll-timeout-ms"));
+            }
+            "--expiry-reaper-mode" => {
+                let value = val(args.next(), "--expiry-reaper-mode");
+                expiry_reaper.mode = match value.as_str() {
+                    "off" => ExpiryReaperMode::Off,
+                    "observe" => ExpiryReaperMode::Observe,
+                    "delete" => ExpiryReaperMode::Delete,
+                    _ => exit_usage("--expiry-reaper-mode must be off|observe|delete"),
+                };
+            }
+            "--expiry-scan-rate" => {
+                expiry_reaper.scan_rate = parse_val(args.next(), "--expiry-scan-rate");
+                if expiry_reaper.scan_rate == 0 {
+                    exit_usage("--expiry-scan-rate must be at least 1");
+                }
+                if expiry_reaper.scan_rate > expiry_reaper::MAX_SCAN_RATE {
+                    exit_usage("--expiry-scan-rate must be at most 1000000");
+                }
+            }
+            "--expiry-delete-rate" => {
+                expiry_reaper.delete_rate = parse_val(args.next(), "--expiry-delete-rate");
+                if expiry_reaper.delete_rate == 0 {
+                    exit_usage("--expiry-delete-rate must be at least 1");
+                }
+                if expiry_reaper.delete_rate > expiry_reaper::MAX_DELETE_RATE {
+                    exit_usage("--expiry-delete-rate must be at most 100000");
+                }
+            }
+            "--expiry-delete-concurrency" => {
+                expiry_reaper.delete_concurrency =
+                    parse_val(args.next(), "--expiry-delete-concurrency");
+                if expiry_reaper.delete_concurrency == 0 {
+                    exit_usage("--expiry-delete-concurrency must be at least 1");
+                }
+                if expiry_reaper.delete_concurrency > expiry_reaper::MAX_DELETE_CONCURRENCY {
+                    exit_usage("--expiry-delete-concurrency must be at most 1024");
+                }
+            }
+            "--expiry-startup-grace-seconds" => {
+                expiry_reaper.startup_grace = std::time::Duration::from_secs(parse_val(
+                    args.next(),
+                    "--expiry-startup-grace-seconds",
+                ));
+            }
+            "--expiry-bulk-fraction" => {
+                expiry_reaper.bulk_fraction = parse_val(args.next(), "--expiry-bulk-fraction");
+                if !expiry_reaper.bulk_fraction.is_finite()
+                    || expiry_reaper.bulk_fraction <= 0.0
+                    || expiry_reaper.bulk_fraction > 1.0
+                {
+                    exit_usage("--expiry-bulk-fraction must be between 0 and 1");
+                }
+            }
+            "--expiry-clock-jump-seconds" => {
+                let seconds: u64 = parse_val(args.next(), "--expiry-clock-jump-seconds");
+                if seconds == 0 {
+                    exit_usage("--expiry-clock-jump-seconds must be at least 1");
+                }
+                expiry_reaper.clock_jump = std::time::Duration::from_secs(seconds);
             }
             // Resident tail-cache cap (bytes); 0 disables it (reads → sendfile/pread).
             // Default is platform-dependent (off on Linux, 64 KiB on macOS).
@@ -423,6 +485,10 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+
+    if expiry_reaper.mode == ExpiryReaperMode::Delete && tier.kind == tier::TierKind::S3 {
+        exit_usage("--expiry-reaper-mode delete cannot be combined with --tier s3");
     }
 
     // Apply --durability memory AFTER the arg loop. Memory mode is the buffered
@@ -689,6 +755,11 @@ fn main() {
             .resume(Arc::clone(&store))
             .await
             .expect("subscription recovery failed");
+        // Start the bounded retirement coordinator in every mode so lazy expiry
+        // and explicit DELETE never escape into detached cleanup work. `off`
+        // disables only the proactive scanner. Recovery and subscription resume
+        // are complete before the scanner can observe or retire anything.
+        let mut expiry_reaper = expiry_reaper::spawn(Arc::clone(&store), expiry_reaper);
         if let Some(readiness) = &readiness {
             readiness.ready();
         }
@@ -698,30 +769,32 @@ fn main() {
             data_dir.display()
         );
         tokio::select! {
-            _ = engine_raw::serve(store, listener, readiness.clone()) => {}
-            _ = shutdown_signal() => {
-                if let Some(readiness) = &readiness {
-                    // Stop advertising readiness before accepting drain work or
-                    // touching the committer/lock shutdown sequence.
-                    readiness.stopping();
-                }
-                // Stop accepting (the serve future is dropped here), let in-flight
-                // requests — including their group-commit fsync — finish, then flush
-                // telemetry. Bounded so a stuck request can't block shutdown forever.
-                // Close reactor-served SSE subscribers first so their permits are
-                // released and `drain` doesn't wait out the full grace period.
-                #[cfg(target_os = "linux")]
-                sse_reactor::shutdown();
-                engine_raw::drain(std::time::Duration::from_secs(25)).await;
-                // Stop + join the dedicated committer threads (Tier-2a) AFTER the
-                // request drain, so any commit a just-drained request staged is
-                // covered by each committer's final drain before the thread exits.
-                if let Some(walset) = wal_for_shutdown.take() {
-                    walset.stop_committers();
-                }
-                telemetry_guard.shutdown();
+            _ = engine_raw::serve(Arc::clone(&store), listener, readiness.clone()) => {
+                tracing::error!("HTTP server stopped unexpectedly");
+            }
+            _ = shutdown_signal() => {}
+            _ = expiry_reaper.stopped() => {
+                tracing::error!("expiration retirement supervisor stopped unexpectedly");
             }
         }
+        if let Some(readiness) = &readiness {
+            // Stop advertising readiness before accepting drain work or
+            // touching the committer/lock shutdown sequence.
+            readiness.stopping();
+        }
+        // Stop accepting (the serve future is dropped here), let in-flight
+        // requests — including their group-commit fsync — finish, then stop the
+        // retirement coordinator while WAL committers are still available.
+        #[cfg(target_os = "linux")]
+        sse_reactor::shutdown();
+        engine_raw::drain(std::time::Duration::from_secs(25)).await;
+        expiry_reaper.shutdown().await;
+        // Stop + join the dedicated committer threads (Tier-2a) AFTER request
+        // and retirement drain, so every staged append/forget is covered.
+        if let Some(walset) = wal_for_shutdown.take() {
+            walset.stop_committers();
+        }
+        telemetry_guard.shutdown();
     });
 }
 

@@ -1119,14 +1119,203 @@ async fn e2e_corrupt_sidecar_quarantines_instead_of_deleting() {
     // Tear the sidecar (simulates a crash-torn rename target).
     std::fs::write(&meta_path, b"{ this is not json").unwrap();
 
-    let h2 = Harness::boot(&dir, None, 1).unwrap();
-    assert!(h2.store.get("q").is_none(), "stream is skipped this boot");
+    // The Store pass itself quarantines and retains the artifacts. WAL startup
+    // is intentionally a separate concern: if this id still has retained WAL
+    // appends, recovery now refuses boot before replay/reset (covered below).
+    let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+    assert!(store.get("q").is_none(), "stream is skipped this boot");
     assert!(data_path.exists(), "data file must NOT be deleted");
     assert!(
         meta_path.with_extension("meta.corrupt").exists(),
         "sidecar parked as .meta.corrupt for repair"
     );
-    h2.crash();
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A quarantined sidecar is an unresolved identity, not proof that its stream
+/// was deleted. If its data file is shorter than an acknowledged WAL tail,
+/// startup must fail closed before `reset_after_recovery` can destroy the only
+/// durable copy/proof of those acknowledged bytes. Once an operator repairs the
+/// sidecar, the untouched WAL must still replay the tail byte-identically.
+#[tokio::test]
+async fn e2e_quarantined_sidecar_preserves_uncheckpointed_wal_tail_for_repair() {
+    let _guard = DurabilityGuard::wal();
+    const SEG: u64 = 4096;
+    let dir = tmp("sidecar-quarantine-wal-tail");
+    let h = Harness::boot_with_segment_size(&dir, Some(1), 1, SEG).unwrap();
+    create_stream(&h.store, "live", OCTET).await;
+    create_stream(&h.store, "q-tail", OCTET).await;
+    let live_acknowledged = b"live-acked-only-in-wal|";
+    let acknowledged = b"acked-only-in-wal|";
+    // The live record deliberately precedes the quarantined record. This proves
+    // the refusal is a full read-only preflight, not a check discovered midway
+    // through a replay that already mutated another stream's short data file.
+    append_acked(&h.store, "live", OCTET, live_acknowledged).await;
+    append_acked(&h.store, "q-tail", OCTET, acknowledged).await;
+
+    let st = h.store.get("q-tail").unwrap();
+    let stream_id = st.id;
+    let data_path = st.file_path.clone();
+    let live_data_path = h.store.get("live").unwrap().file_path.clone();
+    let meta_path = crate::store::meta_path(&data_path);
+    let valid_meta = std::fs::read(&meta_path).unwrap();
+    let seg_path = crate::wal::segment::seg_path(&dir.join("wal").join("0"), 1);
+    let wal_before = std::fs::read(&seg_path).unwrap();
+    drop(st);
+    h.crash();
+
+    // Model the crash boundary: the WAL append was whole + fdatasync'd before
+    // its 2xx, but the data file write did not survive and the sidecar tore.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&data_path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&live_data_path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    std::fs::write(&meta_path, b"{ torn sidecar").unwrap();
+
+    let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+    assert!(
+        store.get("q-tail").is_none(),
+        "quarantined identity is unresolved"
+    );
+    let parked_meta = meta_path.with_extension("meta.corrupt");
+    assert!(parked_meta.exists(), "torn sidecar was parked for repair");
+    let walset = WalSet::open_with_segment_size(&dir, None, 1, SEG).unwrap();
+
+    let err = crate::wal::recovery::recover(&store, &walset)
+        .expect_err("unresolved quarantined WAL identity must refuse startup/reset");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains(&stream_id.to_string()),
+        "error identifies the unresolved WAL stream: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&seg_path).unwrap(),
+        wal_before,
+        "failed recovery leaves the WAL byte-for-byte intact"
+    );
+    let mut retained = Vec::new();
+    walset.shards()[0]
+        .replay_from_checkpoint(0, |kind, id, offset, payload| {
+            if kind == crate::wal::codec::RecordKind::Append && id == stream_id {
+                retained.push((offset, payload.to_vec()));
+            }
+        })
+        .unwrap();
+    assert_eq!(retained, vec![(0, acknowledged.to_vec())]);
+    assert_eq!(std::fs::metadata(&data_path).unwrap().len(), 0);
+    assert_eq!(
+        std::fs::metadata(&live_data_path).unwrap().len(),
+        0,
+        "preflight refusal occurs before replay mutates an earlier live record"
+    );
+    drop(store);
+    drop(walset);
+
+    // Operator repairs the identity sidecar; a second boot can now replay the
+    // acknowledged tail from the WAL that the failed boot deliberately kept.
+    std::fs::write(&meta_path, valid_meta).unwrap();
+    std::fs::remove_file(&parked_meta).unwrap();
+    let repaired_store =
+        Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+    let repaired_wal = WalSet::open_with_segment_size(&dir, None, 1, SEG).unwrap();
+    crate::wal::recovery::recover(&repaired_store, &repaired_wal).unwrap();
+    repaired_wal.reset_after_recovery().unwrap();
+    assert_eq!(
+        stream_file_bytes(&repaired_store, "q-tail"),
+        acknowledged,
+        "the preserved WAL restores every acknowledged byte after repair"
+    );
+    assert_eq!(
+        stream_file_bytes(&repaired_store, "live"),
+        live_acknowledged,
+        "the preserved WAL also restores live streams after repair"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A manually moved/renamed quarantine may no longer carry the generated
+/// `~<stream-id>` suffix. Recovery cannot prove which WAL identity it owns, so
+/// even an apparently empty WAL must be left untouched until an operator makes
+/// the quarantine mappable again.
+#[tokio::test]
+async fn e2e_unmappable_quarantine_refuses_wal_recovery_before_reset() {
+    let _guard = DurabilityGuard::wal();
+    const SEG: u64 = 4096;
+    let dir = tmp("unmappable-sidecar-quarantine");
+
+    // Initialize the Store layout, then install a paired data/quarantine marker
+    // whose basename cannot yield a stable stream id.
+    drop(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+    let data_path = dir.join("streams").join("operator-renamed-stream");
+    std::fs::write(&data_path, b"kept").unwrap();
+    let marker = data_path.with_extension("meta.corrupt");
+    std::fs::write(&marker, b"{ unreadable").unwrap();
+
+    let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+    assert!(store.has_quarantined_streams());
+    assert!(!store.quarantined_stream_ids_complete());
+    let walset = WalSet::open_with_segment_size(&dir, Some(1), 1, SEG).unwrap();
+    let seg_path = crate::wal::segment::seg_path(&dir.join("wal").join("0"), 1);
+    let wal_before = std::fs::read(&seg_path).unwrap();
+
+    let err = crate::wal::recovery::recover(&store, &walset)
+        .expect_err("an unmappable quarantine must fail closed");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("no recoverable stream id"));
+    assert_eq!(std::fs::read(&seg_path).unwrap(), wal_before);
+    assert_eq!(std::fs::read(&data_path).unwrap(), b"kept");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Checkpoint-tail entries remain the durability proof after their WAL records
+/// have been recycled. A quarantined exact id that appears only in `tails` must
+/// therefore block reset just like one with a retained Append record.
+#[tokio::test]
+async fn e2e_quarantined_id_preserves_checkpoint_tail_evidence() {
+    let _guard = DurabilityGuard::wal();
+    const SEG: u64 = 4096;
+    let dir = tmp("quarantine-checkpoint-tail");
+    let h = Harness::boot_with_segment_size(&dir, Some(1), 1, SEG).unwrap();
+    create_stream(&h.store, "q-proof", OCTET).await;
+    let st = h.store.get("q-proof").unwrap();
+    let stream_id = st.id;
+    let data_path = st.file_path.clone();
+    let meta_path = crate::store::meta_path(&data_path);
+    drop(st);
+    h.crash();
+
+    // Model a recycled WAL generation: the stream-specific durability proof is
+    // now only in the checkpoint tails map. The exact value is immaterial to the
+    // admission decision; reset must not erase the evidence while identity is
+    // quarantined.
+    let tails_path = dir.join("wal").join("0").join("tails");
+    let tails = format!("{stream_id} 17\n");
+    std::fs::write(&tails_path, &tails).unwrap();
+    std::fs::write(&meta_path, b"{ torn sidecar").unwrap();
+
+    let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+    let walset = WalSet::open_with_segment_size(&dir, None, 1, SEG).unwrap();
+    let err = crate::wal::recovery::recover(&store, &walset)
+        .expect_err("quarantined checkpoint proof must block WAL reset");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains(&stream_id.to_string()));
+    assert_eq!(std::fs::read_to_string(&tails_path).unwrap(), tails);
+    assert!(
+        data_path.exists(),
+        "paired data remains available for repair"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

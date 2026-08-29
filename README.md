@@ -115,6 +115,22 @@ durable, single-node server on `127.0.0.1:4437` with its data dir under `$TMPDIR
 | `--tail-cache-bytes` | `0` (Linux) / `65536` (macOS) | resident tail-cache cap in bytes; `0` disables it (every read resolves to the file via `sendfile`/`pread`). Off by default on Linux (`sendfile` is already fast), on by default on macOS (no `sendfile`).         |
 | `--read-offload`     | `tail`                        | Linux: where `sendfile` reads run — `inline` (async worker), `tail` (live tail inline, catch-up on the blocking pool), `always` (blocking pool). `tail` keeps a cold backfill's disk fault off the async workers. |
 
+**Expiration reaper** — lazy request-time expiration is always enforced. These controls govern proactive discovery and reclamation of cold streams that are never requested again.
+
+| Flag                               | Default   | Description |
+| ---------------------------------- | --------- | ----------- |
+| `--expiry-reaper-mode`             | `off`     | `off` disables proactive scanning; `observe` scans and reports due streams without deleting them; `delete` enables bounded proactive retirement. |
+| `--expiry-scan-rate`               | `10000`   | Maximum expiring-stream index entries inspected per second (hard maximum `1000000`). |
+| `--expiry-delete-rate`             | `100`     | Maximum retirement attempts admitted per second (hard maximum `100000`). |
+| `--expiry-delete-concurrency`      | `4`       | Maximum concurrent retirement workers (hard maximum `1024`). |
+| `--expiry-startup-grace-seconds`   | `60`      | Minimum monotonic time after recovery before proactive deletion may start. A complete observe-only pass is also required. |
+| `--expiry-bulk-fraction`           | `0.25`    | Sticky safety pause when a pass has at least 64 due streams and its running due fraction exceeds this value. Setting `1.0` is the explicit bulk-delete override. |
+| `--expiry-clock-jump-seconds`      | `300`     | Sticky safety pause when wall-clock movement diverges from monotonic elapsed time by more than this threshold. |
+
+Deletion work is bounded to one configured second of admission; queue overflow is retried by a later scan rather than spawning detached work. Recovered abandoned tombstones and every physical step of a fork-parent cascade use that same admission, rate, and concurrency in all modes. A lossless full pass transfers recovered work to the coordinator so one failing tombstone cannot starve live scans. Physical failures receive six attempts over about 62 seconds; an exhausted exact incarnation is quarantined until restart, releases its admission permit for unrelated work, and is reported as `quarantined_retirements` by `GET /_admin/expiry`. Restart reconstructs and retries the still-indexed tombstone. The startup baseline and sticky bulk/clock latches survive scanner-task restarts. A bulk or clock pause affects proactive deletion only: protocol-visible lazy expiration continues to use wall time. Production deployments should pass the mode explicitly, start in `observe`, and change to `delete` only after validating the due fraction and clock status.
+
+Recovery parks an unreadable stream sidecar as `.meta.corrupt` and never deletes its paired data. In WAL mode, startup performs a read-only preflight before replay or reset: a quarantined ID with retained append/checkpoint evidence, or a quarantine filename whose ID cannot be recovered, refuses startup and leaves the WAL intact for operator repair. Repair or restore the sidecar before restarting in WAL mode; memory mode may boot with the stream skipped. Parked filename IDs remain reserved so a later incarnation cannot reuse them.
+
 **Cold-storage tier** — off by default; see [Tiered storage](#tiered-storage-cold-offload). With `--tier off` the server is byte-identical to a single-file deployment.
 
 | Flag                                          | Default    | Description                                              |
@@ -131,6 +147,7 @@ durable, single-node server on `127.0.0.1:4437` with its data dir under `$TMPDIR
 
 S3 credentials come from the **environment**, never flags: `DS_S3_ACCESS_KEY_ID` /
 `DS_S3_SECRET_ACCESS_KEY` (or the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
+Proactive `--expiry-reaper-mode delete` is refused with S3 tiering until remote deletion has a durable GC tombstone; `off`, `observe`, lazy expiry, and explicit deletion remain available.
 
 ### Choosing a configuration
 

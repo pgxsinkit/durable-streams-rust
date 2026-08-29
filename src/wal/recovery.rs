@@ -29,8 +29,12 @@
 //!    - Else write the payload into the per-stream file at
 //!      `file_pos = stream_offset − file_base`, and track the stream's max
 //!      recovered logical end (`stream_offset + payload_len`).
-//!    - A record whose `stream_id` has no `StreamState` (deleted stream) is
-//!      skipped — recovery never resurrects identity.
+//!    - Before replay mutates any file, quarantined sidecar IDs are audited
+//!      against every retained `Append` and checkpoint-tail proof. A match (or
+//!      an unmappable quarantine) refuses recovery and leaves the WAL intact for
+//!      operator repair. After that proof, a record whose `stream_id` has no
+//!      `StreamState` is a deleted stream and is skipped — recovery never
+//!      resurrects identity.
 //! 4. **Reconcile each touched stream's file tail to the durable frontier:**
 //!    - If the per-stream file is LONGER than the recovered frontier, a torn
 //!      record reached the file's page cache but never the durable WAL (un-acked)
@@ -63,9 +67,11 @@ pub(crate) static RECOVERY_FSYNCS: std::sync::atomic::AtomicU64 =
 /// Replay every shard's WAL (in parallel) and repair each touched stream's
 /// per-stream-file tail to the durable frontier. See the module docs / spec §9.
 ///
-/// Must run AFTER `Store::recover` (the sidecar pass), which owns identity. It is
-/// a no-op for streams not present in the sidecar-recovered set (deleted streams)
-/// and for records below a stream's `file_base` (compacted prefix).
+/// Must run AFTER `Store::recover` (the sidecar pass), which owns identity. It
+/// first fails closed if an unresolved quarantine may own retained WAL bytes;
+/// otherwise it is a no-op for identities not present in the sidecar-recovered
+/// set (proved deleted streams) and for records below a stream's `file_base`
+/// (compacted prefix).
 pub fn recover(store: &Arc<Store>, wal: &Arc<WalSet>) -> io::Result<()> {
     // Build the id → StreamState index once from the sidecar-recovered streams.
     // Streams are keyed by NAME in the store; recovery routes by `stream_id`, so
@@ -102,6 +108,19 @@ pub fn recover(store: &Arc<Store>, wal: &Arc<WalSet>) -> io::Result<()> {
     }
     let index = Arc::new(index);
 
+    // A parked sidecar is an unresolved identity, not evidence that the stream
+    // was deleted. Before touching ANY stream file, prove that the retained WAL
+    // has no append or checkpoint-tail proof for an exactly identified
+    // quarantine. Without this preflight the replay below skips the unknown id
+    // and startup then resets the WAL, potentially destroying the only durable
+    // copy/proof of an acknowledged tail whose data-file write did not survive.
+    //
+    // A malformed quarantine filename cannot be mapped back to a stream id at
+    // all, so there is no sound way to distinguish its records from genuinely
+    // deleted identities. Fail closed unconditionally; an operator must repair
+    // or remove the marker before WAL recovery may mutate files or reset logs.
+    refuse_unresolved_quarantined_wal(store, wal)?;
+
     // Per-shard passes are independent (disjoint stream sets). Spawn one blocking
     // task per shard and join — the replay is synchronous file I/O.
     let mut handles = Vec::with_capacity(wal.shards().len());
@@ -117,6 +136,63 @@ pub fn recover(store: &Arc<Store>, wal: &Arc<WalSet>) -> io::Result<()> {
         h.join().expect("WAL recovery shard thread panicked")?;
     }
     Ok(())
+}
+
+/// Refuse recovery before its first replay write when a quarantined identity
+/// still owns a complete append record or a checkpoint-tail proof. Returning an
+/// error keeps `main`/the boot harness from reaching `reset_after_recovery`,
+/// preserving both acknowledged bytes and their proof for operator repair.
+fn refuse_unresolved_quarantined_wal(store: &Store, wal: &WalSet) -> io::Result<()> {
+    if !store.has_quarantined_streams() {
+        return Ok(());
+    }
+    if !store.quarantined_stream_ids_complete() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WAL recovery refused: a quarantined stream sidecar has no recoverable stream id; \
+             repair or remove the .meta.corrupt marker before startup (WAL left intact)",
+        ));
+    }
+
+    let quarantined: std::collections::HashSet<u64> =
+        store.quarantined_stream_ids().into_iter().collect();
+    if quarantined.is_empty() {
+        return Ok(());
+    }
+
+    for shard in wal.shards() {
+        let persisted_tails = shard.read_durable_tails();
+        if let Some(stream_id) = quarantined
+            .iter()
+            .find(|stream_id| persisted_tails.contains_key(stream_id))
+        {
+            return Err(quarantined_wal_error(*stream_id));
+        }
+        let mut unresolved = None;
+        shard.replay_from_checkpoint(0, |kind, stream_id, _, _| {
+            if unresolved.is_none()
+                && kind == RecordKind::Append
+                && quarantined.contains(&stream_id)
+            {
+                unresolved = Some(stream_id);
+            }
+        })?;
+        if let Some(stream_id) = unresolved {
+            return Err(quarantined_wal_error(stream_id));
+        }
+    }
+    Ok(())
+}
+
+fn quarantined_wal_error(stream_id: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "WAL recovery refused: quarantined stream id {stream_id} has retained WAL or \
+             checkpoint durability evidence; repair its .meta.corrupt sidecar before \
+             startup (WAL left intact)"
+        ),
+    )
 }
 
 /// Replay one shard and reconcile the tails of the streams it touched.
@@ -166,13 +242,12 @@ fn recover_shard(
     // but no retained WAL record still gets reconciled), then raised by the replay
     // below. Only streams with EITHER a persisted tail OR an in-range Append are
     // inserted, so we reconcile exactly the streams the WAL touched.
-    let mut frontier: HashMap<u64, u64> = shard.read_durable_tails();
-    // Fold in the per-stream sidecar proof (every stream of this shard gets an
-    // entry; max keeps the strongest proof).
-    for (id, proof) in seed {
-        let slot = frontier.entry(id).or_insert(0);
-        *slot = (*slot).max(proof);
-    }
+    let frontier_from_disk = shard.read_durable_tails();
+    // A tails sidecar may still contain a hard-retired ID if the process crashed
+    // after retirement but before the next checkpoint durably rewrote the prune.
+    // Stream identity belongs to Store's recovered sidecars: filter the loaded
+    // tail map to this shard's live seed IDs before merging either source.
+    let mut frontier = merge_live_frontier(frontier_from_disk, seed);
     // Streams whose per-stream FILE was actually written by the replay below —
     // their reconcile must run unconditionally (fsync the repair).
     let mut replay_wrote: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -297,6 +372,20 @@ fn recover_shard(
         reconcile_tail(st, logical_tail)?;
     }
     Ok(())
+}
+
+/// Keep checkpoint tails only for identities proved live by Store recovery, then
+/// merge each live sidecar proof using the strongest known frontier.
+fn merge_live_frontier(
+    mut persisted: HashMap<u64, u64>,
+    seed: HashMap<u64, u64>,
+) -> HashMap<u64, u64> {
+    persisted.retain(|id, _| seed.contains_key(id));
+    for (id, proof) in seed {
+        let slot = persisted.entry(id).or_insert(0);
+        *slot = (*slot).max(proof);
+    }
+    persisted
 }
 
 /// Positioned write of `payload` at `file_pos` into a stream's per-stream file.
@@ -445,6 +534,22 @@ mod tests {
             fork_offset_raw: None,
             fork_sub_offset: None,
         }
+    }
+
+    #[test]
+    fn persisted_tails_are_filtered_to_live_seed_ids_before_merge() {
+        let retired = 41;
+        let live = 42;
+        let persisted = HashMap::from([(retired, 999), (live, 10)]);
+        let seed = HashMap::from([(live, 12)]);
+
+        let frontier = merge_live_frontier(persisted, seed);
+
+        assert_eq!(frontier, HashMap::from([(live, 12)]));
+        assert!(
+            !frontier.contains_key(&retired),
+            "a stale tails-file entry is not a live recovery identity"
+        );
     }
 
     /// Encode an `Append` record for `(stream_id, stream_offset, payload)` at `lsn`

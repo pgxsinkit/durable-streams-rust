@@ -116,6 +116,12 @@ pub fn register(
     };
     let _ = std_stream.set_nonblocking(true);
     let fd = std_stream.into_raw_fd();
+    if reg.st.is_fenced() {
+        unsafe {
+            libc::close(fd);
+        }
+        return;
+    }
     // If shutdown has begun, the target reactor may already have run `close_all`
     // and exited, which would leak this fd + permit. Close it and let the permit
     // drop instead.
@@ -380,6 +386,11 @@ impl Reactor {
             _ => return,
         };
         loop {
+            if sub.st.is_fenced() {
+                sub.done = true;
+                frame_terminator(&mut sub.pending);
+                return;
+            }
             let (file, file_base, tail, closed) = {
                 let s = sub.st.shared.read().unwrap();
                 (
@@ -555,6 +566,15 @@ impl Reactor {
             let Some(sub) = self.slab[key as usize].sub.as_ref() else {
                 continue;
             };
+            if sub.st.is_fenced() {
+                let sub = self.slab[key as usize].sub.as_mut().unwrap();
+                if !sub.done {
+                    sub.done = true;
+                    frame_terminator(&mut sub.pending);
+                }
+                self.flush(key);
+                continue;
+            }
             if now.duration_since(sub.registered_at) >= MAX_DURATION {
                 // Lifetime cap: end cleanly; the client reconnects from its offset.
                 let sub = self.slab[key as usize].sub.as_mut().unwrap();

@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::api::{base64_encode, Body, Method, Req, Resp};
 use crate::store::{format_offset, parse_offset, ParsedOffset, Store};
@@ -192,6 +192,12 @@ pub struct SubscriptionManager {
     state_path: PathBuf,
     dirty_revision: AtomicU64,
     persistence_scheduled: AtomicBool,
+    /// Number of detached coalescing writers that have been admitted but have
+    /// not fully exited yet. This is separate from `persistence_scheduled`,
+    /// which intentionally has a brief handoff window while a dirty successor
+    /// races the current writer.
+    persistence_active: AtomicUsize,
+    persistence_idle: Notify,
     persistence_sequence: AtomicU64,
     persisted_sequence: Arc<AtomicU64>,
     persistence_file_lock: Arc<StdMutex<()>>,
@@ -203,6 +209,23 @@ pub struct SubscriptionManager {
     token_key: hmac::Key,
     service_jwt: ServiceJwtVerifier,
     public_base_url: Option<String>,
+}
+
+struct PersistenceActivity {
+    manager: Arc<SubscriptionManager>,
+}
+
+impl Drop for PersistenceActivity {
+    fn drop(&mut self) {
+        if self
+            .manager
+            .persistence_active
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.manager.persistence_idle.notify_waiters();
+        }
+    }
 }
 
 struct SubscriptionCreateGuard<'a> {
@@ -396,6 +419,8 @@ impl SubscriptionManager {
             state_path,
             dirty_revision: AtomicU64::new(0),
             persistence_scheduled: AtomicBool::new(false),
+            persistence_active: AtomicUsize::new(0),
+            persistence_idle: Notify::new(),
             persistence_sequence: AtomicU64::new(0),
             persisted_sequence: Arc::new(AtomicU64::new(0)),
             persistence_file_lock: Arc::new(StdMutex::new(())),
@@ -455,8 +480,17 @@ impl SubscriptionManager {
         if self.persistence_scheduled.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Account before spawning so a drain started immediately after this
+        // function returns cannot miss a task that Tokio has not polled yet.
+        self.persistence_active.fetch_add(1, Ordering::AcqRel);
         let manager = Arc::clone(self);
+        let activity = PersistenceActivity {
+            manager: Arc::clone(&manager),
+        };
         tokio::spawn(async move {
+            // Move an already-created guard into the future so cancellation
+            // before its first poll still releases the active slot.
+            let _activity = activity;
             let mut delay_ms = 0u64;
             loop {
                 if delay_ms != 0 {
@@ -522,6 +556,25 @@ impl SubscriptionManager {
                 }
             }
         });
+    }
+
+    /// Wait until every coalescing snapshot writer admitted before or during
+    /// this wait has exited. Registering the notification before observing the
+    /// count prevents a final writer transition from being missed.
+    #[cfg(test)]
+    async fn drain_state_persistence(&self) {
+        loop {
+            let idle = self.persistence_idle.notified();
+            tokio::pin!(idle);
+            // `notify_waiters` does not store a permit. Enroll this waiter
+            // before observing the active count so the final writer cannot
+            // transition to zero in the gap before the first `.await` poll.
+            idle.as_mut().enable();
+            if self.persistence_active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
     }
 
     fn refresh_signing_keys(&self) -> io::Result<()> {
@@ -1018,7 +1071,7 @@ impl SubscriptionManager {
             }
         }
         if config.kind == SubscriptionKind::PullWake {
-            if let Err(message) = validate_wake_stream(&store, &stream_root, &config) {
+            if let Err(message) = validate_wake_stream(&store, &stream_root, &config).await {
                 return subscription_error(409, "WAKE_STREAM_INVALID", message);
             }
         }
@@ -1555,28 +1608,79 @@ impl SubscriptionManager {
         }
     }
 
-    pub async fn on_stream_deleted(self: &Arc<Self>, store: Arc<Store>, absolute_path: &str) {
+    /// Durably apply the subscription-side transition for one retired stream
+    /// incarnation. The caller keeps the old, fenced stream mapped until this
+    /// returns, so `expected_stream_id` prevents a delayed retry from mutating
+    /// links belonging to a replacement at the same path.
+    pub async fn on_stream_deleted(
+        self: &Arc<Self>,
+        store: Arc<Store>,
+        absolute_path: &str,
+        expected_stream_id: u64,
+    ) -> io::Result<()> {
         if self.subscription_count.load(Ordering::Acquire) == 0 {
-            return;
+            return Ok(());
+        }
+        if store
+            .streams
+            .get(absolute_path)
+            .is_some_and(|stream| stream.id != expected_stream_id)
+        {
+            return Ok(());
         }
         let deliveries = {
             let mut state = self.state.lock().await;
+            // Identify affected subscriptions before cloning any rollback
+            // state. The overwhelmingly common deletion has no matching link;
+            // it must stay allocation- and persistence-free.
+            let affected = state
+                .subscriptions
+                .iter()
+                .filter_map(|(key, subscription)| {
+                    let relative = relative_stream_path(&subscription.stream_root, absolute_path)?;
+                    let linked = subscription
+                        .streams
+                        .get(&relative)
+                        .is_some_and(|link| link.stream_id == Some(expected_stream_id));
+                    let wake_stream =
+                        subscription.config.wake_stream.as_deref() == Some(relative.as_str());
+                    (linked || wake_stream).then(|| (key.clone(), relative))
+                })
+                .collect::<Vec<_>>();
+            if affected.is_empty() {
+                return Ok(());
+            }
+            let before = affected
+                .iter()
+                .map(|(key, _)| {
+                    (
+                        key.clone(),
+                        state
+                            .subscriptions
+                            .get(key)
+                            .expect("affected subscription still exists")
+                            .clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
             let mut deliveries = Vec::new();
-            let mut changed = false;
-            for subscription in state.subscriptions.values_mut() {
-                let Some(relative) = relative_stream_path(&subscription.stream_root, absolute_path)
-                else {
-                    continue;
-                };
-                let was_linked = subscription.streams.contains_key(&relative);
+            for (key, relative) in &affected {
+                let subscription = state
+                    .subscriptions
+                    .get_mut(key)
+                    .expect("affected subscription still exists");
+                let was_linked = subscription
+                    .streams
+                    .get(relative)
+                    .is_some_and(|link| link.stream_id == Some(expected_stream_id));
                 let was_wake_stream =
                     subscription.config.wake_stream.as_deref() == Some(relative.as_str());
-                if !was_linked && !was_wake_stream {
-                    continue;
-                }
-                changed = true;
                 let mut remove_link = false;
-                if let Some(link) = subscription.streams.get_mut(&relative) {
+                if let Some(link) = subscription
+                    .streams
+                    .get_mut(relative)
+                    .filter(|_| was_linked)
+                {
                     if link.explicit {
                         // Explicit membership survives deletion/recreation, but
                         // the recreated stream starts a new offset lifetime.
@@ -1587,9 +1691,9 @@ impl SubscriptionManager {
                         remove_link = true;
                     }
                 }
-                let was_in_snapshot = subscription.wake_snapshot.contains_key(&relative);
+                let was_in_snapshot = subscription.wake_snapshot.contains_key(relative);
                 if remove_link {
-                    subscription.streams.remove(&relative);
+                    subscription.streams.remove(relative);
                 }
                 if (was_wake_stream || was_in_snapshot) && subscription.wake_id.is_some() {
                     // Any worker/callback for the old snapshot could otherwise
@@ -1607,14 +1711,41 @@ impl SubscriptionManager {
                     clear_wake(subscription);
                 }
             }
-            if changed {
-                self.persist_background_or_abort(&state, "delete transition");
+            let persisted = PersistedState {
+                version: STATE_VERSION,
+                subscriptions: state.subscriptions.values().cloned().collect(),
+            };
+            let sequence = self
+                .persistence_sequence
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
+            let path = self.state_path.clone();
+            let file_lock = Arc::clone(&self.persistence_file_lock);
+            let persisted_sequence = Arc::clone(&self.persisted_sequence);
+            let result = tokio::task::spawn_blocking(move || {
+                persist_ordered_snapshot(
+                    &path,
+                    &file_lock,
+                    &persisted_sequence,
+                    sequence,
+                    &persisted,
+                )
+            })
+            .await
+            .map_err(|error| io::Error::other(format!("subscription writer failed: {error}")))
+            .and_then(|result| result);
+            if let Err(error) = result {
+                for (key, subscription) in before {
+                    state.subscriptions.insert(key, subscription);
+                }
+                return Err(error);
             }
             deliveries
         };
         for delivery in deliveries {
             self.execute_delivery(store.clone(), delivery).await;
         }
+        Ok(())
     }
 
     fn create_wake(
@@ -2895,20 +3026,30 @@ fn valid_relative_stream_path(path: &str) -> bool {
         && path.split('/').next() != Some("__ds")
 }
 
-fn validate_wake_stream(
-    store: &Store,
+async fn validate_wake_stream(
+    store: &Arc<Store>,
     stream_root: &str,
     config: &SubscriptionConfig,
 ) -> Result<(), &'static str> {
     let Some(wake_stream) = config.wake_stream.as_deref() else {
         return Err("pull-wake subscriptions require wake_stream");
     };
-    let Some(stream) = store.get(&absolute_stream_path(stream_root, wake_stream)) else {
-        return Err("wake_stream must be created before the subscription");
+    let lookup_now = SystemTime::now();
+    let stream = match store.lookup_at(
+        &absolute_stream_path(stream_root, wake_stream),
+        lookup_now,
+        false,
+    ) {
+        crate::store::StreamLookup::Live(stream) => stream,
+        crate::store::StreamLookup::Gone(_) => return Err("wake_stream is deleted"),
+        crate::store::StreamLookup::Missing => {
+            return Err("wake_stream must be created before the subscription")
+        }
+        crate::store::StreamLookup::Expired(candidate) => {
+            crate::handlers::enqueue_expired_before_not_found(store, &candidate, lookup_now).await;
+            return Err("wake_stream must be created before the subscription");
+        }
     };
-    if stream.shared.read().unwrap().soft_deleted {
-        return Err("wake_stream is deleted");
-    }
     if stream.tail().closed {
         return Err("wake_stream must be open");
     }
@@ -2931,7 +3072,9 @@ fn list_streams(store: &Store, stream_root: &str) -> Vec<String> {
         .streams
         .iter()
         .filter(|entry| {
-            !entry.value().is_expired() && !entry.value().shared.read().unwrap().soft_deleted
+            !entry.value().is_fenced()
+                && !entry.value().is_expired()
+                && !entry.value().shared.read().unwrap().soft_deleted
         })
         .filter_map(|entry| relative_stream_path(stream_root, entry.key()))
         .collect()
@@ -2954,7 +3097,7 @@ fn live_stream_metadata(store: &Store, stream_root: &str, relative: &str) -> Opt
         .streams
         .get(&absolute_stream_path(stream_root, relative))?
         .clone();
-    if stream.is_expired() || stream.shared.read().unwrap().soft_deleted {
+    if stream.is_fenced() || stream.is_expired() || stream.shared.read().unwrap().soft_deleted {
         return None;
     }
     Some((stream.id, format_offset(stream.tail().bytes)))
@@ -3508,6 +3651,35 @@ mod tests {
         assert_eq!(value["version"], STATE_VERSION);
     }
 
+    // Deliberately hold the synchronous writer lock while yielding: the test
+    // must prove the async drain observes a writer blocked in spawn_blocking.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn persistence_drain_waits_for_a_held_snapshot_writer() {
+        let (store, dir) = test_store("persistence-drain");
+        let file_lock = store.subscriptions.persistence_file_lock.lock().unwrap();
+        store.subscriptions.schedule_state_persistence();
+
+        let manager = store.subscriptions.clone();
+        let drain = tokio::spawn(async move {
+            manager.drain_state_persistence().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "drain must wait for the scheduled writer holding an active slot"
+        );
+
+        drop(file_lock);
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("drain must finish after the writer is released")
+            .unwrap();
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn dns_target_policy_accepts_public_ipv6_and_rejects_local_ranges() {
         assert!(public_webhook_ip("2606:4700:4700::1111".parse().unwrap()));
@@ -3605,6 +3777,39 @@ mod tests {
         )
         .await;
         assert_eq!(response.status, 409);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn expired_wake_stream_validation_enqueues_retirement() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("expired-wake");
+        let mut wake = json_request(Method::Put, "/root/wake/pool", json!([]));
+        wake.headers.push(("stream-ttl".into(), "1".into()));
+        assert_eq!(handle(store.clone(), wake).await.status, 201);
+        let expired = store.streams.get("/root/wake/pool").unwrap().clone();
+        expired.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(2);
+
+        let response = handle(
+            store.clone(),
+            json_request(
+                Method::Put,
+                "/root/__ds/subscriptions/sub-1",
+                json!({
+                    "type": "pull-wake",
+                    "pattern": "events/*",
+                    "wake_stream": "wake/pool"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(response.status, 409);
+        assert!(
+            !expired.file_path.exists(),
+            "validation must hand its expired lookup candidate to retirement"
+        );
+
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3783,6 +3988,335 @@ mod tests {
         assert!(
             store.get("/root/wake/pool").unwrap().tail().bytes > first_wake_tail,
             "the outstanding wake for the deleted stream must not suppress later work"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_delayed_delete_transition_cannot_unlink_a_replacement_incarnation() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("delete-incarnation-fence");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        let old = store.get("/root/events/a").unwrap();
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "streams": ["events/a"],
+                        "wake_stream": "wake/pool"
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+
+        // Model path reuse winning before an old asynchronous deletion callback
+        // reaches the subscription manager. The callback must be fenced by the
+        // deleted stream's immutable id, never by path alone.
+        store.streams.remove("/root/events/a");
+        create_json_stream(&store, "/root/events/a").await;
+        let replacement = store.get("/root/events/a").unwrap();
+        assert_ne!(replacement.id, old.id);
+
+        store
+            .subscriptions
+            .clone()
+            .on_stream_deleted(store.clone(), "/root/events/a", old.id)
+            .await
+            .unwrap();
+
+        let state = store.subscriptions.state.lock().await;
+        let link = state
+            .subscriptions
+            .get(&subscription_key("/root", "sub-1"))
+            .unwrap()
+            .streams
+            .get("events/a")
+            .expect("replacement link must survive a stale delete callback");
+        assert_eq!(link.stream_id, Some(replacement.id));
+        drop(state);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_delete_transition_is_reported_and_rolled_back() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("delete-transition-persist-failure");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        let stream = store.get("/root/events/a").unwrap();
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "streams": ["events/a"],
+                        "wake_stream": "wake/pool"
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+
+        std::fs::remove_file(&store.subscriptions.state_path).unwrap();
+        std::fs::create_dir(&store.subscriptions.state_path).unwrap();
+        assert!(matches!(
+            store.prepare_delete(&stream).await,
+            crate::store::PrepareRetirement::Ready
+        ));
+        let error = store
+            .subscriptions
+            .clone()
+            .on_stream_deleted(store.clone(), "/root/events/a", stream.id)
+            .await
+            .expect_err("the retirement coordinator must see persistence failure");
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::IsADirectory
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Other
+            ),
+            "unexpected persistence failure: {error}"
+        );
+
+        let state = store.subscriptions.state.lock().await;
+        let link = state
+            .subscriptions
+            .get(&subscription_key("/root", "sub-1"))
+            .unwrap()
+            .streams
+            .get("events/a")
+            .unwrap();
+        assert_eq!(link.stream_id, Some(stream.id));
+        drop(state);
+        let retry = handle(
+            store.clone(),
+            json_request(Method::Put, "/root/events/a", json!([])),
+        )
+        .await;
+        assert_eq!(
+            retry.status, 503,
+            "a compatible PUT must not downgrade a failed explicit retirement"
+        );
+        assert!(retry
+            .headers
+            .iter()
+            .any(|(name, value)| *name == "retry-after" && value == "1"));
+        assert_eq!(
+            handle(
+                store.clone(),
+                Req {
+                    method: Method::Get,
+                    path: "/root/events/a".into(),
+                    query: Some("offset=0000000000000000_0000000000000000".into()),
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+            )
+            .await
+            .status,
+            404
+        );
+        assert!(
+            stream.file_path.exists(),
+            "a GET must not downgrade a failed explicit retirement to expiry durability"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn delete_transition_persistence_does_not_block_the_async_worker() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("delete-transition-blocking-io");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        let stream = store.streams.get("/root/events/a").unwrap().clone();
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "streams": ["events/a"],
+                        "wake_stream": "wake/pool"
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+
+        let file_lock = Arc::clone(&store.subscriptions.persistence_file_lock);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = file_lock.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            // The timeout is a deadlock failsafe for the RED implementation,
+            // where synchronous fsync blocks this single-thread Tokio runtime.
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        locked_rx.recv().unwrap();
+
+        let manager = store.subscriptions.clone();
+        let store2 = store.clone();
+        let stream_id = stream.id;
+        let transition = tokio::spawn(async move {
+            manager
+                .on_stream_deleted(store2, "/root/events/a", stream_id)
+                .await
+        });
+        let started = Instant::now();
+        tokio::task::yield_now().await;
+        let worker_delay = started.elapsed();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        transition.await.unwrap().unwrap();
+        assert!(
+            worker_delay < Duration::from_millis(500),
+            "subscription fsync blocked the async worker for {worker_delay:?}"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_publication_winner_remains_acked_through_subscription_notification() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("post-full-append-guard");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "pattern": "events/*",
+                        "wake_stream": "wake/pool"
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+        let stream = store.streams.get("/root/events/a").unwrap().clone();
+
+        // Hold the manager lock so retirement fences after durable publication
+        // wins but before the awaited subscription callback completes. The
+        // guard keeps retirement from finishing; the visible append stays 2xx.
+        let state = store.subscriptions.state.lock().await;
+        let append = tokio::spawn(handle(
+            store.clone(),
+            json_request(Method::Post, "/root/events/a", json!({"value": 1})),
+        ));
+        while stream.tail().bytes == 0 {
+            tokio::task::yield_now().await;
+        }
+        let store2 = store.clone();
+        let stream2 = stream.clone();
+        let retirement = tokio::spawn(async move { store2.prepare_delete(&stream2).await });
+        while !stream.is_fenced() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !retirement.is_finished(),
+            "retirement must wait through subscription notification"
+        );
+        drop(state);
+
+        assert_eq!(append.await.unwrap().status, 204);
+        assert_eq!(
+            retirement.await.unwrap(),
+            crate::store::PrepareRetirement::Ready
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initial_put_publication_winner_remains_acked_through_subscription_notification() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("put-full-append-guard");
+        create_json_stream(&store, "/root/wake/pool").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "pattern": "events/*",
+                        "wake_stream": "wake/pool"
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+
+        // As above, publication is the winner even though DELETE fences while
+        // the initial PUT is still awaiting subscription notification.
+        let state = store.subscriptions.state.lock().await;
+        let create = tokio::spawn(handle(
+            store.clone(),
+            json_request(Method::Put, "/root/events/initial", json!({"value": 1})),
+        ));
+        let stream = loop {
+            if let Some(stream) = store.streams.get("/root/events/initial") {
+                let stream = stream.clone();
+                if stream.tail().bytes > 0 {
+                    break stream;
+                }
+            }
+            tokio::task::yield_now().await;
+        };
+        let store2 = store.clone();
+        let stream2 = stream.clone();
+        let retirement = tokio::spawn(async move { store2.prepare_delete(&stream2).await });
+        while !stream.is_fenced() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !retirement.is_finished(),
+            "retirement must wait through initial PUT notification"
+        );
+        drop(state);
+
+        assert_eq!(create.await.unwrap().status, 201);
+        assert_eq!(
+            retirement.await.unwrap(),
+            crate::store::PrepareRetirement::Ready
         );
 
         drop(store);
@@ -4497,6 +5031,11 @@ mod tests {
             assert!(subscription.next_attempt_at_ms.is_some());
         }
         create_json_stream(&store, "/root/wake/pool").await;
+        // The source append admitted a detached coalescing snapshot writer.
+        // A real restart cannot overlap that old process, so wait for the test
+        // manager's writer to exit before opening a second manager on the same
+        // directory (and therefore the same atomic-write temp namespace).
+        store.subscriptions.drain_state_persistence().await;
         // Prevent the old manager's already-spawned retry from competing with
         // the fresh manager. This intentionally does not touch the durable
         // snapshot that the restarted manager loads.
