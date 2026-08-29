@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -283,6 +283,16 @@ pub struct StreamState {
     /// Fork source: ranges below base_offset are read through this chain.
     pub parent: Option<Arc<StreamState>>,
     pub appender: AsyncMutex<Appender>,
+    #[allow(dead_code)]
+    pub(crate) fenced: AtomicBool,
+    #[allow(dead_code)]
+    pub(crate) inflight_appends: AtomicUsize,
+    #[allow(dead_code)]
+    pub(crate) inflight_appends_zero: tokio::sync::Notify,
+    #[allow(dead_code)]
+    pub(crate) retirement_queued: AtomicBool,
+    #[allow(dead_code)]
+    pub(crate) deletion_tx: watch::Sender<bool>,
     pub shared: RwLock<Shared>,
     pub tail_tx: watch::Sender<Tail>,
     /// The sidecar's persisted `durable_tail` as read at BOOT (None for sidecars
@@ -332,6 +342,38 @@ pub struct StreamState {
     /// are attached. See sse_reactor.rs.
     #[cfg(target_os = "linux")]
     pub sse_subs: StdMutex<Option<Box<StreamSubs>>>,
+}
+
+#[allow(dead_code)]
+pub(crate) struct InflightAppendGuard {
+    stream: Arc<StreamState>,
+}
+
+#[allow(dead_code)]
+impl InflightAppendGuard {
+    pub(crate) fn begin(
+        stream: &Arc<StreamState>,
+        _appender: &tokio::sync::MutexGuard<'_, Appender>,
+    ) -> Option<Self> {
+        if stream.fenced.load(Ordering::Acquire) {
+            return None;
+        }
+
+        stream.inflight_appends.fetch_add(1, Ordering::AcqRel);
+        Some(Self {
+            stream: stream.clone(),
+        })
+    }
+}
+
+impl Drop for InflightAppendGuard {
+    fn drop(&mut self) {
+        let previous = self.stream.inflight_appends.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "in-flight append count underflowed");
+        if previous == 1 {
+            self.stream.inflight_appends_zero.notify_waiters();
+        }
+    }
 }
 
 /// Reactor subscriber list for one stream — populated only while subscribers are
@@ -396,6 +438,52 @@ pub fn set_tail_cache_bytes(n: usize) {
 /// Current resident tail-cache cap (bytes). `0` = disabled.
 pub fn tail_cache_bytes() -> usize {
     TAIL_CACHE_BYTES.load(Ordering::Relaxed)
+}
+
+#[allow(dead_code)]
+impl StreamState {
+    /// Fences this stream while `_appender` is the guard from this stream's
+    /// appender mutex; the parameter makes that caller-side invariant explicit.
+    pub(crate) fn fence_while_holding_appender(
+        &self,
+        _appender: &tokio::sync::MutexGuard<'_, Appender>,
+    ) {
+        self.fenced.store(true, Ordering::Release);
+    }
+
+    /// Waits for in-flight append guards to drain after the stream was fenced
+    /// under its appender lock.
+    pub(crate) async fn wait_for_inflight_appends_zero(&self) {
+        loop {
+            let notified = self.inflight_appends_zero.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.inflight_appends.load(Ordering::Acquire) == 0 {
+                return;
+            }
+
+            notified.await;
+        }
+    }
+
+    pub(crate) fn subscribe_deletion(&self) -> watch::Receiver<bool> {
+        self.deletion_tx.subscribe()
+    }
+
+    pub(crate) fn signal_deletion(&self) {
+        self.deletion_tx.send_replace(true);
+    }
+
+    pub(crate) fn try_queue_retirement(&self) -> bool {
+        self.retirement_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn clear_retirement_queued(&self) {
+        self.retirement_queued.store(false, Ordering::Release);
+    }
 }
 
 impl StreamState {
@@ -983,6 +1071,7 @@ impl Store {
             bytes: tail,
             closed: meta.closed,
         });
+        let (deletion_tx, _) = watch::channel(false);
         let state = Arc::new(StreamState {
             id: meta.id,
             path: path.to_string(),
@@ -995,6 +1084,11 @@ impl Store {
                 file: file.clone(),
                 written,
             }),
+            fenced: AtomicBool::new(false),
+            inflight_appends: AtomicUsize::new(0),
+            inflight_appends_zero: tokio::sync::Notify::new(),
+            retirement_queued: AtomicBool::new(false),
+            deletion_tx,
             shared: RwLock::new(Shared {
                 tail,
                 // Recovered/opened tail is durable by definition.
@@ -1233,6 +1327,7 @@ impl Store {
             bytes: base_offset,
             closed,
         });
+        let (deletion_tx, _) = watch::channel(false);
         let state = Arc::new(StreamState {
             id,
             path: path.to_string(),
@@ -1247,6 +1342,11 @@ impl Store {
                 file: file.clone(),
                 written: 0,
             }),
+            fenced: AtomicBool::new(false),
+            inflight_appends: AtomicUsize::new(0),
+            inflight_appends_zero: tokio::sync::Notify::new(),
+            retirement_queued: AtomicBool::new(false),
+            deletion_tx,
             shared: RwLock::new(Shared {
                 tail: base_offset,
                 durable_tail: base_offset,
@@ -1468,6 +1568,188 @@ mod expiry_deadline_tests {
 
         assert_eq!(state.expiry_deadline(), Some(absolute));
         assert!(state.is_expired_at(UNIX_EPOCH + Duration::from_secs(2)));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod stream_lifecycle_tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    fn config() -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    fn temporary_directory(tag: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "ds-stream-lifecycle-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn create_state() -> (PathBuf, Store, Arc<StreamState>) {
+        let directory = temporary_directory("create");
+        let store =
+            Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap();
+        let state = match store.create("stream", config(), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        (directory, store, state)
+    }
+
+    #[test]
+    fn stream_lifecycle_create_initializes_transient_state() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<InflightAppendGuard>();
+        let (directory, _store, state) = create_state();
+
+        assert!(!state.fenced.load(Ordering::Acquire));
+        assert_eq!(state.inflight_appends.load(Ordering::Acquire), 0);
+        assert!(!state.retirement_queued.load(Ordering::Acquire));
+        assert!(!*state.subscribe_deletion().borrow());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stream_lifecycle_recovery_reinitializes_transient_state() {
+        let directory = temporary_directory("recovery");
+        let store =
+            Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap();
+        let state = match store.create("stream", config(), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        state.fenced.store(true, Ordering::Release);
+        state.inflight_appends.store(2, Ordering::Release);
+        state.retirement_queued.store(true, Ordering::Release);
+        state.signal_deletion();
+        drop(state);
+        drop(store);
+
+        let recovered_store =
+            Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap();
+        let recovered = recovered_store.get("stream").expect("recovered stream");
+        assert!(!recovered.fenced.load(Ordering::Acquire));
+        assert_eq!(recovered.inflight_appends.load(Ordering::Acquire), 0);
+        assert!(!recovered.retirement_queued.load(Ordering::Acquire));
+        assert!(!*recovered.subscribe_deletion().borrow());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_lifecycle_guard_count_and_final_drop_notifies() {
+        let (directory, _store, state) = create_state();
+        let appender = state.appender.lock().await;
+        let first = InflightAppendGuard::begin(&state, &appender).expect("unfenced stream");
+        let second = InflightAppendGuard::begin(&state, &appender).expect("unfenced stream");
+        assert_eq!(state.inflight_appends.load(Ordering::Acquire), 2);
+
+        let waiting_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_state.wait_for_inflight_appends_zero().await;
+        });
+        tokio::task::yield_now().await;
+
+        drop(first);
+        assert_eq!(state.inflight_appends.load(Ordering::Acquire), 1);
+        assert!(!waiter.is_finished());
+        drop(second);
+        timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("final drop must wake waiter")
+            .unwrap();
+
+        drop(appender);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_lifecycle_guard_drops_on_early_return() {
+        let (directory, _store, state) = create_state();
+        let appender = state.appender.lock().await;
+
+        let begin_then_return = || {
+            let _guard = InflightAppendGuard::begin(&state, &appender).expect("unfenced stream");
+        };
+        begin_then_return();
+
+        assert_eq!(state.inflight_appends.load(Ordering::Acquire), 0);
+        drop(appender);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_lifecycle_fence_under_appender_lock_rejects_later_guard() {
+        let (directory, _store, state) = create_state();
+        let appender = state.appender.lock().await;
+
+        state.fence_while_holding_appender(&appender);
+        assert!(InflightAppendGuard::begin(&state, &appender).is_none());
+
+        drop(appender);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_lifecycle_wait_registration_drop_interleaving_completes() {
+        let (directory, _store, state) = create_state();
+        let appender = state.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&state, &appender).expect("unfenced stream");
+        let waiting_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_state.wait_for_inflight_appends_zero().await;
+        });
+
+        tokio::task::yield_now().await;
+        drop(guard);
+        timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("registered waiter must not miss final drop")
+            .unwrap();
+
+        drop(appender);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_lifecycle_deletion_watch_is_level_triggered() {
+        let (directory, _store, state) = create_state();
+        let mut before_signal = state.subscribe_deletion();
+        assert!(!*before_signal.borrow());
+
+        state.signal_deletion();
+        before_signal.changed().await.unwrap();
+        assert!(*before_signal.borrow());
+        assert!(*state.subscribe_deletion().borrow());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stream_lifecycle_retirement_queue_cas_deduplicates_and_clears() {
+        let (directory, _store, state) = create_state();
+
+        assert!(state.try_queue_retirement());
+        assert!(!state.try_queue_retirement());
+        state.clear_retirement_queued();
+        assert!(state.try_queue_retirement());
 
         let _ = std::fs::remove_dir_all(directory);
     }
