@@ -1322,20 +1322,46 @@ impl Store {
         self: &Arc<Self>,
         stream: Arc<StreamState>,
     ) -> ExplicitRetirementResult {
-        self.retire(stream, LocalCleanupMode::ExplicitDelete).await
+        self.retire(
+            stream,
+            LocalCleanupMode::ExplicitDelete,
+            crate::retirement::RetirementPriority::Interactive,
+        )
+        .await
     }
 
     pub(crate) async fn retire_expiry(
         self: &Arc<Self>,
         stream: Arc<StreamState>,
     ) -> ExplicitRetirementResult {
-        self.retire(stream, LocalCleanupMode::Expiry).await
+        self.retire(
+            stream,
+            LocalCleanupMode::Expiry,
+            crate::retirement::RetirementPriority::Interactive,
+        )
+        .await
+    }
+
+    /// Bounded scanner admission for an exact due identity. Request-triggered
+    /// expiry and explicit DELETE remain interactive so proactive scans cannot
+    /// consume their reserved coordinator or physical capacity.
+    pub(crate) async fn retire_proactive_expiry(
+        self: &Arc<Self>,
+        stream: Arc<StreamState>,
+    ) -> ExplicitRetirementResult {
+        self.retire(
+            stream,
+            LocalCleanupMode::Expiry,
+            crate::retirement::RetirementPriority::Proactive,
+        )
+        .await
     }
 
     async fn retire(
         self: &Arc<Self>,
         stream: Arc<StreamState>,
         mode: LocalCleanupMode,
+        priority: crate::retirement::RetirementPriority,
     ) -> ExplicitRetirementResult {
         match self.streams.get(&stream.path) {
             None => return ExplicitRetirementResult::Missing,
@@ -1351,11 +1377,7 @@ impl Store {
             return ExplicitRetirementResult::Unavailable;
         };
         let executor = Arc::clone(executor);
-        let ticket = match executor.admit(
-            stream.clone(),
-            crate::retirement::RetirementPriority::Interactive,
-            mode,
-        ) {
+        let ticket = match executor.admit(stream.clone(), priority, mode) {
             crate::retirement::RetirementAdmissionResult::Admitted(ticket) => ticket,
             crate::retirement::RetirementAdmissionResult::Existing(ticket) => {
                 return ExplicitRetirementResult::Existing(ticket);
@@ -2859,6 +2881,199 @@ mod retirement_executor_lifecycle_tests {
         assert_eq!(executor.worker_count(), 0);
 
         drop(executor);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proactive_expiry_uses_the_proactive_coordinator_lane() {
+        let (directory, store) = temporary_store("proactive-expiry-priority");
+        let executor_config = crate::retirement::RetirementConfig {
+            // Keep proactive work retained after logical release so the queue
+            // partition is observable without timing a worker dispatch.
+            proactive_coordinator_capacity: 0,
+            ..crate::retirement::RetirementConfig::default()
+        };
+        store
+            .init_retirement_executor_for_test(executor_config)
+            .unwrap();
+        let stream = match store
+            .create(
+                "due",
+                StreamConfig {
+                    ttl_seconds: Some(1),
+                    ..stream_config()
+                },
+                None,
+                0,
+            )
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("test stream must be created"),
+        };
+        stream.shared.write().unwrap().last_access = UNIX_EPOCH;
+
+        assert!(matches!(
+            store.retire_proactive_expiry(Arc::clone(&stream)).await,
+            ExplicitRetirementResult::Owner(_)
+        ));
+        assert_eq!(
+            store.retirement_executor().unwrap().pending_and_jobs(),
+            (1, 0, 1),
+            "scanner expiry must use the proactive pending lane"
+        );
+
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proactive_expiry_rechecks_renewed_and_replaced_identities_before_fencing() {
+        let (directory, store) = temporary_store("proactive-expiry-recheck");
+        store.init_retirement_executor().unwrap();
+        let config = StreamConfig {
+            ttl_seconds: Some(1),
+            ..stream_config()
+        };
+        let renewed = match store.create("renewed", config.clone(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("test stream must be created"),
+        };
+        renewed.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let candidate = store
+            .expiration_page(crate::expiration::ExpirationCursor::start(), 1)
+            .candidates
+            .pop()
+            .expect("due stream is indexed");
+        assert_eq!(
+            store.observe_expiration_candidate(&candidate, SystemTime::now()),
+            crate::expiration::ExpirationCandidateObservation::Due
+        );
+        renewed.shared.write().unwrap().last_access = SystemTime::now();
+        assert!(matches!(
+            store.retire_proactive_expiry(Arc::clone(&renewed)).await,
+            ExplicitRetirementResult::Cancelled(_)
+        ));
+        assert!(store.is_exact_registered(&renewed));
+        assert!(!renewed.fenced.load(Ordering::Acquire));
+
+        let stale = match store.create("stale", config.clone(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("test stream must be created"),
+        };
+        assert!(store.streams.remove("stale").is_some());
+        let replacement = match store.create("stale", config, None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("vacated path must create a replacement"),
+        };
+        assert!(matches!(
+            store.retire_proactive_expiry(Arc::clone(&stale)).await,
+            ExplicitRetirementResult::Stale
+        ));
+        assert!(!stale.fenced.load(Ordering::Acquire));
+        assert!(store
+            .registered_stream("stale")
+            .is_some_and(|current| Arc::ptr_eq(&current, &replacement)));
+
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(replacement);
+        drop(stale);
+        drop(renewed);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proactive_expiry_queue_rejection_leaves_no_fence_and_can_retry() {
+        let (directory, store) = temporary_store("proactive-expiry-queue-full");
+        let executor_config = crate::retirement::RetirementConfig {
+            queue_capacity: 1,
+            proactive_coordinator_capacity: 0,
+            ..crate::retirement::RetirementConfig::default()
+        };
+        let executor = Arc::clone(
+            store
+                .init_retirement_executor_for_test(executor_config)
+                .unwrap(),
+        );
+        let config = StreamConfig {
+            ttl_seconds: Some(1),
+            ..stream_config()
+        };
+        let blocker = match store.create("blocker", config.clone(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("test stream must be created"),
+        };
+        let blocked = match store.create("blocked", config, None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("test stream must be created"),
+        };
+        blocker.shared.write().unwrap().last_access = UNIX_EPOCH;
+        blocked.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let blocker_ticket = match executor.admit(
+            Arc::clone(&blocker),
+            crate::retirement::RetirementPriority::Proactive,
+            LocalCleanupMode::Expiry,
+        ) {
+            crate::retirement::RetirementAdmissionResult::Admitted(ticket) => ticket,
+            _ => panic!("first bounded admission must reserve the only slot"),
+        };
+        assert!(matches!(
+            store.retire_proactive_expiry(Arc::clone(&blocked)).await,
+            ExplicitRetirementResult::Rejected(crate::retirement::RetirementAdmission::QueueFull)
+        ));
+        assert!(!blocked.fenced.load(Ordering::Acquire));
+        assert!(executor.cancel_prelogical(&blocker, &blocker_ticket));
+        assert!(matches!(
+            store.retire_proactive_expiry(Arc::clone(&blocked)).await,
+            ExplicitRetirementResult::Owner(_)
+        ));
+        assert!(blocked.fenced.load(Ordering::Acquire));
+
+        executor.shutdown().await;
+        drop(blocked);
+        drop(blocker);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proactive_expiry_wal_path_releases_logical_then_cleans_physically() {
+        let (directory, store) = temporary_store("proactive-expiry-wal");
+        let _wal = attach_test_wal(&store, &directory.join("wal"));
+        store.init_retirement_executor().unwrap();
+        let stream = match store
+            .create(
+                "due",
+                StreamConfig {
+                    ttl_seconds: Some(1),
+                    ..stream_config()
+                },
+                None,
+                0,
+            )
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("test stream must be created"),
+        };
+        stream.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let ticket = match store.retire_proactive_expiry(Arc::clone(&stream)).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("due WAL stream must be admitted proactively"),
+        };
+        assert_eq!(ticket.wait_logical().await, LogicalCompletion::Completed);
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(!stream.file_path.exists());
+
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(stream);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }

@@ -325,7 +325,7 @@ impl RetirementExecutor {
     }
 
     #[cfg(test)]
-    fn pending_and_jobs(&self) -> (usize, usize, usize) {
+    pub(crate) fn pending_and_jobs(&self) -> (usize, usize, usize) {
         let state = lock_recover(&self.inner.state);
         (
             state.jobs.len(),

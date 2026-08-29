@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -16,9 +17,8 @@ use crate::store::{Store, StreamState};
 
 /// Requested behavior for the future expiration reaper.
 ///
-/// `Delete` is deliberately accepted before the scanner exists so deployment
-/// configuration can be rolled out ahead of activation.  It has no effect in
-/// this configuration-only slice.
+/// `Delete` is tier-guarded and activates only after the scanner has completed
+/// its initial read-only pass and all delete-safety gates permit admission.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ExpirationReaperMode {
     #[default]
@@ -274,6 +274,7 @@ pub(crate) struct ExpirationScannerStatus {
     bulk_fraction: BulkFraction,
     clock_jump_threshold_duration: Duration,
     safety: Mutex<DeleteSafetyState>,
+    proactive_admission_attempts: AtomicU64,
 }
 
 impl ExpirationScannerStatus {
@@ -291,6 +292,7 @@ impl ExpirationScannerStatus {
             bulk_fraction: config.bulk_fraction,
             clock_jump_threshold_duration: config.clock_jump_threshold_duration(),
             safety: Mutex::new(DeleteSafetyState::default()),
+            proactive_admission_attempts: AtomicU64::new(0),
         }
     }
 
@@ -416,6 +418,17 @@ impl ExpirationScannerStatus {
             completed_due: safety.completed_due,
         }
     }
+
+    fn record_proactive_admission_attempt(&self) {
+        self.proactive_admission_attempts
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn proactive_admission_attempts(&self) -> u64 {
+        self.proactive_admission_attempts
+            .load(AtomicOrdering::Relaxed)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -469,8 +482,8 @@ fn due_fraction(due: u64, checked: u64) -> f64 {
 
 /// Supervised process-lifetime expiration scanner.
 ///
-/// Off mode creates no task. Observe and requested Delete mode both run the
-/// same read-only observer until 8dy deliberately adds retirement admission.
+/// Off mode creates no task. Observe stays read-only; Delete admits only after
+/// its read-only safety gates are satisfied.
 pub(crate) struct ExpirationScanner {
     shutdown: tokio::sync::watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -495,12 +508,9 @@ impl ExpirationScanner {
         let store = Arc::downgrade(store);
         let task_status = Arc::clone(&status);
         let task = tokio::spawn(async move {
-            // Delete intentionally enters the observer too. Keep this match at
-            // the task boundary so a future edit cannot activate deletion merely
-            // by accepting the requested CLI mode.
             match config.mode() {
                 ExpirationReaperMode::Observe | ExpirationReaperMode::Delete => {
-                    run_read_only_scanner(store, config, task_status, shutdown_rx).await;
+                    run_scanner(store, config, task_status, shutdown_rx).await;
                 }
                 ExpirationReaperMode::Off => unreachable!("off mode starts no scanner task"),
             }
@@ -539,31 +549,54 @@ struct ObservedPage {
     candidate_count: usize,
     checked_count: u64,
     due_count: usize,
+    due_streams: Vec<Arc<StreamState>>,
 }
 
-async fn run_read_only_scanner(
+async fn run_scanner(
     store: Weak<Store>,
     config: ExpirationScannerConfig,
     status: Arc<ExpirationScannerStatus>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut cursor = ExpirationCursor::start();
+    let mut delete_pacer = DeletePacer::new(config.delete_rate_deletions_per_second());
     loop {
+        if *shutdown.borrow() {
+            return;
+        }
         let Some(store) = store.upgrade() else {
             return;
         };
+        // The initial full pass is unconditionally observation-only. Capture
+        // this before recording the page that may complete that pass.
+        let initial_pass_complete_at_page_start = status.initial_observe_pass_complete();
         let observed = observe_page(&store, cursor, SystemTime::now());
         cursor = observed.next_cursor;
+        let candidate_count = observed.candidate_count;
         status.record_observe_page(
             observed.checked_count,
             u64::try_from(observed.due_count).expect("page due count fits u64"),
             observed.pass_complete,
         );
         status.sample_clock(SystemTime::now(), Instant::now());
-        let delay = page_pacing_delay(
-            config.scan_rate_candidates_per_second(),
-            observed.candidate_count,
-        );
+        let safety = status.safety_snapshot_at(Instant::now());
+        if !admit_due_candidates(
+            &store,
+            &status,
+            &mut delete_pacer,
+            &mut shutdown,
+            DeletePageDecision {
+                mode: config.mode(),
+                initial_pass_complete_at_page_start,
+                safety,
+            },
+            observed.due_streams,
+        )
+        .await
+        {
+            return;
+        }
+        let delay = page_pacing_delay(config.scan_rate_candidates_per_second(), candidate_count);
         drop(store);
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
@@ -576,15 +609,97 @@ async fn run_read_only_scanner(
     }
 }
 
+/// Return false only when shutdown interrupts pacing. This is the sole
+/// activation boundary: all page candidates have already been classified and
+/// counted, and a failed safety gate admits none of them.
+#[derive(Clone, Copy)]
+struct DeletePageDecision {
+    mode: ExpirationReaperMode,
+    initial_pass_complete_at_page_start: bool,
+    safety: DeleteSafetySnapshot,
+}
+
+async fn admit_due_candidates(
+    store: &Arc<Store>,
+    status: &ExpirationScannerStatus,
+    delete_pacer: &mut DeletePacer,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    decision: DeletePageDecision,
+    due_streams: Vec<Arc<StreamState>>,
+) -> bool {
+    if decision.mode != ExpirationReaperMode::Delete
+        || !decision.initial_pass_complete_at_page_start
+        || !decision.safety.deletion_eligible
+    {
+        return true;
+    }
+    for stream in due_streams {
+        if !delete_pacer.wait_for_permit(shutdown).await {
+            return false;
+        }
+        // A Store retirement future is awaited to completion through logical
+        // handoff so its pre-logical reservation cannot be dropped mid-flight.
+        // Its ticket/physical phase remains executor-owned; the scanner waits
+        // on neither completion.
+        status.record_proactive_admission_attempt();
+        let _ = store.retire_proactive_expiry(stream).await;
+    }
+    true
+}
+
+struct DeletePacer {
+    interval: Duration,
+    next_permit: Option<Instant>,
+}
+
+impl DeletePacer {
+    fn new(rate_per_second: u64) -> Self {
+        Self {
+            interval: delete_pacing_interval(rate_per_second),
+            next_permit: None,
+        }
+    }
+
+    async fn wait_for_permit(&mut self, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+        if *shutdown.borrow() {
+            return false;
+        }
+        if let Some(next_permit) = self.next_permit {
+            let delay = next_permit.saturating_duration_since(Instant::now());
+            if !delay.is_zero() {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    changed = shutdown.changed() => {
+                        return changed.is_ok() && !*shutdown.borrow();
+                    }
+                }
+            }
+        }
+        if *shutdown.borrow() {
+            return false;
+        }
+        self.next_permit = Some(
+            Instant::now()
+                .checked_add(self.interval)
+                .expect("delete pacing interval is bounded"),
+        );
+        true
+    }
+}
+
 fn observe_page(store: &Store, cursor: ExpirationCursor, now: SystemTime) -> ObservedPage {
     let page = store.expiration_page(cursor, OBSERVATION_PAGE_SIZE);
     let mut checked_count = 0u64;
     let mut due_count = 0;
+    let mut due_streams = Vec::new();
     for candidate in &page.candidates {
         match store.observe_expiration_candidate(candidate, now) {
             ExpirationCandidateObservation::Due => {
                 checked_count = checked_count.saturating_add(1);
                 due_count += 1;
+                if let Some(stream) = candidate.stream.upgrade() {
+                    due_streams.push(stream);
+                }
             }
             ExpirationCandidateObservation::Live => {
                 checked_count = checked_count.saturating_add(1);
@@ -598,6 +713,7 @@ fn observe_page(store: &Store, cursor: ExpirationCursor, now: SystemTime) -> Obs
         candidate_count: page.candidates.len(),
         checked_count,
         due_count,
+        due_streams,
     }
 }
 
@@ -608,6 +724,11 @@ fn page_pacing_delay(rate_per_second: u64, candidate_count: usize) -> Duration {
     let nanos =
         (u128::from(candidate_count as u64) * 1_000_000_000).div_ceil(u128::from(rate_per_second));
     Duration::from_nanos(u64::try_from(nanos).expect("page pacing is bounded by page size"))
+}
+
+fn delete_pacing_interval(rate_per_second: u64) -> Duration {
+    let nanos = 1_000_000_000_u128.div_ceil(u128::from(rate_per_second));
+    Duration::from_nanos(u64::try_from(nanos).expect("delete pacing interval fits u64"))
 }
 
 /// Stable round-robin position owned by an expiration scanner.
@@ -911,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn scanner_mode_is_exact_lowercase_and_delete_is_accepted_but_inert() {
+    fn scanner_mode_is_exact_lowercase_and_delete_is_accepted() {
         assert_eq!("off".parse(), Ok(ExpirationReaperMode::Off));
         assert_eq!("observe".parse(), Ok(ExpirationReaperMode::Observe));
         assert_eq!("delete".parse(), Ok(ExpirationReaperMode::Delete));
@@ -1303,32 +1424,211 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scanner_delete_request_is_still_read_only_observation() {
-        let (directory, store) = store("scanner-delete-requested");
+    async fn delete_activation_keeps_the_first_pass_read_only_then_uses_bounded_retirement() {
+        let (directory, store) = store("scanner-delete-activation");
+        store.init_retirement_executor().unwrap();
         let stream = streams(&store, &["due"]).pop().unwrap();
         stream.shared.write().unwrap().last_access = UNIX_EPOCH;
-        let scanner = ExpirationScanner::start(
-            &store,
-            delete_safety_config(Duration::ZERO, "1.0", Duration::from_secs(5)),
-        );
-        assert!(scanner.task.is_some());
-        wait_for_initial_pass(&scanner).await;
-        assert!(
-            scanner
-                .status()
-                .safety_snapshot_at(Instant::now())
-                .deletion_eligible
-        );
-        scanner.shutdown().await;
+        let config = delete_safety_config(Duration::ZERO, "1.0", Duration::from_secs(5));
+        let status = ExpirationScannerStatus::new_at(&config, Instant::now());
+        status.record_observe_page(1, 1, true);
+        let safety = status.safety_snapshot_at(Instant::now());
+        assert!(safety.deletion_eligible);
+        let (_shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let mut pacer = DeletePacer::new(config.delete_rate_deletions_per_second());
 
-        assert!(store
-            .registered_stream("due")
-            .is_some_and(|current| Arc::ptr_eq(&current, &stream)));
+        // The page which completed the initial pass cannot act, even though
+        // publishing it made the next pass eligible.
+        assert!(
+            admit_due_candidates(
+                &store,
+                &status,
+                &mut pacer,
+                &mut shutdown,
+                DeletePageDecision {
+                    mode: config.mode(),
+                    initial_pass_complete_at_page_start: false,
+                    safety,
+                },
+                vec![Arc::clone(&stream)],
+            )
+            .await
+        );
+        assert_eq!(status.proactive_admission_attempts(), 0);
         assert!(!stream.fenced.load(Ordering::Acquire));
-        assert!(!stream.shared.read().unwrap().soft_deleted);
+
+        assert!(
+            admit_due_candidates(
+                &store,
+                &status,
+                &mut pacer,
+                &mut shutdown,
+                DeletePageDecision {
+                    mode: config.mode(),
+                    initial_pass_complete_at_page_start: true,
+                    safety,
+                },
+                vec![Arc::clone(&stream)],
+            )
+            .await
+        );
+        assert_eq!(status.proactive_admission_attempts(), 1);
+        assert!(stream.fenced.load(Ordering::Acquire));
+        store.retirement_executor().unwrap().shutdown().await;
+
         drop(stream);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn delete_activation_safety_gates_and_observer_modes_admit_nothing() {
+        let (directory, store) = store("scanner-delete-gates");
+        let stream = streams(&store, &["due"]).pop().unwrap();
+        stream.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let config = delete_safety_config(Duration::ZERO, "0.25", Duration::from_secs(5));
+        let status = ExpirationScannerStatus::new_at(&config, Instant::now());
+        status.record_observe_page(4, 2, true);
+        let bulk_paused = status.safety_snapshot_at(Instant::now());
+        assert!(bulk_paused.bulk_paused);
+        let (_shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let mut pacer = DeletePacer::new(config.delete_rate_deletions_per_second());
+        assert!(
+            admit_due_candidates(
+                &store,
+                &status,
+                &mut pacer,
+                &mut shutdown,
+                DeletePageDecision {
+                    mode: ExpirationReaperMode::Delete,
+                    initial_pass_complete_at_page_start: true,
+                    safety: bulk_paused,
+                },
+                vec![Arc::clone(&stream)],
+            )
+            .await
+        );
+        assert_eq!(status.proactive_admission_attempts(), 0);
+
+        assert!(
+            admit_due_candidates(
+                &store,
+                &status,
+                &mut pacer,
+                &mut shutdown,
+                DeletePageDecision {
+                    mode: ExpirationReaperMode::Delete,
+                    initial_pass_complete_at_page_start: true,
+                    safety: DeleteSafetySnapshot::default(),
+                },
+                vec![Arc::clone(&stream)],
+            )
+            .await
+        );
+
+        let clock_status = ExpirationScannerStatus::new_at(&config, Instant::now());
+        clock_status.record_observe_page(1, 1, true);
+        let now = Instant::now();
+        clock_status.sample_clock(UNIX_EPOCH + Duration::from_secs(1), now);
+        clock_status.sample_clock(UNIX_EPOCH, now.checked_add(Duration::from_secs(1)).unwrap());
+        let clock_paused = clock_status.safety_snapshot_at(Instant::now());
+        assert!(clock_paused.clock_paused);
+        assert!(
+            admit_due_candidates(
+                &store,
+                &clock_status,
+                &mut pacer,
+                &mut shutdown,
+                DeletePageDecision {
+                    mode: ExpirationReaperMode::Delete,
+                    initial_pass_complete_at_page_start: true,
+                    safety: clock_paused,
+                },
+                vec![Arc::clone(&stream)],
+            )
+            .await
+        );
+        for mode in [ExpirationReaperMode::Off, ExpirationReaperMode::Observe] {
+            assert!(
+                admit_due_candidates(
+                    &store,
+                    &status,
+                    &mut pacer,
+                    &mut shutdown,
+                    DeletePageDecision {
+                        mode,
+                        initial_pass_complete_at_page_start: true,
+                        safety: DeleteSafetySnapshot {
+                            deletion_eligible: true,
+                            ..DeleteSafetySnapshot::default()
+                        },
+                    },
+                    vec![Arc::clone(&stream)],
+                )
+                .await
+            );
+        }
+        assert!(!stream.fenced.load(Ordering::Acquire));
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn delete_admission_counts_rejections_and_pacing_shutdown_is_prompt() {
+        let (directory, store) = store("scanner-delete-rejected");
+        let streams = streams(&store, &["first", "second"]);
+        for stream in &streams {
+            stream.shared.write().unwrap().last_access = UNIX_EPOCH;
+        }
+        let config = delete_safety_config(Duration::ZERO, "1.0", Duration::from_secs(5));
+        let status = ExpirationScannerStatus::new_at(&config, Instant::now());
+        status.record_observe_page(2, 2, true);
+        let (_shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let mut immediate_pacer = DeletePacer::new(1_000_000_000);
+        assert!(
+            admit_due_candidates(
+                &store,
+                &status,
+                &mut immediate_pacer,
+                &mut shutdown,
+                DeletePageDecision {
+                    mode: ExpirationReaperMode::Delete,
+                    initial_pass_complete_at_page_start: true,
+                    safety: status.safety_snapshot_at(Instant::now()),
+                },
+                streams.clone(),
+            )
+            .await
+        );
+        assert_eq!(status.proactive_admission_attempts(), 2);
+        assert!(streams
+            .iter()
+            .all(|stream| !stream.fenced.load(Ordering::Acquire)));
+
+        let (shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let mut paced = DeletePacer::new(1);
+        paced.next_permit = Some(Instant::now().checked_add(Duration::from_secs(1)).unwrap());
+        assert!(shutdown_tx.send(true).is_ok());
+        assert!(!tokio::time::timeout(
+            Duration::from_secs(1),
+            paced.wait_for_permit(&mut shutdown)
+        )
+        .await
+        .expect("shutdown must interrupt delete pacing"));
+
+        drop(streams);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn delete_pacing_is_independent_nonzero_and_rate_bounded() {
+        assert_eq!(delete_pacing_interval(100), Duration::from_millis(10));
+        assert_eq!(
+            delete_pacing_interval(1_000_000_000),
+            Duration::from_nanos(1)
+        );
     }
 
     #[test]
