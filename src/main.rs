@@ -280,9 +280,8 @@ fn main() {
             "--long-poll-timeout-ms" => {
                 handlers::set_long_poll_timeout(parse_val(args.next(), "--long-poll-timeout-ms"));
             }
-            // Configuration is parsed now but remains inert until the future
-            // scanner runtime owns it. Repeated flags are last-value-wins,
-            // matching the rest of this hand-written argument parser.
+            // Repeated expiration-reaper flags are last-value-wins, matching
+            // the rest of this hand-written argument parser.
             "--expiry-reaper-mode"
             | "--expiry-scan-rate"
             | "--expiry-delete-rate"
@@ -441,6 +440,12 @@ fn main() {
             }
         }
     }
+
+    // Reject before any durability validation, data-dir locking, runtime
+    // creation, scanner startup, readiness, or socket exposure.
+    expiration_reaper_config
+        .validate_tier(&tier)
+        .unwrap_or_else(|error| exit_usage(error));
 
     // Apply --durability memory AFTER the arg loop. Memory mode is the buffered
     // append path with the WAL stage/wait skipped (no splice intercept, no forced

@@ -151,6 +151,37 @@ fn wal_without_an_explicit_data_dir_refuses_to_start() {
     );
 }
 
+#[test]
+fn delete_expiry_reaper_refuses_tier_before_store_side_effects() {
+    let dir = std::env::temp_dir().join(format!(
+        "ds-rust-cli-expiry-delete-tier-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = server()
+        .args([
+            "--durability",
+            "memory",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--tier",
+            "s3",
+            "--expiry-reaper-mode",
+            "delete",
+        ])
+        .output()
+        .expect("spawn");
+
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--expiry-reaper-mode delete"), "{stderr}");
+    assert!(stderr.contains("--tier off"), "{stderr}");
+    assert!(
+        !dir.exists(),
+        "the tier guard must reject before Store/runtime creates the data directory"
+    );
+}
+
 /// The gate is whether `--data-dir` was NAMED, not whether the path looks durable — a throwaway
 /// directory stays available to tests and benches that want the wal code path without
 /// persistence. (The conformance harness relies on exactly this: it passes an explicit mkdtemp.)

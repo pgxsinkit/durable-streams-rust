@@ -137,6 +137,19 @@ impl ExpirationScannerConfig {
     pub(crate) const fn clock_jump_threshold_duration(&self) -> Duration {
         self.clock_jump_threshold_duration
     }
+
+    /// Delete-mode activation must stay local-only until tier-aware retirement
+    /// exists. `TierConfig::enabled` is deliberately fail-closed for any
+    /// current or future non-Off backend.
+    pub(crate) fn validate_tier(&self, tier: &crate::tier::TierConfig) -> Result<(), String> {
+        if self.mode == ExpirationReaperMode::Delete && tier.enabled() {
+            return Err(format!(
+                "--expiry-reaper-mode delete requires --tier off; configured tier is {:?}",
+                tier.kind
+            ));
+        }
+        Ok(())
+    }
 }
 
 const MAX_RATE_PER_SECOND: u64 = 1_000_000_000;
@@ -620,7 +633,7 @@ fn collect_page<'a>(
 mod tests {
     use super::*;
     use crate::store::{CreateResult, Store, StreamConfig};
-    use crate::tier::TierConfig;
+    use crate::tier::{TierConfig, TierKind};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::UNIX_EPOCH;
 
@@ -710,6 +723,30 @@ mod tests {
         config.set_cli_value("--expiry-reaper-mode", "off").unwrap();
         assert_eq!(config.scan_rate_candidates_per_second(), 2);
         assert_eq!(config.mode(), ExpirationReaperMode::Off);
+    }
+
+    #[test]
+    fn delete_mode_rejects_every_enabled_tier_before_runtime_startup() {
+        let tier = |kind| TierConfig {
+            kind,
+            ..TierConfig::default()
+        };
+        for mode in [ExpirationReaperMode::Off, ExpirationReaperMode::Observe] {
+            for kind in [TierKind::Off, TierKind::Local, TierKind::S3] {
+                assert!(scanner_config(mode).validate_tier(&tier(kind)).is_ok());
+            }
+        }
+        assert!(scanner_config(ExpirationReaperMode::Delete)
+            .validate_tier(&tier(TierKind::Off))
+            .is_ok());
+        for kind in [TierKind::Local, TierKind::S3] {
+            let error = scanner_config(ExpirationReaperMode::Delete)
+                .validate_tier(&tier(kind))
+                .unwrap_err();
+            assert!(error.contains("--expiry-reaper-mode delete"));
+            assert!(error.contains("--tier off"));
+            assert!(error.contains(&format!("{kind:?}")));
+        }
     }
 
     fn config() -> StreamConfig {
