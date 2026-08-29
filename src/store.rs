@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
@@ -289,8 +289,9 @@ pub struct StreamState {
     pub(crate) inflight_appends: AtomicUsize,
     #[allow(dead_code)]
     pub(crate) inflight_appends_zero: tokio::sync::Notify,
-    #[allow(dead_code)]
-    pub(crate) retirement_queued: AtomicBool,
+    /// Never persisted: deduplication, attempt count, and failure cooldown are
+    /// rebuilt on create and recovery by the retirement foundation.
+    pub(crate) retirement_state: StdMutex<crate::retirement::RetirementState>,
     #[allow(dead_code)]
     pub(crate) deletion_tx: watch::Sender<bool>,
     pub shared: RwLock<Shared>,
@@ -483,14 +484,12 @@ impl StreamState {
         crate::sse_reactor::close_stream_for_deletion(self);
     }
 
-    pub(crate) fn try_queue_retirement(&self) -> bool {
-        self.retirement_queued
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    pub(crate) fn clear_retirement_queued(&self) {
-        self.retirement_queued.store(false, Ordering::Release);
+    /// Retirement state is process-local; a prior holder panicking must not
+    /// permanently prevent a later bounded retirement attempt.
+    pub(crate) fn retirement_state(&self) -> StdMutexGuard<'_, crate::retirement::RetirementState> {
+        self.retirement_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -1127,7 +1126,7 @@ impl Store {
             fenced: AtomicBool::new(false),
             inflight_appends: AtomicUsize::new(0),
             inflight_appends_zero: tokio::sync::Notify::new(),
-            retirement_queued: AtomicBool::new(false),
+            retirement_state: StdMutex::new(crate::retirement::RetirementState::default()),
             deletion_tx,
             shared: RwLock::new(Shared {
                 tail,
@@ -1460,7 +1459,7 @@ impl Store {
             fenced: AtomicBool::new(false),
             inflight_appends: AtomicUsize::new(0),
             inflight_appends_zero: tokio::sync::Notify::new(),
-            retirement_queued: AtomicBool::new(false),
+            retirement_state: StdMutex::new(crate::retirement::RetirementState::default()),
             deletion_tx,
             shared: RwLock::new(Shared {
                 tail: base_offset,
@@ -1737,7 +1736,7 @@ mod stream_lifecycle_tests {
 
         assert!(!state.fenced.load(Ordering::Acquire));
         assert_eq!(state.inflight_appends.load(Ordering::Acquire), 0);
-        assert!(!state.retirement_queued.load(Ordering::Acquire));
+        assert!(state.retirement_state().is_clean());
         assert!(!*state.subscribe_deletion().borrow());
 
         let _ = std::fs::remove_dir_all(directory);
@@ -1754,7 +1753,7 @@ mod stream_lifecycle_tests {
         };
         state.fenced.store(true, Ordering::Release);
         state.inflight_appends.store(2, Ordering::Release);
-        state.retirement_queued.store(true, Ordering::Release);
+        let _ = state.retirement_state().reserve(std::time::Instant::now());
         state.signal_deletion();
         drop(state);
         drop(store);
@@ -1764,7 +1763,7 @@ mod stream_lifecycle_tests {
         let recovered = recovered_store.get("stream").expect("recovered stream");
         assert!(!recovered.fenced.load(Ordering::Acquire));
         assert_eq!(recovered.inflight_appends.load(Ordering::Acquire), 0);
-        assert!(!recovered.retirement_queued.load(Ordering::Acquire));
+        assert!(recovered.retirement_state().is_clean());
         assert!(!*recovered.subscribe_deletion().borrow());
 
         let _ = std::fs::remove_dir_all(directory);
@@ -1855,18 +1854,6 @@ mod stream_lifecycle_tests {
         before_signal.changed().await.unwrap();
         assert!(*before_signal.borrow());
         assert!(*state.subscribe_deletion().borrow());
-
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn stream_lifecycle_retirement_queue_cas_deduplicates_and_clears() {
-        let (directory, _store, state) = create_state();
-
-        assert!(state.try_queue_retirement());
-        assert!(!state.try_queue_retirement());
-        state.clear_retirement_queued();
-        assert!(state.try_queue_retirement());
 
         let _ = std::fs::remove_dir_all(directory);
     }

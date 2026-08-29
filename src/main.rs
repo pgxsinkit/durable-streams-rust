@@ -6,6 +6,7 @@ mod engine_raw;
 mod handlers;
 mod http1;
 mod reserved_paths;
+mod retirement;
 mod srvstats;
 #[cfg(target_os = "linux")]
 mod sse_reactor;
