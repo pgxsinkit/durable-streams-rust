@@ -475,6 +475,14 @@ impl StreamState {
         self.deletion_tx.send_replace(true);
     }
 
+    /// Wake every reader after retirement has fenced and drained this stream.
+    /// Both explicit and expiry retirement use this single level-triggered path.
+    pub(crate) fn wake_deletion(&self) {
+        self.signal_deletion();
+        #[cfg(target_os = "linux")]
+        crate::sse_reactor::close_stream_for_deletion(self);
+    }
+
     pub(crate) fn try_queue_retirement(&self) -> bool {
         self.retirement_queued
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

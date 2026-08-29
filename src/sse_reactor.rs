@@ -52,6 +52,10 @@ struct Shard {
     /// (pushed by the append path). The generation guards against the slot being
     /// freed and reused before the wake is drained.
     wake: Mutex<Vec<(u32, u32)>>,
+    /// Subscribers that must be closed because their stream was retired. This
+    /// is deliberately separate from append wakes: retirement never produces a
+    /// tail frame after its level-triggered deletion signal.
+    close: Mutex<Vec<(u32, u32)>>,
 }
 
 /// A subscriber handed from a connection task to the reactor.
@@ -125,6 +129,12 @@ pub fn register(
         }
         return;
     }
+    if *reg.st.subscribe_deletion().borrow() {
+        unsafe {
+            libc::close(fd);
+        }
+        return;
+    }
     let pool = pool();
     let shard = &pool[(fd as usize) % pool.len()];
     shard.intake.lock().unwrap().push(Registration {
@@ -173,6 +183,70 @@ pub fn wake_stream(st: &StreamState) {
     }
 }
 
+/// Close all live reactor subscribers for a stream after its deletion signal.
+/// It also rejects registrations still waiting in intake. Registrations racing
+/// this pass are rejected by `register` or by the deletion check while `insert`
+/// holds the stream subscriber-list lock.
+pub fn close_stream_for_deletion(st: &StreamState) {
+    let Some(pool) = POOL.get() else { return };
+    close_stream_for_deletion_in_pool(st, pool);
+}
+
+/// Queue the identity-safe deletion closes against an already-running reactor
+/// pool. Kept private so the reactor test can drive the exact cross-thread path
+/// without initializing the process-global pool.
+fn close_stream_for_deletion_in_pool(st: &StreamState, pool: &[Arc<Shard>]) {
+    let mut to_signal: Vec<u16> = Vec::new();
+
+    for (idx, shard) in pool.iter().enumerate() {
+        let rejected = {
+            let mut intake = shard.intake.lock().unwrap();
+            let mut retained = Vec::with_capacity(intake.len());
+            let mut rejected = Vec::new();
+            for reg in intake.drain(..) {
+                if std::ptr::eq(reg.st.as_ref(), st) {
+                    rejected.push(reg);
+                } else {
+                    retained.push(reg);
+                }
+            }
+            *intake = retained;
+            rejected
+        };
+        if !rejected.is_empty() {
+            for reg in rejected {
+                unsafe {
+                    libc::close(reg.fd);
+                }
+            }
+            to_signal.push(idx as u16);
+        }
+    }
+
+    {
+        let guard = st.sse_subs.lock().unwrap();
+        let Some(list) = guard.as_ref() else {
+            for shard in to_signal {
+                signal(pool[shard as usize].eventfd);
+            }
+            return;
+        };
+        for handle in &list.subs {
+            pool[handle.shard as usize]
+                .close
+                .lock()
+                .unwrap()
+                .push((handle.key, handle.gen));
+            if !to_signal.contains(&handle.shard) {
+                to_signal.push(handle.shard);
+            }
+        }
+    }
+    for shard in to_signal {
+        signal(pool[shard as usize].eventfd);
+    }
+}
+
 /// Begin draining: close every subscriber (releasing its permit) so server
 /// shutdown's `drain()` doesn't wait out the full grace period. No-op if no
 /// reactor thread was ever started.
@@ -197,6 +271,7 @@ fn pool() -> &'static Vec<Arc<Shard>> {
                 eventfd,
                 intake: Mutex::new(Vec::new()),
                 wake: Mutex::new(Vec::new()),
+                close: Mutex::new(Vec::new()),
             });
             let me = shard.clone();
             std::thread::Builder::new()
@@ -281,38 +356,80 @@ impl Reactor {
                 }
             }
             if got_wakeup {
-                let intake: Vec<Registration> =
-                    std::mem::take(&mut *self.shard.intake.lock().unwrap());
-                for reg in intake {
-                    self.insert(reg);
-                }
-                let wakes: Vec<(u32, u32)> = std::mem::take(&mut *self.shard.wake.lock().unwrap());
-                for (key, gen) in wakes {
-                    if self
-                        .slab
-                        .get(key as usize)
-                        .is_some_and(|s| s.gen == gen && s.sub.is_some())
-                    {
-                        // Clear the stream's coalescing latch BEFORE producing:
-                        // produce() reads the tail after the clear, so a publish
-                        // racing this flush is either included or re-queues.
-                        if let Some(sub) = self.slab[key as usize].sub.as_ref() {
-                            if let Some(list) = sub.st.sse_subs.lock().unwrap().as_ref() {
-                                list.wake_pending.store(false, Ordering::Release);
-                            }
-                        }
-                        self.produce(key);
-                        self.flush(key);
-                    }
-                }
+                self.drain_cross_thread_work();
             }
             self.tick();
+        }
+    }
+
+    /// Drain deletion closes before registrations and append wakes. A queued
+    /// append wake for a just-retired slot is generation-stale after `close`, so
+    /// it cannot produce another frame.
+    fn drain_cross_thread_work(&mut self) {
+        let closes: Vec<(u32, u32)> = std::mem::take(&mut *self.shard.close.lock().unwrap());
+        for (key, gen) in closes {
+            if self
+                .slab
+                .get(key as usize)
+                .is_some_and(|slot| slot.gen == gen && slot.sub.is_some())
+            {
+                self.close(key);
+            }
+        }
+        let intake: Vec<Registration> = std::mem::take(&mut *self.shard.intake.lock().unwrap());
+        for reg in intake {
+            self.insert(reg);
+        }
+        let wakes: Vec<(u32, u32)> = std::mem::take(&mut *self.shard.wake.lock().unwrap());
+        for (key, gen) in wakes {
+            if self
+                .slab
+                .get(key as usize)
+                .is_some_and(|slot| slot.gen == gen && slot.sub.is_some())
+            {
+                // Clear the stream's coalescing latch BEFORE producing:
+                // produce() reads the tail after the clear, so a publish racing
+                // this flush is either included or re-queues.
+                if let Some(sub) = self.slab[key as usize].sub.as_ref() {
+                    if let Some(list) = sub.st.sse_subs.lock().unwrap().as_ref() {
+                        list.wake_pending.store(false, Ordering::Release);
+                    }
+                }
+                self.produce(key);
+                self.flush(key);
+            }
         }
     }
 
     /// Register a new subscriber: seat it in the slab, link it on its stream,
     /// arm epoll, and emit its first frame(s).
     fn insert(&mut self, reg: Registration) {
+        if *reg.st.subscribe_deletion().borrow() {
+            unsafe {
+                libc::close(reg.fd);
+            }
+            return;
+        }
+        let Registration {
+            fd,
+            st,
+            write_off,
+            encoding,
+            client_cursor,
+            head,
+            permit,
+        } = reg;
+        let st_for_list = st.clone();
+        // Holding this lock makes registration identity-safe against
+        // `close_stream_for_deletion`: signal-before-lock means either we see
+        // deletion and reject here, or retirement sees the linked handle.
+        let mut stream_subs = st_for_list.sse_subs.lock().unwrap();
+        if *st_for_list.subscribe_deletion().borrow() {
+            unsafe {
+                libc::close(fd);
+            }
+            return;
+        }
         let key = match self.free.pop() {
             Some(k) => k,
             None => {
@@ -322,49 +439,46 @@ impl Reactor {
         };
         let gen = self.slab[key as usize].gen;
         let now = Instant::now();
-        let st = reg.st.clone();
         self.slab[key as usize].sub = Some(Sub {
-            fd: reg.fd,
-            st: reg.st,
-            write_off: reg.write_off,
-            start: reg.write_off,
-            pending: reg.head,
+            fd,
+            st,
+            write_off,
+            start: write_off,
+            pending: head,
             sent: 0,
-            encoding: reg.encoding,
-            client_cursor: reg.client_cursor,
+            encoding,
+            client_cursor,
             registered_at: now,
             last_event: now,
             sent_initial: false,
             done: false,
             epollout_armed: false,
-            _permit: reg.permit,
+            _permit: permit,
         });
         // Link onto the stream so the append path can find and wake this sub.
-        {
-            let mut g = st.sse_subs.lock().unwrap();
-            let list = g.get_or_insert_with(|| {
-                Box::new(StreamSubs {
-                    subs: Vec::new(),
-                    wake_pending: std::sync::atomic::AtomicBool::new(false),
-                })
-            });
-            list.subs.push(SubHandle {
-                shard: self.shard_idx,
-                key,
-                gen,
-            });
-            // A gen-stale wake (subscriber closed between queue and drain) is
-            // dropped without clearing the latch; reset it on every register so
-            // a fresh subscriber can never inherit a stale-set latch.
-            list.wake_pending.store(false, Ordering::Release);
-        }
+        let list = stream_subs.get_or_insert_with(|| {
+            Box::new(StreamSubs {
+                subs: Vec::new(),
+                wake_pending: std::sync::atomic::AtomicBool::new(false),
+            })
+        });
+        list.subs.push(SubHandle {
+            shard: self.shard_idx,
+            key,
+            gen,
+        });
+        // A gen-stale wake (subscriber closed between queue and drain) is
+        // dropped without clearing the latch; reset it on every register so
+        // a fresh subscriber can never inherit a stale-set latch.
+        list.wake_pending.store(false, Ordering::Release);
+        drop(stream_subs);
         // Watch for peer close/errors; EPOLLOUT is armed lazily by flush().
         let mut ev = libc::epoll_event {
             events: libc::EPOLLRDHUP as u32,
             u64: key as u64,
         };
         unsafe {
-            libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, reg.fd, &mut ev);
+            libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd, &mut ev);
         }
         self.produce(key);
         self.flush(key);
@@ -375,6 +489,15 @@ impl Reactor {
     /// `pending`. A faithful synchronous port of `handlers::SseSource::next`
     /// (minus the async idle wait, which the keepalive sweep covers).
     fn produce(&mut self, key: u32) {
+        let deleted = self
+            .slab
+            .get(key as usize)
+            .and_then(|slot| slot.sub.as_ref())
+            .is_some_and(|sub| *sub.st.subscribe_deletion().borrow());
+        if deleted {
+            self.close(key);
+            return;
+        }
         let sub = match self.slab[key as usize].sub.as_mut() {
             Some(s) if !s.done => s,
             _ => return,
@@ -555,6 +678,10 @@ impl Reactor {
             let Some(sub) = self.slab[key as usize].sub.as_ref() else {
                 continue;
             };
+            if *sub.st.subscribe_deletion().borrow() {
+                self.close(key);
+                continue;
+            }
             if now.duration_since(sub.registered_at) >= MAX_DURATION {
                 // Lifetime cap: end cleanly; the client reconnects from its offset.
                 let sub = self.slab[key as usize].sub.as_mut().unwrap();
@@ -642,6 +769,137 @@ fn push_frame(pending: &mut Vec<u8>, sent: &mut usize, frame: &[u8]) {
 /// Append the terminating chunk (`0\r\n\r\n`) that ends a chunked SSE response.
 fn frame_terminator(pending: &mut Vec<u8>) {
     pending.extend_from_slice(b"0\r\n\r\n");
+}
+
+#[cfg(test)]
+mod deletion_wakes_tests {
+    use super::*;
+    use crate::store::{CreateResult, Store, StreamConfig};
+    use crate::tier::TierConfig;
+
+    fn config() -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    #[test]
+    fn deletion_wakes_reactor_rejects_registration_after_signal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new_with_tier(directory.path().into(), TierConfig::default()).unwrap();
+        let state = match store.create("stream", config(), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        state.signal_deletion();
+
+        let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        let shard = Arc::new(Shard {
+            eventfd,
+            intake: Mutex::new(Vec::new()),
+            wake: Mutex::new(Vec::new()),
+            close: Mutex::new(Vec::new()),
+        });
+        let mut reactor = Reactor::new(shard, 0);
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        reactor.insert(Registration {
+            fd: fds[0],
+            st: state,
+            write_off: 0,
+            encoding: SseEncoding::Base64,
+            client_cursor: None,
+            head: Vec::new(),
+            permit,
+        });
+        assert!(reactor.slab.is_empty(), "deleted stream must not register");
+
+        unsafe {
+            libc::close(fds[1]);
+            libc::close(reactor.epfd);
+            libc::close(eventfd);
+        }
+    }
+
+    #[test]
+    fn deletion_wakes_reactor_closes_seated_subscriber_before_append_wake() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new_with_tier(directory.path().into(), TierConfig::default()).unwrap();
+        let state = match store.create("stream", config(), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+
+        let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        let shard = Arc::new(Shard {
+            eventfd,
+            intake: Mutex::new(Vec::new()),
+            wake: Mutex::new(Vec::new()),
+            close: Mutex::new(Vec::new()),
+        });
+        let mut reactor = Reactor::new(shard.clone(), 0);
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = permits.clone().try_acquire_owned().unwrap();
+        reactor.insert(Registration {
+            fd: fds[0],
+            st: state.clone(),
+            write_off: 0,
+            encoding: SseEncoding::Base64,
+            client_cursor: None,
+            head: Vec::new(),
+            permit,
+        });
+
+        let key = 0;
+        let gen = reactor.slab[key as usize].gen;
+        assert!(reactor.slab[key as usize].sub.is_some());
+        let stream_subs = state.sse_subs.lock().unwrap();
+        let handles = &stream_subs.as_ref().unwrap().subs;
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].shard, 0);
+        assert_eq!(handles[0].key, key);
+        assert_eq!(handles[0].gen, gen);
+        drop(stream_subs);
+
+        state.signal_deletion();
+        close_stream_for_deletion_in_pool(&state, std::slice::from_ref(&shard));
+        assert_eq!(*shard.close.lock().unwrap(), vec![(key, gen)]);
+        // A tail wake racing deletion has the old generation. The reactor drains
+        // deletion first, so this wake cannot produce another event.
+        shard.wake.lock().unwrap().push((key, gen));
+        reactor.drain_cross_thread_work();
+
+        assert!(reactor.slab[key as usize].sub.is_none());
+        assert_eq!(reactor.slab[key as usize].gen, gen.wrapping_add(1));
+        assert_eq!(reactor.free, vec![key]);
+        assert!(state.sse_subs.lock().unwrap().is_none());
+        assert_eq!(permits.available_permits(), 1);
+        assert_eq!(unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, -1);
+
+        unsafe {
+            libc::close(fds[1]);
+            libc::close(reactor.epfd);
+            libc::close(eventfd);
+        }
+    }
 }
 
 fn pread_exact(file: &std::fs::File, mut off: u64, mut buf: &mut [u8]) -> std::io::Result<()> {

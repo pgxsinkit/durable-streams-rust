@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use serde_json::value::RawValue;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::Instrument;
 
 use crate::api::{Body, Method, Req, Resp};
@@ -2036,6 +2036,12 @@ async fn handle_long_poll(
     client_cursor: Option<u64>,
     cache_hit: &mut bool,
 ) -> Resp {
+    // Subscribe before observing the tail so a concurrent retirement wake cannot
+    // be missed between the initial snapshot and the wait loop.
+    let mut deletion = st.subscribe_deletion();
+    if deletion_observed(&mut deletion) {
+        return deletion_missing_response();
+    }
     let t0 = st.tail();
     // A beyond-tail numeric offset is treated as caught-up at the tail (see
     // `resolve_start`), so it follows the normal wait path below.
@@ -2045,9 +2051,21 @@ async fn handle_long_poll(
     // Existing data → return immediately. This is a backlog (the consumer was
     // behind the tail), so it may include cold historical bytes: not hot.
     if from < t0.bytes {
-        return long_poll_data(&st, from, t0, client_cursor, false, cache_hit).await;
+        return long_poll_data(
+            &st,
+            from,
+            t0,
+            client_cursor,
+            false,
+            cache_hit,
+            &mut deletion,
+        )
+        .await;
     }
     if t0.closed {
+        if deletion_observed(&mut deletion) {
+            return deletion_missing_response();
+        }
         return long_poll_close(t0.bytes, cursor);
     }
 
@@ -2055,20 +2073,47 @@ async fn handle_long_poll(
     let mut rx = st.tail_tx.subscribe();
     let deadline = Instant::now() + long_poll_timeout_dur();
     loop {
+        if deletion_observed(&mut deletion) {
+            return deletion_missing_response();
+        }
         let t = *rx.borrow_and_update();
         if t.bytes > from {
             // Caught-up consumer woken by new appends: freshly-written, hot.
-            return long_poll_data(&st, from, t, client_cursor, true, cache_hit).await;
+            return long_poll_data(&st, from, t, client_cursor, true, cache_hit, &mut deletion)
+                .await;
         }
         if t.closed {
+            if deletion_observed(&mut deletion) {
+                return deletion_missing_response();
+            }
             return long_poll_close(t.bytes, cursor);
         }
         tokio::select! {
+            biased;
+            r = deletion.changed() => {
+                let _ = r;
+                return deletion_missing_response();
+            }
             r = rx.changed() => {
                 if r.is_err() {
+                    if deletion_observed(&mut deletion) {
+                        return deletion_missing_response();
+                    }
                     let t = st.tail();
                     if t.bytes > from {
-                        return long_poll_data(&st, from, t, client_cursor, true, cache_hit).await;
+                        return long_poll_data(
+                            &st,
+                            from,
+                            t,
+                            client_cursor,
+                            true,
+                            cache_hit,
+                            &mut deletion,
+                        )
+                        .await;
+                    }
+                    if deletion_observed(&mut deletion) {
+                        return deletion_missing_response();
                     }
                     return long_poll_timeout(t.bytes, cursor, t.closed);
                 }
@@ -2083,9 +2128,24 @@ async fn handle_long_poll(
                 // response, including empty 204s) and is never delivered.
                 // Invariant: a long-poll response never advances the client's
                 // offset beyond the bytes it actually delivered.
+                if deletion_observed(&mut deletion) {
+                    return deletion_missing_response();
+                }
                 let t = st.tail();
                 if t.bytes > from {
-                    return long_poll_data(&st, from, t, client_cursor, true, cache_hit).await;
+                    return long_poll_data(
+                        &st,
+                        from,
+                        t,
+                        client_cursor,
+                        true,
+                        cache_hit,
+                        &mut deletion,
+                    )
+                    .await;
+                }
+                if deletion_observed(&mut deletion) {
+                    return deletion_missing_response();
                 }
                 return long_poll_timeout(t.bytes, cursor, t.closed);
             }
@@ -2100,9 +2160,16 @@ async fn long_poll_data(
     client_cursor: Option<u64>,
     hot: bool,
     cache_hit: &mut bool,
+    deletion: &mut watch::Receiver<bool>,
 ) -> Resp {
+    if deletion_observed(deletion) {
+        return deletion_missing_response();
+    }
     let cursor = compute_cursor(client_cursor);
     let body = read_range_body(st, from, t.bytes, hot, "long-poll", cache_hit).await;
+    if deletion_observed(deletion) {
+        return deletion_missing_response();
+    }
     let mut b = ResponseBuilder::new(200)
         .h("content-type", st.config.content_type.clone())
         .h(H_NEXT_OFFSET, format_offset(t.bytes))
@@ -2114,6 +2181,14 @@ async fn long_poll_data(
         b = b.hs(H_CLOSED, "true");
     }
     b.body(body)
+}
+
+fn deletion_observed(deletion: &mut watch::Receiver<bool>) -> bool {
+    *deletion.borrow_and_update()
+}
+
+fn deletion_missing_response() -> Resp {
+    text_response(404, "stream not found")
 }
 
 fn long_poll_close(tail: u64, cursor: u64) -> Resp {
@@ -2225,6 +2300,7 @@ pub(crate) fn sse_control_event(
 struct SseSource {
     st: Arc<StreamState>,
     rxw: tokio::sync::watch::Receiver<Tail>,
+    deletion: watch::Receiver<bool>,
     pos: u64,
     start: u64,
     deadline: Instant,
@@ -2235,14 +2311,23 @@ struct SseSource {
 }
 
 impl SseSource {
+    fn deletion_observed(&mut self) -> bool {
+        *self.deletion.borrow_and_update()
+    }
+
     /// Produce the next SSE event, or `None` to end the stream. Mirrors the
     /// original producer loop, but returns one frame per call (state persists in
     /// `self`) so it can run inline without a channel.
     async fn next(&mut self) -> Option<Bytes> {
-        if self.done {
+        if self.done || self.deletion_observed() {
+            self.done = true;
             return None;
         }
         loop {
+            if self.deletion_observed() {
+                self.done = true;
+                return None;
+            }
             let t = *self.rxw.borrow_and_update();
             if t.bytes > self.pos {
                 // Read new range and emit data + control. Caught-up subscribers
@@ -2268,6 +2353,10 @@ impl SseSource {
                         }
                     }
                 };
+                if self.deletion_observed() {
+                    self.done = true;
+                    return None;
+                }
                 crate::telemetry::record_tail_cache(cache_hit, "sse");
                 crate::telemetry::record_read(read_t0.elapsed_secs(), "sse", cache_hit);
                 let mut ev = String::new();
@@ -2293,6 +2382,10 @@ impl SseSource {
                 return Some(Bytes::from(ev));
             }
             if t.closed && self.pos >= t.bytes {
+                if self.deletion_observed() {
+                    self.done = true;
+                    return None;
+                }
                 let mut ev = String::new();
                 sse_control_event(
                     &mut ev,
@@ -2311,6 +2404,10 @@ impl SseSource {
                 && !t.closed
                 && self.pos == self.st.tail().bytes
             {
+                if self.deletion_observed() {
+                    self.done = true;
+                    return None;
+                }
                 let mut ev = String::new();
                 sse_control_event(
                     &mut ev,
@@ -2332,6 +2429,12 @@ impl SseSource {
             }
             let wait = SSE_KEEPALIVE.min(self.deadline - now);
             tokio::select! {
+                biased;
+                r = self.deletion.changed() => {
+                    let _ = r;
+                    self.done = true;
+                    return None;
+                }
                 r = self.rxw.changed() => {
                     if r.is_err() {
                         self.done = true;
@@ -2339,6 +2442,10 @@ impl SseSource {
                     }
                 }
                 _ = tokio::time::sleep(wait) => {
+                    if self.deletion_observed() {
+                        self.done = true;
+                        return None;
+                    }
                     // No new data within the keep-alive window: emit a heartbeat
                     // control (still open here — the close path returns above).
                     let mut ev = String::new();
@@ -2363,6 +2470,9 @@ impl crate::api::EventSource for SseSource {
     /// forked/compacted/tiered range) stays on the inline hand-off path.
     #[cfg(target_os = "linux")]
     fn reactor_reg(&self) -> Option<crate::api::SseReg> {
+        if *self.deletion.borrow() {
+            return None;
+        }
         if self.st.parent.is_some() || self.st.blobstore.is_some() {
             return None;
         }
@@ -2388,6 +2498,7 @@ fn handle_sse(st: Arc<StreamState>, offset: ParsedOffset, client_cursor: Option<
 
     let src = SseSource {
         rxw: st.tail_tx.subscribe(),
+        deletion: st.subscribe_deletion(),
         st,
         pos: start,
         start,
@@ -2500,13 +2611,141 @@ async fn handle_delete(store: Arc<Store>, path: String) -> Resp {
 }
 
 #[cfg(test)]
+mod deletion_wakes_tests {
+    use super::*;
+    use crate::store::{CreateResult, Store, StreamConfig};
+    use crate::tier::TierConfig;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::time::timeout;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn directory(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ds-deletion-wakes-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn config() -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    fn state(tag: &str) -> (std::path::PathBuf, Arc<StreamState>) {
+        let directory = directory(tag);
+        let store = Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap();
+        let state = match store.create("stream", config(), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        (directory, state)
+    }
+
+    fn inline_source(st: Arc<StreamState>) -> SseSource {
+        SseSource {
+            rxw: st.tail_tx.subscribe(),
+            deletion: st.subscribe_deletion(),
+            st,
+            pos: 0,
+            start: 0,
+            deadline: Instant::now() + SSE_MAX_DURATION,
+            client_cursor: None,
+            encoding: SseEncoding::Base64,
+            sent_initial: false,
+            done: false,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deletion_wakes_long_poll_already_signaled() {
+        let (directory, state) = state("long-poll-already");
+        state.signal_deletion();
+
+        let mut cache_hit = false;
+        assert_eq!(
+            handle_long_poll(state, ParsedOffset::Now, None, &mut cache_hit)
+                .await
+                .status,
+            404
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deletion_wakes_long_poll_mid_wait() {
+        let (directory, state) = state("long-poll-wait");
+        let waiting_state = state.clone();
+        let waiting = tokio::spawn(async move {
+            let mut cache_hit = false;
+            handle_long_poll(waiting_state, ParsedOffset::Now, None, &mut cache_hit).await
+        });
+        tokio::task::yield_now().await;
+
+        state.signal_deletion();
+        assert_eq!(
+            timeout(Duration::from_secs(5), waiting)
+                .await
+                .expect("deletion must wake long-poll")
+                .unwrap()
+                .status,
+            404
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deletion_wakes_inline_sse_already_signaled() {
+        let (directory, state) = state("sse-already");
+        state.signal_deletion();
+        let mut source = inline_source(state);
+
+        assert!(source.next().await.is_none());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deletion_wakes_inline_sse_mid_wait_without_post_delete_event() {
+        let (directory, state) = state("sse-wait");
+        let mut source = inline_source(state.clone());
+        assert!(source.next().await.is_some(), "initial control event");
+
+        let signal_state = state.clone();
+        let signal = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            signal_state.signal_deletion();
+        });
+        assert!(timeout(Duration::from_secs(5), source.next())
+            .await
+            .expect("deletion must wake inline SSE")
+            .is_none());
+        signal.await.unwrap();
+        assert!(source.next().await.is_none(), "no post-delete event");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
 mod append_fence_tests {
     use super::*;
     use crate::store::{CreateResult, Store, StreamConfig};
     use crate::tier::TierConfig;
     use crate::wal::walset::WalSet;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::UNIX_EPOCH;
+    use std::time::SystemTime;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -2652,13 +2891,15 @@ mod append_fence_tests {
         let wal = WalSet::open(&directory, Some(1), 1).unwrap();
         assert!(store.wal.set(wal.clone()).is_ok());
         let state = match store
-            .create("ttl-rollback", config(Some(60)), None, 0)
+            .create("ttl-rollback", config(Some(3_600)), None, 0)
             .unwrap()
         {
             CreateResult::Created(state) => state,
             _ => panic!("expected new stream"),
         };
-        let original_access = UNIX_EPOCH;
+        // Keep this TTL baseline far from expiry: this test reaches the WAL
+        // stage-failure rollback, not the independently-tested lazy-expiry path.
+        let original_access = SystemTime::now();
         state.shared.write().unwrap().last_access = original_access;
         wal.shard_for(state.id).fail_next_write();
 
