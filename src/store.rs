@@ -656,6 +656,20 @@ pub(crate) struct LocalCleanupOutcome {
     pub(crate) reclaimed_local_bytes: u64,
 }
 
+/// Outcome of one exact explicit-retirement attempt. The caller that receives
+/// `Owner` alone performed the Store linearization; duplicates share its ticket.
+#[allow(dead_code)] // TODO(retirement-005c): handlers consume this result.
+pub(crate) enum ExplicitRetirementResult {
+    Owner(crate::retirement::RetirementTicket),
+    Existing(crate::retirement::RetirementTicket),
+    Missing,
+    Gone,
+    Stale,
+    Rejected(crate::retirement::RetirementAdmission),
+    Unavailable,
+    Cancelled(crate::retirement::RetirementTicket),
+}
+
 impl Store {
     fn publish_inventory(&self, st: &StreamState) {
         // Keep the registry shard locked through projection publication. A
@@ -915,9 +929,7 @@ impl Store {
             let store = store.upgrade().ok_or_else(|| {
                 std::io::Error::other("retirement cleanup ran after Store was dropped")
             })?;
-            // 005b2 extends this callback with retirement finalization. This
-            // lifecycle slice deliberately delegates only to local cleanup.
-            store.cleanup_local_stream(stream, mode)
+            store.finalize_retirement_cleanup(stream, mode)
         });
         let executor = Arc::new(
             crate::retirement::RetirementExecutor::new(
@@ -940,6 +952,167 @@ impl Store {
         &self,
     ) -> Option<&Arc<crate::retirement::RetirementExecutor>> {
         self.retirement_executor.get()
+    }
+
+    /// Retire one exact registered stream incarnation. This only linearizes
+    /// Store state and schedules the bounded physical phase; 005c maps the
+    /// returned ticket to the explicit DELETE response.
+    #[allow(dead_code)] // TODO(retirement-005c): explicit DELETE calls this.
+    pub(crate) async fn retire_explicit(
+        self: &Arc<Self>,
+        stream: Arc<StreamState>,
+    ) -> ExplicitRetirementResult {
+        match self.streams.get(&stream.path) {
+            None => return ExplicitRetirementResult::Missing,
+            Some(current) if current.id != stream.id || !Arc::ptr_eq(current.value(), &stream) => {
+                return ExplicitRetirementResult::Stale;
+            }
+            Some(_) => {}
+        }
+        if stream.shared.read().unwrap().soft_deleted {
+            return ExplicitRetirementResult::Gone;
+        }
+        let Some(executor) = self.retirement_executor() else {
+            return ExplicitRetirementResult::Unavailable;
+        };
+        let executor = Arc::clone(executor);
+        let ticket = match executor.admit(
+            stream.clone(),
+            crate::retirement::RetirementPriority::Interactive,
+            LocalCleanupMode::ExplicitDelete,
+        ) {
+            crate::retirement::RetirementAdmissionResult::Admitted(ticket) => ticket,
+            crate::retirement::RetirementAdmissionResult::Existing(ticket) => {
+                return ExplicitRetirementResult::Existing(ticket);
+            }
+            crate::retirement::RetirementAdmissionResult::Rejected(reason) => {
+                return ExplicitRetirementResult::Rejected(reason);
+            }
+        };
+
+        {
+            let appender = stream.appender.lock().await;
+            if !self.is_exact_live(&stream) || stream.fenced.load(Ordering::Acquire) {
+                drop(appender);
+                return self.cancel_explicit_retirement(&executor, &stream, ticket);
+            }
+            stream.fence_while_holding_appender(&appender);
+        }
+        stream.wait_for_inflight_appends_zero().await;
+
+        if !self.is_exact_live(&stream) {
+            return self.cancel_explicit_retirement(&executor, &stream, ticket);
+        }
+        stream.wake_deletion();
+        self.subscriptions
+            .clone()
+            .on_stream_deleted(Arc::clone(self), &stream.path)
+            .await;
+        if !self.is_exact_live(&stream) {
+            return self.cancel_explicit_retirement(&executor, &stream, ticket);
+        }
+
+        let soft_deleted = {
+            let mut shared = stream.shared.write().unwrap();
+            if shared.soft_deleted {
+                return self.cancel_explicit_retirement(&executor, &stream, ticket);
+            }
+            if shared.ref_count > 0 {
+                shared.soft_deleted = true;
+                true
+            } else {
+                false
+            }
+        };
+        if !soft_deleted {
+            let removed = self.streams.remove_if(&stream.path, |_, current| {
+                current.id == stream.id && Arc::ptr_eq(current, &stream)
+            });
+            if removed.is_none() {
+                return self.cancel_explicit_retirement(&executor, &stream, ticket);
+            }
+            self.remove_inventory(&stream.path, stream.id);
+        }
+
+        if executor.release_logical(&stream, &ticket) {
+            ExplicitRetirementResult::Owner(ticket)
+        } else {
+            if !soft_deleted {
+                self.restore_exact_registration(&stream);
+            }
+            ExplicitRetirementResult::Cancelled(ticket)
+        }
+    }
+
+    #[allow(dead_code)]
+    fn cancel_explicit_retirement(
+        &self,
+        executor: &crate::retirement::RetirementExecutor,
+        stream: &Arc<StreamState>,
+        ticket: crate::retirement::RetirementTicket,
+    ) -> ExplicitRetirementResult {
+        let _ = executor.cancel_prelogical(stream, &ticket);
+        ExplicitRetirementResult::Cancelled(ticket)
+    }
+
+    fn is_exact_registered(&self, stream: &Arc<StreamState>) -> bool {
+        self.streams
+            .get(&stream.path)
+            .is_some_and(|current| current.id == stream.id && Arc::ptr_eq(current.value(), stream))
+    }
+
+    #[allow(dead_code)]
+    fn is_exact_live(&self, stream: &Arc<StreamState>) -> bool {
+        self.is_exact_registered(stream) && !stream.shared.read().unwrap().soft_deleted
+    }
+
+    #[allow(dead_code)]
+    fn restore_exact_registration(&self, stream: &Arc<StreamState>) {
+        use dashmap::mapref::entry::Entry;
+
+        let restored = match self.streams.entry(stream.path.clone()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(entry) => {
+                entry.insert(stream.clone());
+                true
+            }
+        };
+        if restored {
+            self.publish_inventory(stream);
+        }
+    }
+
+    /// Physical finalizer for an already-linearized retirement. It deliberately
+    /// performs no registry mutation: the logical path owns that transition.
+    fn finalize_retirement_cleanup(
+        &self,
+        stream: &Arc<StreamState>,
+        mode: LocalCleanupMode,
+    ) -> std::io::Result<LocalCleanupOutcome> {
+        if !stream.fenced.load(Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "retirement cleanup requires a fenced stream",
+            ));
+        }
+        if stream.shared.read().unwrap().soft_deleted {
+            if !self.is_exact_registered(stream) {
+                return Err(std::io::Error::other(
+                    "soft retirement lost its exact registry tombstone",
+                ));
+            }
+            write_meta_sync(stream, true)?;
+            self.publish_inventory(stream);
+            return Ok(LocalCleanupOutcome::default());
+        }
+        if self.is_exact_registered(stream) {
+            return Err(std::io::Error::other(
+                "hard retirement must leave the registry before cleanup",
+            ));
+        }
+        self.gc_remote_segments(stream);
+        let outcome = self.cleanup_local_stream(stream, mode)?;
+        self.release_parent(stream);
+        Ok(outcome)
     }
 
     /// Directory holding staged sealed chunk files (separate from `streams/` so
@@ -1921,9 +2094,7 @@ mod stream_lifecycle_tests {
 #[cfg(test)]
 mod retirement_executor_lifecycle_tests {
     use super::*;
-    use crate::retirement::{
-        RetirementAdmissionResult, RetirementPriority, TerminalCleanupCompletion,
-    };
+    use crate::retirement::{LogicalCompletion, TerminalCleanupCompletion};
 
     fn stream_config() -> StreamConfig {
         StreamConfig {
@@ -1950,6 +2121,16 @@ mod retirement_executor_lifecycle_tests {
             Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap(),
         );
         (directory, store)
+    }
+
+    async fn wait_until_fenced(stream: &StreamState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !stream.fenced.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("explicit retirement should fence the admitted stream");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1986,28 +2167,22 @@ mod retirement_executor_lifecycle_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn retirement_executor_lifecycle_callback_cleans_the_exact_stream() {
         let (directory, store) = temporary_store("callback");
-        let executor = Arc::clone(store.init_retirement_executor().unwrap());
+        store.init_retirement_executor().unwrap();
         let stream = match store.create("stream", stream_config(), None, 0).unwrap() {
             CreateResult::Created(stream) => stream,
             _ => panic!("expected stream creation"),
         };
-        let ticket = match executor.admit(
-            stream.clone(),
-            RetirementPriority::Interactive,
-            LocalCleanupMode::Expiry,
-        ) {
-            RetirementAdmissionResult::Admitted(ticket) => ticket,
-            _ => panic!("first admission owns the logical gate"),
+        let ticket = match store.retire_explicit(stream.clone()).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("first explicit retirement owns the logical gate"),
         };
-        assert!(executor.release_logical(&stream, &ticket));
         assert!(matches!(
             ticket.wait_terminal().await,
             TerminalCleanupCompletion::Succeeded { .. }
         ));
         assert!(!stream.file_path.exists());
-        executor.shutdown().await;
+        store.retirement_executor().unwrap().shutdown().await;
 
-        drop(executor);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -2026,6 +2201,210 @@ mod retirement_executor_lifecycle_tests {
         executor.shutdown().await;
         drop(executor);
         assert!(weak_store.upgrade().is_none());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_retirement_store_waits_for_inflight_and_deduplicates() {
+        let (directory, store) = temporary_store("inflight");
+        store.init_retirement_executor().unwrap();
+        let stream = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected stream creation"),
+        };
+        let appender = stream.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&stream, &appender).unwrap();
+        drop(appender);
+
+        let owner_store = store.clone();
+        let owner_stream = stream.clone();
+        let mut owner =
+            tokio::spawn(async move { owner_store.retire_explicit(owner_stream).await });
+        wait_until_fenced(&stream).await;
+        let duplicate = match store.retire_explicit(stream.clone()).await {
+            ExplicitRetirementResult::Existing(ticket) => ticket,
+            _ => panic!("duplicate must share the admitted ticket"),
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut owner)
+                .await
+                .is_err(),
+            "logical retirement and cleanup must wait for the full-ack guard"
+        );
+        assert!(stream.file_path.exists());
+
+        drop(guard);
+        let ticket = match tokio::time::timeout(Duration::from_secs(5), &mut owner)
+            .await
+            .expect("retirement resumes after final guard drop")
+            .expect("retirement task should not panic")
+        {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("admitted caller must own Store linearization"),
+        };
+        assert!(ticket.same_identity(&duplicate));
+        assert_eq!(ticket.wait_logical().await, LogicalCompletion::Completed);
+        assert!(store.streams.get("stream").is_none());
+        assert!(!store
+            .inventory_page(None, None, 10)
+            .unwrap()
+            .1
+            .iter()
+            .any(|entry| entry.path == "stream"));
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        store.retirement_executor().unwrap().shutdown().await;
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_retirement_store_soft_tombstone_is_durable() {
+        let (directory, store) = temporary_store("soft");
+        store.init_retirement_executor().unwrap();
+        let stream = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected stream creation"),
+        };
+        stream.shared.write().unwrap().ref_count = 1;
+        let ticket = match store.retire_explicit(stream.clone()).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("soft retirement should own linearization"),
+        };
+        assert_eq!(ticket.wait_logical().await, LogicalCompletion::Completed);
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        let retained = store
+            .get("stream")
+            .expect("soft tombstone stays registered");
+        assert!(retained.shared.read().unwrap().soft_deleted);
+        store.retirement_executor().unwrap().shutdown().await;
+
+        drop(retained);
+        drop(stream);
+        drop(store);
+        let reopened = Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default())
+            .expect("durable soft tombstone reopens");
+        assert!(
+            reopened
+                .get("stream")
+                .expect("soft tombstone is recovered")
+                .shared
+                .read()
+                .unwrap()
+                .soft_deleted
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_retirement_store_replacement_cancels_the_owner_ticket() {
+        let (directory, store) = temporary_store("replacement");
+        store.init_retirement_executor().unwrap();
+        let original = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected original stream"),
+        };
+        let appender = original.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&original, &appender).unwrap();
+        drop(appender);
+        let owner_store = store.clone();
+        let owner_stream = original.clone();
+        let owner = tokio::spawn(async move { owner_store.retire_explicit(owner_stream).await });
+        wait_until_fenced(&original).await;
+
+        store.streams.remove_if("stream", |_, current| {
+            current.id == original.id && Arc::ptr_eq(current, &original)
+        });
+        let replacement = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected replacement stream"),
+        };
+        drop(guard);
+        let ticket = match tokio::time::timeout(Duration::from_secs(5), owner)
+            .await
+            .expect("replacement race must resolve")
+            .expect("retirement task should not panic")
+        {
+            ExplicitRetirementResult::Cancelled(ticket) => ticket,
+            _ => panic!("lost identity must cancel the owner ticket"),
+        };
+        assert_eq!(ticket.wait_logical().await, LogicalCompletion::Cancelled);
+        assert_eq!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Cancelled
+        );
+        assert!(Arc::ptr_eq(
+            store.streams.get("stream").unwrap().value(),
+            &replacement
+        ));
+        assert!(original.file_path.exists());
+        assert!(replacement.file_path.exists());
+        store.retirement_executor().unwrap().shutdown().await;
+
+        drop(replacement);
+        drop(original);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_retirement_store_rejects_unfenced_direct_cleanup() {
+        let (directory, store) = temporary_store("unfenced");
+        store.init_retirement_executor().unwrap();
+        let stream = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected stream creation"),
+        };
+        assert!(store
+            .finalize_retirement_cleanup(&stream, LocalCleanupMode::ExplicitDelete)
+            .is_err());
+        assert!(stream.file_path.exists());
+        assert!(store.is_exact_registered(&stream));
+        store.retirement_executor().unwrap().shutdown().await;
+
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_retirement_store_retries_failed_hard_cleanup_without_unfencing() {
+        let _fault_guard = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = temporary_store("retry");
+        store.init_retirement_executor().unwrap();
+        let stream = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected stream creation"),
+        };
+        DELETE_FAULT.store(2, Ordering::Relaxed);
+        let ticket = match store.retire_explicit(stream.clone()).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("hard retirement should own linearization"),
+        };
+        assert_eq!(
+            ticket.wait_first_attempt().await,
+            crate::retirement::FirstAttemptCompletion::Failed
+        );
+        assert!(stream.fenced.load(Ordering::Acquire));
+        assert!(stream.file_path.exists());
+        assert!(store.streams.get("stream").is_none());
+
+        DELETE_FAULT.store(0, Ordering::Relaxed);
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        store.retirement_executor().unwrap().shutdown().await;
+
+        drop(stream);
+        drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }
 }
