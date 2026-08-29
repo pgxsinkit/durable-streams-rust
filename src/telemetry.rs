@@ -37,6 +37,13 @@ mod imp {
     const LATENCY_BUCKETS: &[f64] = &[
         0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
     ];
+    /// Expiry scanner and physical cleanup durations (seconds).
+    const EXPIRY_DURATION_BUCKETS: &[f64] =
+        &[0.0001, 0.001, 0.01, 0.05, 0.25, 1.0, 5.0, 15.0, 60.0, 300.0];
+    /// Expiry age and wall/monotonic divergence ranges (seconds).
+    const EXPIRY_AGE_BUCKETS: &[f64] = &[
+        0.001, 0.01, 0.1, 1.0, 5.0, 30.0, 60.0, 300.0, 900.0, 3600.0, 21600.0, 86400.0, 604800.0,
+    ];
     /// Batch-size histogram bucket boundaries (count).
     const BATCH_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
 
@@ -61,6 +68,12 @@ mod imp {
         expiry_lag: Histogram<f64>,
         expiry_clock_drift: Histogram<f64>,
         expiry_bulk_guard_paused: Gauge<u64>,
+        expiry_cleanup_duration: Histogram<f64>,
+        expiry_reclaimed_local_bytes: Counter<u64>,
+        expiry_queue_depth: Gauge<u64>,
+        expiry_queue_retries: Counter<u64>,
+        expiry_fence_oldest_age: Gauge<f64>,
+        expiry_cleanup_failed: Gauge<u64>,
     }
 
     impl Metrics {
@@ -122,12 +135,12 @@ mod imp {
                     .build(),
                 expiry_outcome: meter
                     .u64_counter("ds.expiry.outcome")
-                    .with_description("Bounded expiry scanner outcomes.")
+                    .with_description("Bounded expiry lifecycle outcomes.")
                     .build(),
                 expiry_lag: meter
                     .f64_histogram("ds.expiry.lag")
                     .with_unit("s")
-                    .with_description("Latest and oldest due-candidate lag per scanner page.")
+                    .with_description("Oldest due-candidate lag per scanner page.")
                     .build(),
                 expiry_clock_drift: meter
                     .f64_histogram("ds.expiry.clock_drift")
@@ -137,6 +150,38 @@ mod imp {
                 expiry_bulk_guard_paused: meter
                     .u64_gauge("ds.expiry.bulk_guard.paused")
                     .with_description("Whether the expiry bulk safety guard is currently paused.")
+                    .build(),
+                expiry_cleanup_duration: meter
+                    .f64_histogram("ds.expiry.cleanup.duration")
+                    .with_unit("s")
+                    .with_description("Physical expiry cleanup attempt duration.")
+                    .build(),
+                expiry_reclaimed_local_bytes: meter
+                    .u64_counter("ds.expiry.reclaimed.local_bytes")
+                    .with_description(
+                        "Local bytes reclaimed by successful physical expiry cleanup.",
+                    )
+                    .build(),
+                expiry_queue_depth: meter
+                    .u64_gauge("ds.expiry.queue.depth")
+                    .with_description("Current retained Expiry retirement job count.")
+                    .build(),
+                expiry_queue_retries: meter
+                    .u64_counter("ds.expiry.queue.retries")
+                    .with_description(
+                        "Expiry cleanup retries scheduled after failed physical attempts.",
+                    )
+                    .build(),
+                expiry_fence_oldest_age: meter
+                    .f64_gauge("ds.expiry.fence.oldest_age")
+                    .with_unit("s")
+                    .with_description(
+                        "Age of the oldest retained expiry fence, or zero when none remain.",
+                    )
+                    .build(),
+                expiry_cleanup_failed: meter
+                    .u64_gauge("ds.expiry.cleanup_failed")
+                    .with_description("Current terminal expiry cleanup failures in cooldown.")
                     .build(),
             }
         }
@@ -269,9 +314,16 @@ mod imp {
                     .with_view(bucket_view("ds.append.duration", LATENCY_BUCKETS))
                     .with_view(bucket_view("ds.read.duration", LATENCY_BUCKETS))
                     .with_view(bucket_view("ds.read.offload.wait", LATENCY_BUCKETS))
-                    .with_view(bucket_view("ds.expiry.scan.duration", LATENCY_BUCKETS))
-                    .with_view(bucket_view("ds.expiry.lag", LATENCY_BUCKETS))
-                    .with_view(bucket_view("ds.expiry.clock_drift", LATENCY_BUCKETS))
+                    .with_view(bucket_view(
+                        "ds.expiry.scan.duration",
+                        EXPIRY_DURATION_BUCKETS,
+                    ))
+                    .with_view(bucket_view(
+                        "ds.expiry.cleanup.duration",
+                        EXPIRY_DURATION_BUCKETS,
+                    ))
+                    .with_view(bucket_view("ds.expiry.lag", EXPIRY_AGE_BUCKETS))
+                    .with_view(bucket_view("ds.expiry.clock_drift", EXPIRY_AGE_BUCKETS))
                     .with_view(bucket_view("ds.append.fsync.batch_size", BATCH_BUCKETS))
                     .build();
                 Some(provider)
@@ -398,16 +450,7 @@ mod imp {
                     );
                 }
             }
-            if let Some(seconds) = page
-                .latest_due_lag_seconds
-                .filter(|seconds| seconds.is_finite())
-            {
-                m.expiry_lag.record(seconds, &[]);
-            }
-            if let Some(seconds) = page
-                .oldest_due_lag_seconds
-                .filter(|seconds| seconds.is_finite())
-            {
+            if let Some(seconds) = page.due_lag_seconds().filter(|seconds| seconds.is_finite()) {
                 m.expiry_lag.record(seconds, &[]);
             }
             if let Some(seconds) = page
@@ -435,6 +478,61 @@ mod imp {
                     &[KeyValue::new("outcome", delta.outcome.label())],
                 );
             }
+        }
+    }
+
+    pub fn record_expiry_retirement(snapshot: super::ExpiryRetirementTelemetry) {
+        if let Some(m) = metrics() {
+            m.expiry_queue_depth.record(snapshot.queue_depth, &[]);
+            m.expiry_cleanup_failed.record(snapshot.cleanup_failed, &[]);
+            m.expiry_fence_oldest_age.record(
+                snapshot
+                    .oldest_fence_age_seconds
+                    .filter(|seconds| seconds.is_finite())
+                    .unwrap_or(0.0),
+                &[],
+            );
+        }
+    }
+
+    pub fn record_expiry_cleanup_attempt(attempt: super::ExpiryCleanupTelemetry) {
+        if let Some(m) = metrics() {
+            if attempt.duration_seconds.is_finite() {
+                m.expiry_cleanup_duration
+                    .record(attempt.duration_seconds, &[]);
+            }
+            if let Some(disposition) = attempt.disposition {
+                match disposition {
+                    super::ExpiryCleanupDisposition::Reaped(reclaimed_local_bytes) => {
+                        m.expiry_reclaimed_local_bytes
+                            .add(reclaimed_local_bytes, &[]);
+                        m.expiry_outcome.add(
+                            1,
+                            &[KeyValue::new(
+                                "outcome",
+                                super::ExpiryOutcome::Reaped.label(),
+                            )],
+                        );
+                    }
+                    super::ExpiryCleanupDisposition::SoftDeleted => {
+                        m.expiry_outcome.add(
+                            1,
+                            &[KeyValue::new(
+                                "outcome",
+                                super::ExpiryOutcome::SoftDeleted.label(),
+                            )],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Exactly one increment is emitted at retry scheduling, never again when
+    /// the retry is later dispatched.
+    pub fn record_expiry_cleanup_retry() {
+        if let Some(m) = metrics() {
+            m.expiry_queue_retries.add(1, &[]);
         }
     }
 
@@ -497,6 +595,12 @@ mod imp {
     pub fn record_expiry_clock_drift(_seconds: f64) {}
     #[inline(always)]
     pub fn record_expiry_outcome(_delta: super::ExpiryOutcomeDelta) {}
+    #[inline(always)]
+    pub fn record_expiry_retirement(_snapshot: super::ExpiryRetirementTelemetry) {}
+    #[inline(always)]
+    pub fn record_expiry_cleanup_attempt(_attempt: super::ExpiryCleanupTelemetry) {}
+    #[inline(always)]
+    pub fn record_expiry_cleanup_retry() {}
 
     /// Zero-sized no-op timer: `start`/`elapsed_secs` compile to nothing, so a
     /// default build reads no clock on hot paths.
@@ -518,9 +622,10 @@ mod imp {
 // but are part of the stable public surface — keep the re-export complete.
 #[allow(unused_imports)]
 pub use imp::{
-    init, record_append, record_append_lock_wait, record_expiry_clock_drift, record_expiry_outcome,
-    record_expiry_page, record_fsync, record_offload_wait, record_read, record_request,
-    record_tail_cache, Guard, Timer,
+    init, record_append, record_append_lock_wait, record_expiry_cleanup_attempt,
+    record_expiry_cleanup_retry, record_expiry_clock_drift, record_expiry_outcome,
+    record_expiry_page, record_expiry_retirement, record_fsync, record_offload_wait, record_read,
+    record_request, record_tail_cache, Guard, Timer,
 };
 
 /// The complete static label domain for `ds.expiry.outcome`. No caller accepts
@@ -570,8 +675,7 @@ pub struct ExpiryOutcomeDelta {
 }
 
 /// O(1) telemetry emitted once after each scanner page has updated its safety
-/// state. Latest and oldest lag are the page's newest due candidate and its
-/// maximum due lag respectively, both recorded in seconds when present.
+/// state. The oldest/max due lag is the sole page lag sample, in seconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExpiryPageTelemetry {
     pub index_entries: u64,
@@ -588,6 +692,12 @@ pub struct ExpiryPageTelemetry {
 
 #[allow(dead_code)]
 impl ExpiryPageTelemetry {
+    /// Exactly one due-lag sample is emitted per page: the maximum (oldest)
+    /// overdue candidate, rather than both the newest and oldest values.
+    pub const fn due_lag_seconds(self) -> Option<f64> {
+        self.oldest_due_lag_seconds
+    }
+
     pub const fn outcome_deltas(self) -> [ExpiryOutcomeDelta; 2] {
         [
             ExpiryOutcomeDelta {
@@ -600,6 +710,31 @@ impl ExpiryPageTelemetry {
             },
         ]
     }
+}
+
+/// O(1) retirement state captured outside the coordinator lock before current
+/// gauges are recorded. It deliberately has no stream identity or lane label.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpiryRetirementTelemetry {
+    pub queue_depth: u64,
+    pub cleanup_failed: u64,
+    pub oldest_fence_age_seconds: Option<f64>,
+}
+
+/// One matched physical expiry cleanup attempt. Every attempt records its
+/// duration; only a successful disposition emits a terminal outcome.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpiryCleanupTelemetry {
+    pub duration_seconds: f64,
+    pub disposition: Option<ExpiryCleanupDisposition>,
+}
+
+/// Successful physical expiry cleanup is either a hard reap or a durable soft
+/// tombstone. Only the former contributes reclaimed bytes and `reaped`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpiryCleanupDisposition {
+    Reaped(u64),
+    SoftDeleted,
 }
 
 #[cfg(test)]
@@ -654,6 +789,7 @@ mod tests {
         );
         assert_eq!(page.index_entries, 9);
         assert!(!page.bulk_guard_paused);
+        assert_eq!(page.due_lag_seconds(), Some(0.5));
         assert_eq!(page.completed_pass_duration_seconds, Some(1.0));
 
         let next_page = ExpiryPageTelemetry {
@@ -669,6 +805,54 @@ mod tests {
             vec![1.0],
             "a completed pass emits one duration"
         );
+    }
+
+    #[test]
+    fn expiry_page_records_only_the_oldest_due_lag() {
+        let page = ExpiryPageTelemetry {
+            latest_due_lag_seconds: Some(0.1),
+            oldest_due_lag_seconds: Some(5.0),
+            ..empty_expiry_page()
+        };
+        assert_eq!(page.due_lag_seconds(), Some(5.0));
+        let single_due = ExpiryPageTelemetry {
+            latest_due_lag_seconds: Some(2.0),
+            oldest_due_lag_seconds: Some(2.0),
+            ..empty_expiry_page()
+        };
+        assert_eq!(single_due.due_lag_seconds(), Some(2.0));
+    }
+
+    #[test]
+    fn expiry_retirement_events_are_scalar_and_success_only_reclaims() {
+        let snapshot = ExpiryRetirementTelemetry {
+            queue_depth: 3,
+            cleanup_failed: 1,
+            oldest_fence_age_seconds: Some(60.0),
+        };
+        assert_eq!(snapshot.queue_depth, 3);
+        assert_eq!(snapshot.cleanup_failed, 1);
+        let success = ExpiryCleanupTelemetry {
+            duration_seconds: 0.25,
+            disposition: Some(ExpiryCleanupDisposition::Reaped(42)),
+        };
+        let soft_deleted = ExpiryCleanupTelemetry {
+            duration_seconds: 0.25,
+            disposition: Some(ExpiryCleanupDisposition::SoftDeleted),
+        };
+        let failed = ExpiryCleanupTelemetry {
+            duration_seconds: 0.25,
+            disposition: None,
+        };
+        assert_eq!(
+            success.disposition,
+            Some(ExpiryCleanupDisposition::Reaped(42))
+        );
+        assert_eq!(
+            soft_deleted.disposition,
+            Some(ExpiryCleanupDisposition::SoftDeleted)
+        );
+        assert_eq!(failed.disposition, None);
     }
 
     #[test]
@@ -719,6 +903,18 @@ mod tests {
                 "expiry telemetry must not label {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn expiry_histograms_use_operationally_sized_buckets() {
+        let source = include_str!("telemetry.rs");
+        assert!(source.contains("604800.0"), "age buckets include days");
+        assert!(
+            source.contains("300.0"),
+            "cleanup/scan buckets include minutes"
+        );
+        assert!(source.contains("EXPIRY_AGE_BUCKETS"));
+        assert!(source.contains("EXPIRY_DURATION_BUCKETS"));
     }
 
     fn empty_expiry_page() -> ExpiryPageTelemetry {

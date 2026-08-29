@@ -8,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::watch;
 
+use super::coordinator::ExpiryFenceLease;
+
 pub(crate) const DEFAULT_RETIREMENT_QUEUE_CAPACITY: usize = 4096;
 pub(crate) const DEFAULT_RETIREMENT_CONCURRENCY: usize = 64;
 pub(crate) const RESERVED_INTERACTIVE_COORDINATOR_PERMITS: usize = 8;
@@ -265,6 +267,7 @@ pub(crate) struct RetirementState {
     attempts: u8,
     cleanup_failed_at: Option<SystemTime>,
     cooldown_until: Option<Instant>,
+    expiry_fence_lease: Option<ExpiryFenceLease>,
 }
 
 pub(crate) enum RetirementReservation {
@@ -274,6 +277,12 @@ pub(crate) enum RetirementReservation {
 }
 
 impl RetirementState {
+    pub(crate) fn install_expiry_fence_lease(
+        &mut self,
+        lease: ExpiryFenceLease,
+    ) -> Option<ExpiryFenceLease> {
+        self.expiry_fence_lease.replace(lease)
+    }
     pub(crate) fn has_terminal_failure(&self) -> bool {
         self.cleanup_failed_at.is_some()
     }

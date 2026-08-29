@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-use crate::store::{LocalCleanupMode, LocalCleanupOutcome, StreamState};
+use crate::store::{LocalCleanupDisposition, LocalCleanupMode, LocalCleanupOutcome, StreamState};
 
 use super::{RetirementConfig, RetirementPriority, RESERVED_INTERACTIVE_CLEANUP_WORKERS};
 
@@ -30,7 +30,10 @@ pub(crate) enum PhysicalSubmitError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PhysicalAttemptResult {
-    Succeeded { reclaimed_local_bytes: u64 },
+    Succeeded {
+        reclaimed_local_bytes: u64,
+        disposition: LocalCleanupDisposition,
+    },
     Failed,
     Panicked,
     Cancelled,
@@ -312,9 +315,21 @@ fn worker_loop(index: usize, shared: Arc<Shared>, cleanup: CleanupCallback) {
         let result = match catch_unwind(AssertUnwindSafe(|| cleanup(&job.stream, job.mode))) {
             Ok(Ok(outcome)) => PhysicalAttemptResult::Succeeded {
                 reclaimed_local_bytes: outcome.reclaimed_local_bytes,
+                disposition: outcome.disposition,
             },
-            Ok(Err(_)) => PhysicalAttemptResult::Failed,
-            Err(_) => PhysicalAttemptResult::Panicked,
+            Ok(Err(error)) => {
+                if job.mode == LocalCleanupMode::Expiry {
+                    crate::store::log_expiry_cleanup_failure(&job.stream, &error);
+                }
+                PhysicalAttemptResult::Failed
+            }
+            Err(_) => {
+                if job.mode == LocalCleanupMode::Expiry {
+                    let error = io::Error::other("cleanup callback panicked");
+                    crate::store::log_expiry_cleanup_failure(&job.stream, &error);
+                }
+                PhysicalAttemptResult::Panicked
+            }
         };
         let duration = started.elapsed();
         {
@@ -682,6 +697,7 @@ mod tests {
                     1 => panic!("expected callback panic"),
                     _ => Ok(LocalCleanupOutcome {
                         reclaimed_local_bytes: 7,
+                        ..LocalCleanupOutcome::default()
                     }),
                 },
             );
@@ -721,7 +737,8 @@ mod tests {
                 .wait()
                 .await,
             PhysicalAttemptResult::Succeeded {
-                reclaimed_local_bytes: 7
+                reclaimed_local_bytes: 7,
+                disposition: LocalCleanupDisposition::HardReaped,
             }
         );
         executor.shutdown().await;

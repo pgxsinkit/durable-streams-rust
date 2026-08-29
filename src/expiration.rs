@@ -680,14 +680,13 @@ impl ExpirationScannerStatus {
                 // Physical completion is executor-owned and belongs to 0ln-b, so
                 // this snapshot deliberately leaves `reaped` at zero here.
                 crate::store::ExplicitRetirementResult::Owner(_) => None,
-                crate::store::ExplicitRetirementResult::Existing(_) => {
-                    safety.outcomes.fenced = safety.outcomes.fenced.saturating_add(1);
-                    Some(crate::telemetry::ExpiryOutcome::Fenced)
-                }
-                crate::store::ExplicitRetirementResult::Gone => {
-                    safety.outcomes.soft_deleted = safety.outcomes.soft_deleted.saturating_add(1);
-                    Some(crate::telemetry::ExpiryOutcome::SoftDeleted)
-                }
+                // A duplicate ticket did not apply a new fence. Fence telemetry
+                // is emitted by Store only for the exact successful transition.
+                crate::store::ExplicitRetirementResult::Existing(_) => None,
+                // Store emits soft_deleted only after the exact durable
+                // tombstone transition succeeds; observing an old tombstone is
+                // not another transition.
+                crate::store::ExplicitRetirementResult::Gone => None,
                 crate::store::ExplicitRetirementResult::Missing
                 | crate::store::ExplicitRetirementResult::Stale => {
                     safety.outcomes.stale = safety.outcomes.stale.saturating_add(1);
@@ -931,6 +930,11 @@ async fn run_scanner(
             monotonic: Instant::now(),
         });
         status.sample_clock(SystemTime::now(), Instant::now());
+        // Refresh the O(1) retirement age gauge while scanning so a retained
+        // idle fence continues to report its current age between transitions.
+        if let Some(executor) = store.retirement_executor() {
+            executor.emit_expiry_telemetry();
+        }
         let safety = status.safety_snapshot_at(Instant::now());
         if !admit_due_candidates(
             &store,
@@ -2054,9 +2058,6 @@ mod tests {
         status.record_proactive_outcome(&crate::store::ExplicitRetirementResult::Owner(
             crate::retirement::RetirementTicket::new(),
         ));
-        status.record_proactive_outcome(&crate::store::ExplicitRetirementResult::Existing(
-            crate::retirement::RetirementTicket::new(),
-        ));
         status.record_proactive_outcome(&crate::store::ExplicitRetirementResult::Cancelled(
             crate::retirement::RetirementTicket::new(),
         ));
@@ -2067,7 +2068,7 @@ mod tests {
             outcomes.reaped, 0,
             "logical ownership is not physical reaping"
         );
-        assert_eq!(outcomes.fenced, 1, "only an existing ticket is fenced");
+        assert_eq!(outcomes.fenced, 0, "duplicate tickets do not re-fence");
         assert_eq!(
             outcomes.failed, 1,
             "identity-loss cancellation is not renewal"

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{mpsc, Notify};
 
-use crate::store::{LocalCleanupMode, StreamState};
+use crate::store::{LocalCleanupDisposition, LocalCleanupMode, StreamState};
 
 use super::{
     retry_backoff, CleanupCallback, FirstAttemptCompletion, LogicalCompletion,
@@ -61,6 +61,16 @@ struct AdmissionNode {
     next: Option<u64>,
 }
 
+/// O(1) identity-safe expiry-fence index. Weak identity keeps telemetry from
+/// extending stream lifetime after a terminal cooldown or replacement.
+struct ExpiryFenceNode {
+    stream: Weak<StreamState>,
+    fenced_at: Instant,
+    previous: Option<u64>,
+    next: Option<u64>,
+    terminal_failure: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ScheduledRetry {
     due: Instant,
@@ -96,6 +106,11 @@ struct CoordinatorState {
     admitted: HashMap<u64, AdmissionNode>,
     oldest_admission: Option<u64>,
     newest_admission: Option<u64>,
+    expiry_jobs: u64,
+    expiry_fences: HashMap<u64, ExpiryFenceNode>,
+    oldest_expiry_fence: Option<u64>,
+    newest_expiry_fence: Option<u64>,
+    expiry_terminal_cleanup_failed_current: u64,
     cumulative_retry_attempts: u64,
     terminal_cleanup_failed_current: u64,
     terminal_successes: u64,
@@ -139,6 +154,41 @@ struct Inner {
     dispatch_observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
+/// Lifetime lease stored in the exact StreamState retirement state. It owns no
+/// stream or executor strongly; on stream disposal it removes only the matching
+/// weak identity from the O(1) expiry-fence index.
+pub(crate) struct ExpiryFenceLease {
+    inner: Weak<Inner>,
+    id: u64,
+    stream: Weak<StreamState>,
+}
+
+impl Drop for ExpiryFenceLease {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let removed = {
+            let mut state = lock_recover(&inner.state);
+            if state.closed {
+                false
+            } else if state
+                .expiry_fences
+                .get(&self.id)
+                .is_some_and(|node| Weak::ptr_eq(&node.stream, &self.stream))
+            {
+                remove_expiry_fence_by_id(&mut state, self.id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            emit_expiry_telemetry(&inner);
+        }
+    }
+}
+
 /// Admission plus one physical cleanup attempt per stream.
 pub(crate) struct RetirementExecutor {
     inner: Arc<Inner>,
@@ -173,7 +223,9 @@ impl RetirementExecutor {
         });
         let task = tokio::spawn(coordinator(Arc::downgrade(&inner), receiver));
         *lock_recover(&inner.task) = Some(task);
-        Ok(Self { inner })
+        let executor = Self { inner };
+        executor.emit_expiry_telemetry();
+        Ok(executor)
     }
 
     #[cfg(test)]
@@ -215,17 +267,22 @@ impl RetirementExecutor {
         if cleared_terminal_failure {
             state.terminal_cleanup_failed_current =
                 state.terminal_cleanup_failed_current.saturating_sub(1);
+            clear_expiry_fence_failure(&mut state, &stream);
         }
 
         if state.jobs.contains_key(&stream.id) {
             // A path replacement must never overwrite the retained job just
             // because its test/recovery identity reused the numeric ID.
             stream.retirement_state().finish(&ticket);
+            drop(state);
+            self.emit_expiry_telemetry();
             return RetirementAdmissionResult::Rejected(RetirementAdmission::IdentityConflict);
         }
 
         if state.jobs.len() >= self.inner.config.queue_capacity {
             stream.retirement_state().finish(&ticket);
+            drop(state);
+            self.emit_expiry_telemetry();
             return RetirementAdmissionResult::Rejected(RetirementAdmission::QueueFull);
         }
 
@@ -267,6 +324,11 @@ impl RetirementExecutor {
                 admitted_sequence,
             },
         );
+        if mode == LocalCleanupMode::Expiry {
+            state.expiry_jobs = state.expiry_jobs.saturating_add(1);
+        }
+        drop(state);
+        self.emit_expiry_telemetry();
         RetirementAdmissionResult::Admitted(ticket)
     }
 
@@ -337,6 +399,8 @@ impl RetirementExecutor {
         remove_job(&mut state, stream.id);
         state.terminal_cancellations = state.terminal_cancellations.saturating_add(1);
         state.first_attempt_cancellations = state.first_attempt_cancellations.saturating_add(1);
+        drop(state);
+        self.emit_expiry_telemetry();
         true
     }
 
@@ -368,6 +432,11 @@ impl RetirementExecutor {
             state.admitted.clear();
             state.oldest_admission = None;
             state.newest_admission = None;
+            state.expiry_jobs = 0;
+            state.expiry_fences.clear();
+            state.oldest_expiry_fence = None;
+            state.newest_expiry_fence = None;
+            state.expiry_terminal_cleanup_failed_current = 0;
             let first_cancellations = jobs
                 .values()
                 .filter(|record| !record.first_attempt_completed)
@@ -389,6 +458,7 @@ impl RetirementExecutor {
                 .complete_terminal(TerminalCleanupCompletion::Cancelled);
             job.stream.retirement_state().finish(&job.ticket);
         }
+        self.emit_expiry_telemetry();
         self.inner.notify.notify_waiters();
     }
 
@@ -405,6 +475,22 @@ impl RetirementExecutor {
             state.jobs.len(),
             state.interactive_pending.len(),
             state.proactive_pending.len(),
+        )
+    }
+
+    #[cfg(test)]
+    fn expiry_telemetry_state(&self) -> (u64, u64, Option<Duration>) {
+        let state = lock_recover(&self.inner.state);
+        let oldest_age = state.oldest_expiry_fence.and_then(|id| {
+            state
+                .expiry_fences
+                .get(&id)
+                .map(|node| Instant::now().saturating_duration_since(node.fenced_at))
+        });
+        (
+            state.expiry_jobs,
+            state.expiry_terminal_cleanup_failed_current,
+            oldest_age,
         )
     }
 
@@ -462,10 +548,42 @@ impl RetirementExecutor {
             closed: state.closed || physical.closed,
         }
     }
+
+    pub(crate) fn emit_expiry_telemetry(&self) {
+        emit_expiry_telemetry(&self.inner);
+    }
+
+    /// Store calls this only after it has applied the exact expiry fence while
+    /// holding the appender lock. Cancellation and cooldown deliberately leave
+    /// the marker intact until an exact hard cleanup or shutdown removes it.
+    pub(crate) fn mark_expiry_fence(&self, stream: &Arc<StreamState>) {
+        let inserted = {
+            let mut state = lock_recover(&self.inner.state);
+            if state.closed {
+                return;
+            }
+            mark_expiry_fence(&mut state, stream)
+        };
+        if inserted {
+            let previous_lease = {
+                let mut retirement_state = stream.retirement_state();
+                retirement_state.install_expiry_fence_lease(ExpiryFenceLease {
+                    inner: Arc::downgrade(&self.inner),
+                    id: stream.id,
+                    stream: Arc::downgrade(stream),
+                })
+            };
+            drop(previous_lease);
+        }
+        self.emit_expiry_telemetry();
+    }
 }
 
 fn remove_job(state: &mut CoordinatorState, id: u64) -> Option<JobRecord> {
     let record = state.jobs.remove(&id)?;
+    if record.job.mode == LocalCleanupMode::Expiry {
+        state.expiry_jobs = state.expiry_jobs.saturating_sub(1);
+    }
     let node = state
         .admitted
         .remove(&record.admitted_sequence)
@@ -489,6 +607,107 @@ fn remove_job(state: &mut CoordinatorState, id: u64) -> Option<JobRecord> {
         state.newest_admission = node.previous;
     }
     Some(record)
+}
+
+fn mark_expiry_fence(state: &mut CoordinatorState, stream: &Arc<StreamState>) -> bool {
+    let identity = Arc::downgrade(stream);
+    if state
+        .expiry_fences
+        .get(&stream.id)
+        .is_some_and(|node| Weak::ptr_eq(&node.stream, &identity))
+    {
+        return false;
+    }
+    remove_expiry_fence_by_id(state, stream.id);
+    let previous = state.newest_expiry_fence;
+    state.expiry_fences.insert(
+        stream.id,
+        ExpiryFenceNode {
+            stream: identity,
+            fenced_at: Instant::now(),
+            previous,
+            next: None,
+            terminal_failure: false,
+        },
+    );
+    if let Some(previous) = previous {
+        state
+            .expiry_fences
+            .get_mut(&previous)
+            .expect("newest expiry fence remains retained")
+            .next = Some(stream.id);
+    } else {
+        state.oldest_expiry_fence = Some(stream.id);
+    }
+    state.newest_expiry_fence = Some(stream.id);
+    true
+}
+
+fn remove_expiry_fence(state: &mut CoordinatorState, stream: &Arc<StreamState>) {
+    let identity = Arc::downgrade(stream);
+    if state
+        .expiry_fences
+        .get(&stream.id)
+        .is_some_and(|node| Weak::ptr_eq(&node.stream, &identity))
+    {
+        remove_expiry_fence_by_id(state, stream.id);
+    }
+}
+
+fn remove_expiry_fence_by_id(state: &mut CoordinatorState, id: u64) {
+    let Some(node) = state.expiry_fences.remove(&id) else {
+        return;
+    };
+    if node.terminal_failure {
+        state.expiry_terminal_cleanup_failed_current = state
+            .expiry_terminal_cleanup_failed_current
+            .saturating_sub(1);
+    }
+    if let Some(previous) = node.previous {
+        state
+            .expiry_fences
+            .get_mut(&previous)
+            .expect("previous expiry fence remains retained")
+            .next = node.next;
+    } else {
+        state.oldest_expiry_fence = node.next;
+    }
+    if let Some(next) = node.next {
+        state
+            .expiry_fences
+            .get_mut(&next)
+            .expect("next expiry fence remains retained")
+            .previous = node.previous;
+    } else {
+        state.newest_expiry_fence = node.previous;
+    }
+}
+
+fn clear_expiry_fence_failure(state: &mut CoordinatorState, stream: &Arc<StreamState>) {
+    let identity = Arc::downgrade(stream);
+    if let Some(node) = state.expiry_fences.get_mut(&stream.id) {
+        if Weak::ptr_eq(&node.stream, &identity) && node.terminal_failure {
+            node.terminal_failure = false;
+            state.expiry_terminal_cleanup_failed_current = state
+                .expiry_terminal_cleanup_failed_current
+                .saturating_sub(1);
+        }
+    }
+}
+
+fn mark_expiry_fence_failure(state: &mut CoordinatorState, job: &Job) {
+    if job.mode != LocalCleanupMode::Expiry {
+        return;
+    }
+    let identity = Arc::downgrade(&job.stream);
+    if let Some(node) = state.expiry_fences.get_mut(&job.id()) {
+        if Weak::ptr_eq(&node.stream, &identity) && !node.terminal_failure {
+            node.terminal_failure = true;
+            state.expiry_terminal_cleanup_failed_current = state
+                .expiry_terminal_cleanup_failed_current
+                .saturating_add(1);
+        }
+    }
 }
 
 impl Drop for RetirementExecutor {
@@ -520,6 +739,17 @@ async fn coordinator(inner: Weak<Inner>, mut events: mpsc::Receiver<WorkerEvent>
             return;
         }
         if let Some(due) = next_retry {
+            #[cfg(feature = "telemetry")]
+            tokio::select! {
+                event = events.recv() => match event {
+                    Some(event) => finish_attempt(&inner, event),
+                    None => return,
+                },
+                _ = &mut notified => {},
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => {},
+                _ = tokio::time::sleep(Duration::from_secs(1)) => emit_expiry_telemetry(&inner),
+            }
+            #[cfg(not(feature = "telemetry"))]
             tokio::select! {
                 event = events.recv() => match event {
                     Some(event) => finish_attempt(&inner, event),
@@ -529,6 +759,16 @@ async fn coordinator(inner: Weak<Inner>, mut events: mpsc::Receiver<WorkerEvent>
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => {},
             }
         } else {
+            #[cfg(feature = "telemetry")]
+            tokio::select! {
+                event = events.recv() => match event {
+                    Some(event) => finish_attempt(&inner, event),
+                    None => return,
+                },
+                _ = &mut notified => {},
+                _ = tokio::time::sleep(Duration::from_secs(1)) => emit_expiry_telemetry(&inner),
+            }
+            #[cfg(not(feature = "telemetry"))]
             tokio::select! {
                 event = events.recv() => match event {
                     Some(event) => finish_attempt(&inner, event),
@@ -691,7 +931,7 @@ fn settle_without_attempt(state: &mut CoordinatorState, job: Arc<Job>, cancelled
 }
 
 fn finish_attempt(inner: &Inner, event: WorkerEvent) {
-    let outcome = {
+    let (outcome, cleanup_telemetry) = {
         let mut state = lock_recover(&inner.state);
         let job = match state.jobs.get_mut(&event.id) {
             Some(record) if record.active_attempt == Some(event.attempt) => {
@@ -718,9 +958,30 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
                 state.active_proactive = state.active_proactive.saturating_sub(1)
             }
         }
+        let cleanup_telemetry = (job.mode == LocalCleanupMode::Expiry).then_some({
+            crate::telemetry::ExpiryCleanupTelemetry {
+                duration_seconds: event.duration.as_secs_f64(),
+                disposition: match event.result {
+                    PhysicalAttemptResult::Succeeded {
+                        reclaimed_local_bytes,
+                        disposition: LocalCleanupDisposition::HardReaped,
+                    } => Some(crate::telemetry::ExpiryCleanupDisposition::Reaped(
+                        reclaimed_local_bytes,
+                    )),
+                    PhysicalAttemptResult::Succeeded {
+                        disposition: LocalCleanupDisposition::DurableSoftDeleted,
+                        ..
+                    } => Some(crate::telemetry::ExpiryCleanupDisposition::SoftDeleted),
+                    PhysicalAttemptResult::Failed
+                    | PhysicalAttemptResult::Panicked
+                    | PhysicalAttemptResult::Cancelled => None,
+                },
+            }
+        });
         let outcome = match event.result {
             PhysicalAttemptResult::Succeeded {
                 reclaimed_local_bytes,
+                disposition,
             } => {
                 remove_job(&mut state, event.id);
                 state.terminal_successes = state.terminal_successes.saturating_add(1);
@@ -729,7 +990,10 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
                     .saturating_add(reclaimed_local_bytes);
                 state.last_successful_cleanup_wall_time = Some(wall_now);
                 state.last_successful_cleanup_duration = Some(event.duration);
-                AttemptOutcome::Succeeded(job, reclaimed_local_bytes)
+                if disposition == LocalCleanupDisposition::HardReaped {
+                    remove_expiry_fence(&mut state, &job.stream);
+                }
+                AttemptOutcome::Succeeded(job, reclaimed_local_bytes, disposition)
             }
             PhysicalAttemptResult::Failed | PhysicalAttemptResult::Panicked
                 if event.attempt < MAX_CLEANUP_ATTEMPTS =>
@@ -754,6 +1018,7 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
                 state.terminal_failures = state.terminal_failures.saturating_add(1);
                 state.terminal_cleanup_failed_current =
                     state.terminal_cleanup_failed_current.saturating_add(1);
+                mark_expiry_fence_failure(&mut state, &job);
                 AttemptOutcome::Failed(job)
             }
             PhysicalAttemptResult::Cancelled => {
@@ -776,11 +1041,14 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
                 }
             }
         }
-        outcome
+        (outcome, cleanup_telemetry)
     };
+    if let Some(cleanup_telemetry) = cleanup_telemetry {
+        crate::telemetry::record_expiry_cleanup_attempt(cleanup_telemetry);
+    }
     if event.attempt == 1 {
         match &outcome {
-            AttemptOutcome::Succeeded(job, reclaimed_local_bytes) => {
+            AttemptOutcome::Succeeded(job, reclaimed_local_bytes, _) => {
                 job.ticket
                     .complete_first_attempt(FirstAttemptCompletion::Succeeded {
                         reclaimed_local_bytes: *reclaimed_local_bytes,
@@ -797,15 +1065,25 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
         }
     }
     match outcome {
-        AttemptOutcome::Succeeded(job, reclaimed_local_bytes) => {
+        AttemptOutcome::Succeeded(job, reclaimed_local_bytes, _) => {
             job.ticket
                 .complete_terminal(TerminalCleanupCompletion::Succeeded {
                     reclaimed_local_bytes,
                 });
             job.stream.retirement_state().finish(&job.ticket);
         }
-        AttemptOutcome::Retry(_) => {}
+        AttemptOutcome::Retry(job) => {
+            if job.mode == LocalCleanupMode::Expiry {
+                crate::telemetry::record_expiry_cleanup_retry();
+            }
+        }
         AttemptOutcome::Failed(job) => {
+            if job.mode == LocalCleanupMode::Expiry {
+                crate::telemetry::record_expiry_outcome(crate::telemetry::ExpiryOutcomeDelta {
+                    outcome: crate::telemetry::ExpiryOutcome::Failed,
+                    count: 1,
+                });
+            }
             job.ticket
                 .complete_terminal(TerminalCleanupCompletion::Failed);
             job.stream.retirement_state().fail_terminal(
@@ -821,11 +1099,12 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
             job.stream.retirement_state().finish(&job.ticket);
         }
     }
+    emit_expiry_telemetry(inner);
     inner.notify.notify_one();
 }
 
 enum AttemptOutcome {
-    Succeeded(Arc<Job>, u64),
+    Succeeded(Arc<Job>, u64, LocalCleanupDisposition),
     Retry(Arc<Job>),
     Failed(Arc<Job>),
     Cancelled(Arc<Job>),
@@ -833,6 +1112,35 @@ enum AttemptOutcome {
 
 fn lock_recover<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Capture only bounded coordinator scalars, then record them after releasing
+/// the coordinator lock. The scanner refreshes this same O(1) projection on
+/// pages, so an idle retained fence's age does not stay permanently stale.
+fn emit_expiry_telemetry(inner: &Inner) {
+    #[cfg(not(feature = "telemetry"))]
+    {
+        let _ = inner;
+    }
+    #[cfg(feature = "telemetry")]
+    {
+        let snapshot = {
+            let state = lock_recover(&inner.state);
+            let oldest_fence_age_seconds = state.oldest_expiry_fence.and_then(|id| {
+                state.expiry_fences.get(&id).map(|node| {
+                    Instant::now()
+                        .saturating_duration_since(node.fenced_at)
+                        .as_secs_f64()
+                })
+            });
+            crate::telemetry::ExpiryRetirementTelemetry {
+                queue_depth: state.expiry_jobs,
+                cleanup_failed: state.expiry_terminal_cleanup_failed_current,
+                oldest_fence_age_seconds,
+            }
+        };
+        crate::telemetry::record_expiry_retirement(snapshot);
+    }
 }
 
 #[cfg(test)]
@@ -1236,6 +1544,7 @@ mod tests {
             } else {
                 Ok(LocalCleanupOutcome {
                     reclaimed_local_bytes: 9,
+                    ..LocalCleanupOutcome::default()
                 })
             }
         });
@@ -1613,6 +1922,7 @@ mod tests {
         let cleanup: CleanupCallback = Arc::new(move |_, _| {
             Ok(LocalCleanupOutcome {
                 reclaimed_local_bytes: reclaimed,
+                ..LocalCleanupOutcome::default()
             })
         });
         let executor = RetirementExecutor::new(cleanup, config(2, 8, 0)).unwrap();
@@ -1678,6 +1988,96 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn expiry_telemetry_state_is_mode_scoped_and_fence_survives_prelogical_cancel() {
+        let (store, expiry, directory) = store_stream("expiry-telemetry-state");
+        let explicit = stream(&store, "explicit-telemetry-state");
+        let executor = RetirementExecutor::new(
+            Arc::new(|_, _| Ok(LocalCleanupOutcome::default())),
+            config(3, 8, 0),
+        )
+        .unwrap();
+        let expiry_ticket = ticket(executor.admit(
+            Arc::clone(&expiry),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        executor.mark_expiry_fence(&expiry);
+        let explicit_ticket = ticket(executor.admit(
+            Arc::clone(&explicit),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::ExplicitDelete,
+        ));
+        assert_eq!(executor.expiry_telemetry_state().0, 1);
+        assert!(executor.expiry_telemetry_state().2.is_some());
+        assert!(executor.cancel_prelogical(&expiry, &expiry_ticket));
+        assert_eq!(executor.expiry_telemetry_state().0, 0);
+        assert!(
+            executor.expiry_telemetry_state().2.is_some(),
+            "a WAL/prelogical cancellation keeps its expiry fence age"
+        );
+        assert!(executor.cancel_prelogical(&explicit, &explicit_ticket));
+        executor.shutdown().await;
+        assert_eq!(executor.expiry_telemetry_state(), (0, 0, None));
+        // A Store appender can finish its exact fence recheck after shutdown;
+        // that late mark must not repopulate the cleared telemetry projection.
+        executor.mark_expiry_fence(&expiry);
+        assert_eq!(executor.expiry_telemetry_state(), (0, 0, None));
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn expiry_fence_index_relinks_head_middle_and_tail_without_duplicate_identity() {
+        let (store, first, directory) = store_stream("expiry-fence-relink");
+        let middle = stream(&store, "expiry-fence-middle");
+        let last = stream(&store, "expiry-fence-last");
+        let mut state = CoordinatorState::default();
+
+        assert!(mark_expiry_fence(&mut state, &first));
+        assert!(mark_expiry_fence(&mut state, &middle));
+        assert!(mark_expiry_fence(&mut state, &last));
+        assert!(
+            !mark_expiry_fence(&mut state, &middle),
+            "the same exact identity has one fence node"
+        );
+        assert_eq!(state.oldest_expiry_fence, Some(first.id));
+        assert_eq!(state.newest_expiry_fence, Some(last.id));
+
+        remove_expiry_fence(&mut state, &middle);
+        assert_eq!(
+            state
+                .expiry_fences
+                .get(&first.id)
+                .and_then(|node| node.next),
+            Some(last.id)
+        );
+        assert_eq!(
+            state
+                .expiry_fences
+                .get(&last.id)
+                .and_then(|node| node.previous),
+            Some(first.id)
+        );
+
+        remove_expiry_fence(&mut state, &first);
+        assert_eq!(state.oldest_expiry_fence, Some(last.id));
+        assert_eq!(
+            state
+                .expiry_fences
+                .get(&last.id)
+                .and_then(|node| node.previous),
+            None
+        );
+        remove_expiry_fence(&mut state, &last);
+        assert!(state.expiry_fences.is_empty());
+        assert_eq!(state.oldest_expiry_fence, None);
+        assert_eq!(state.newest_expiry_fence, None);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn retirement_snapshot_ignores_stale_worker_events_after_cancellation() {
         let (store, stream, directory) = store_stream("snapshot-stale-event");
         let executor = RetirementExecutor::new(
@@ -1699,6 +2099,7 @@ mod tests {
                 attempt: 1,
                 result: PhysicalAttemptResult::Succeeded {
                     reclaimed_local_bytes: 99,
+                    disposition: LocalCleanupDisposition::HardReaped,
                 },
                 duration: Duration::from_secs(1),
             },
@@ -1744,6 +2145,7 @@ mod tests {
                 attempt: 1,
                 result: PhysicalAttemptResult::Succeeded {
                     reclaimed_local_bytes: 99,
+                    disposition: LocalCleanupDisposition::HardReaped,
                 },
                 duration: Duration::from_secs(1),
             },
@@ -1826,6 +2228,7 @@ mod tests {
                 attempt: 1,
                 result: PhysicalAttemptResult::Succeeded {
                     reclaimed_local_bytes: 7,
+                    disposition: LocalCleanupDisposition::HardReaped,
                 },
                 duration: Duration::from_millis(3),
             },

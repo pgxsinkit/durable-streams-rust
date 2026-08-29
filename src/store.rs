@@ -12,10 +12,11 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use sha2::{Digest, Sha256};
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
 use crate::expiration::{
@@ -24,6 +25,122 @@ use crate::expiration::{
 };
 
 pub const MAX_SAFE_INT: u64 = (1u64 << 53) - 1;
+
+const EXPIRY_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy)]
+enum ExpiryFailureLogCategory {
+    WalForget,
+    TombstoneCollection,
+    CascadeDeferred,
+    Cleanup,
+}
+
+impl ExpiryFailureLogCategory {
+    const fn index(self) -> usize {
+        match self {
+            Self::WalForget => 0,
+            Self::TombstoneCollection => 1,
+            Self::CascadeDeferred => 2,
+            Self::Cleanup => 3,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::WalForget => "wal_forget",
+            Self::TombstoneCollection => "tombstone_collection",
+            Self::CascadeDeferred => "cascade_deferred",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExpiryFailureLogSlot {
+    next_allowed: Option<Instant>,
+    suppressed: u64,
+}
+
+impl ExpiryFailureLogSlot {
+    const EMPTY: Self = Self {
+        next_allowed: None,
+        suppressed: 0,
+    };
+}
+
+struct ExpiryFailureLogLimiter {
+    slots: [ExpiryFailureLogSlot; 4],
+}
+
+impl ExpiryFailureLogLimiter {
+    fn permit(&mut self, category: ExpiryFailureLogCategory, now: Instant) -> Option<u64> {
+        let slot = &mut self.slots[category.index()];
+        if slot.next_allowed.is_some_and(|deadline| now < deadline) {
+            slot.suppressed = slot.suppressed.saturating_add(1);
+            return None;
+        }
+        let suppressed = std::mem::take(&mut slot.suppressed);
+        slot.next_allowed = Some(now + EXPIRY_FAILURE_LOG_INTERVAL);
+        Some(suppressed)
+    }
+}
+
+static EXPIRY_FAILURE_LOG_LIMITER: OnceLock<StdMutex<ExpiryFailureLogLimiter>> = OnceLock::new();
+
+fn log_expiry_failure(
+    category: ExpiryFailureLogCategory,
+    stream: &StreamState,
+    error_kind: &'static str,
+) {
+    let limiter = EXPIRY_FAILURE_LOG_LIMITER.get_or_init(|| {
+        StdMutex::new(ExpiryFailureLogLimiter {
+            slots: [ExpiryFailureLogSlot::EMPTY; 4],
+        })
+    });
+    let suppressed = limiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .permit(category, Instant::now());
+    let Some(suppressed) = suppressed else {
+        return;
+    };
+    // Hash only after the fixed-category limiter admits this log path. The
+    // full SHA-256 digest is stable and collision-safe without retaining a
+    // per-stream limiter entry or exposing the raw path.
+    let path_sha256 = expiry_path_sha256(&stream.path);
+    eprintln!(
+        "expiry retirement failure category={} error_kind={} stream_id={} path_sha256={} suppressed_count={}",
+        category.name(), error_kind, stream.id, path_sha256, suppressed
+    );
+}
+
+fn bounded_error_kind(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::NotFound => "not_found",
+        ErrorKind::PermissionDenied => "permission_denied",
+        ErrorKind::ConnectionRefused => "connection_refused",
+        ErrorKind::ConnectionReset => "connection_reset",
+        ErrorKind::TimedOut => "timed_out",
+        ErrorKind::Interrupted => "interrupted",
+        ErrorKind::InvalidData => "invalid_data",
+        ErrorKind::WriteZero => "write_zero",
+        _ => "other",
+    }
+}
+
+fn expiry_path_sha256(path: &str) -> String {
+    format!("{:x}", Sha256::digest(path.as_bytes()))
+}
+
+pub(crate) fn log_expiry_cleanup_failure(stream: &StreamState, error: &std::io::Error) {
+    log_expiry_failure(
+        ExpiryFailureLogCategory::Cleanup,
+        stream,
+        bounded_error_kind(error),
+    );
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tail {
@@ -707,6 +824,16 @@ pub(crate) enum LocalCleanupMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LocalCleanupOutcome {
     pub(crate) reclaimed_local_bytes: u64,
+    pub(crate) disposition: LocalCleanupDisposition,
+}
+
+/// The durable result of a completed local cleanup attempt. A soft tombstone
+/// is successful cleanup, but it is not a physical reaping/unlink.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum LocalCleanupDisposition {
+    #[default]
+    HardReaped,
+    DurableSoftDeleted,
 }
 
 /// Outcome of one exact explicit-retirement attempt. The caller that receives
@@ -1144,9 +1271,10 @@ impl Store {
                     Ok(SoftParentCollectionAdmission::Deferred(_))
                     | Ok(SoftParentCollectionAdmission::Unavailable) => pass_deferred = true,
                     Ok(SoftParentCollectionAdmission::Skipped) => {}
-                    Err(error) => eprintln!(
-                        "recovery tombstone collection deferred for stream id={} path={:?}: {error}",
-                        stream.id, stream.path
+                    Err(error) => log_expiry_failure(
+                        ExpiryFailureLogCategory::TombstoneCollection,
+                        &stream,
+                        bounded_error_kind(&error),
                     ),
                 }
             }
@@ -1385,7 +1513,7 @@ impl Store {
             }
         };
 
-        {
+        let (newly_applied_expiry_fence, expiry_fence_present) = {
             let appender = stream.appender.lock().await;
             if !self.is_exact_live(&stream) {
                 drop(appender);
@@ -1410,6 +1538,20 @@ impl Store {
             if !already_fenced {
                 stream.fence_while_holding_appender(&appender);
             }
+            (
+                mode == LocalCleanupMode::Expiry && !already_fenced,
+                mode == LocalCleanupMode::Expiry,
+            )
+        };
+        if expiry_fence_present {
+            #[cfg(feature = "telemetry")]
+            executor.mark_expiry_fence(&stream);
+        }
+        if newly_applied_expiry_fence {
+            crate::telemetry::record_expiry_outcome(crate::telemetry::ExpiryOutcomeDelta {
+                outcome: crate::telemetry::ExpiryOutcome::Fenced,
+                count: 1,
+            });
         }
         stream.wait_for_inflight_appends_zero().await;
         // A pre-fence accepted append may have dirtied metadata after the
@@ -1428,9 +1570,10 @@ impl Store {
         // later owner retries this idempotent hand-off without reopening writes.
         if let Some(wal) = self.wal.get() {
             if let Err(error) = wal.forget_stream(stream.id).await {
-                eprintln!(
-                    "retirement WAL forget failed for stream id={} path={:?}: {error}",
-                    stream.id, stream.path
+                log_expiry_failure(
+                    ExpiryFailureLogCategory::WalForget,
+                    &stream,
+                    bounded_error_kind(&error),
                 );
                 return self.cancel_retirement(&executor, &stream, ticket);
             }
@@ -1637,7 +1780,10 @@ impl Store {
             }
             write_meta_sync(stream, true)?;
             self.publish_inventory(stream);
-            return Ok(LocalCleanupOutcome::default());
+            return Ok(LocalCleanupOutcome {
+                reclaimed_local_bytes: 0,
+                disposition: LocalCleanupDisposition::DurableSoftDeleted,
+            });
         }
         if self.is_exact_registered(stream) {
             return Err(std::io::Error::other(
@@ -2053,6 +2199,12 @@ impl Store {
                 return Err(error);
             }
             self.publish_inventory(st);
+            if mode == LocalCleanupMode::Expiry {
+                crate::telemetry::record_expiry_outcome(crate::telemetry::ExpiryOutcomeDelta {
+                    outcome: crate::telemetry::ExpiryOutcome::SoftDeleted,
+                    count: 1,
+                });
+            }
             Ok(LocalCleanupOutcome::default())
         } else {
             // Reclaim this stream's offloaded segments (remote objects + any
@@ -2201,13 +2353,22 @@ impl Store {
         };
         if needs_collection {
             match self.admit_soft_parent_collection(&parent)? {
-                SoftParentCollectionAdmission::Deferred(reason) => eprintln!(
-                    "retirement cascade deferred for stream id={} path={:?}: {reason:?}",
-                    parent.id, parent.path
+                SoftParentCollectionAdmission::Deferred(reason) => log_expiry_failure(
+                    ExpiryFailureLogCategory::CascadeDeferred,
+                    &parent,
+                    match reason {
+                        crate::retirement::RetirementAdmission::QueueFull => "queue_full",
+                        crate::retirement::RetirementAdmission::CoolingDown => "cooling_down",
+                        crate::retirement::RetirementAdmission::ShuttingDown => "shutting_down",
+                        crate::retirement::RetirementAdmission::IdentityConflict => {
+                            "identity_conflict"
+                        }
+                    },
                 ),
-                SoftParentCollectionAdmission::Unavailable => eprintln!(
-                    "retirement cascade deferred for stream id={} path={:?}: executor unavailable",
-                    parent.id, parent.path
+                SoftParentCollectionAdmission::Unavailable => log_expiry_failure(
+                    ExpiryFailureLogCategory::CascadeDeferred,
+                    &parent,
+                    "executor_unavailable",
                 ),
                 SoftParentCollectionAdmission::HandedOff(_)
                 | SoftParentCollectionAdmission::Existing(_)
@@ -6481,5 +6642,77 @@ mod meta_sweep_tests {
             .any(|entry| entry.path == "soft" && entry.deleted));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expiry_failure_path_hash_is_stable_and_never_contains_the_raw_path() {
+        assert_eq!(
+            expiry_path_sha256("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let first = expiry_path_sha256("sensitive/customer-a");
+        assert_eq!(first, expiry_path_sha256("sensitive/customer-a"));
+        assert_ne!(first, expiry_path_sha256("sensitive/customer-b"));
+        assert_eq!(first.len(), 64);
+        assert!(!first.contains("sensitive"));
+    }
+
+    #[test]
+    fn expiry_failure_limiter_keeps_fixed_categories_and_reports_suppression() {
+        let start = Instant::now();
+        let mut limiter = ExpiryFailureLogLimiter {
+            slots: [ExpiryFailureLogSlot::EMPTY; 4],
+        };
+        assert_eq!(
+            limiter.permit(ExpiryFailureLogCategory::WalForget, start),
+            Some(0)
+        );
+        assert_eq!(
+            limiter.permit(ExpiryFailureLogCategory::WalForget, start),
+            None
+        );
+        assert_eq!(
+            limiter.permit(
+                ExpiryFailureLogCategory::WalForget,
+                start + EXPIRY_FAILURE_LOG_INTERVAL,
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            limiter.permit(ExpiryFailureLogCategory::CascadeDeferred, start),
+            Some(0),
+            "categories do not create per-stream entries"
+        );
+    }
+
+    #[test]
+    fn expiry_retirement_logs_never_format_raw_paths() {
+        let source = include_str!("store.rs");
+        let logger = &source[source
+            .find("fn log_expiry_failure")
+            .expect("privacy logger exists")
+            ..source
+                .find("fn expiry_path_sha256")
+                .expect("hash helper follows logger")];
+        assert!(logger.contains("path_sha256"));
+        assert!(!logger.contains("path={:?}"));
+        assert!(!logger.contains("stream.path,"));
+        let production = source
+            .split("#[cfg(test)]\nmod meta_sweep_tests")
+            .next()
+            .expect("production source precedes tests");
+        assert!(
+            !production.contains("path={:?}"),
+            "expiry/retirement logs must not interpolate raw paths"
+        );
+        for source in [
+            production,
+            include_str!("retirement/physical.rs"),
+            include_str!("retirement/coordinator.rs"),
+            include_str!("expiration.rs"),
+        ] {
+            assert!(!source.contains("path={}"));
+            assert!(!source.contains(".path.display()"));
+        }
     }
 }
