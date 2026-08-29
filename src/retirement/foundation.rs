@@ -1,7 +1,7 @@
 //! Completion and admission state shared by the later retirement executor.
 
-// TODO(retirement-B): remove this allowance once the physical executor consumes
-// every foundation type in production. It is intentionally scoped to A only.
+// TODO(retirement-C): remove this allowance once the coordinator consumes the
+// completion, admission, and per-stream state types in production.
 #![allow(dead_code)]
 
 use std::sync::Arc;
