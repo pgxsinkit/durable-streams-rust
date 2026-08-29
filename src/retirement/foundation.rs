@@ -36,6 +36,7 @@ pub(crate) enum RetirementAdmission {
     QueueFull,
     CoolingDown,
     ShuttingDown,
+    IdentityConflict,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

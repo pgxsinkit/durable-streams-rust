@@ -25,7 +25,8 @@ use super::{
 /// The result of an admission attempt. Duplicate admissions return the exact
 /// same level-triggered ticket as the original caller.
 pub(crate) enum RetirementAdmissionResult {
-    Ticket(RetirementTicket),
+    Admitted(RetirementTicket),
+    Existing(RetirementTicket),
     Rejected(RetirementAdmission),
 }
 
@@ -44,6 +45,7 @@ impl Job {
 
 struct JobRecord {
     job: Arc<Job>,
+    logical_released: bool,
     active_attempt: Option<u8>,
     retry_scheduled: bool,
 }
@@ -171,7 +173,7 @@ impl RetirementExecutor {
             let mut retirement = stream.retirement_state();
             match retirement.reserve(Instant::now()) {
                 RetirementReservation::Existing(ticket) => {
-                    return RetirementAdmissionResult::Ticket(ticket);
+                    return RetirementAdmissionResult::Existing(ticket);
                 }
                 RetirementReservation::CoolingDown => {
                     return RetirementAdmissionResult::Rejected(RetirementAdmission::CoolingDown);
@@ -179,6 +181,13 @@ impl RetirementExecutor {
                 RetirementReservation::New(ticket) => ticket,
             }
         };
+
+        if state.jobs.contains_key(&stream.id) {
+            // A path replacement must never overwrite the retained job just
+            // because its test/recovery identity reused the numeric ID.
+            stream.retirement_state().finish(&ticket);
+            return RetirementAdmissionResult::Rejected(RetirementAdmission::IdentityConflict);
+        }
 
         if state.jobs.len() >= self.inner.config.queue_capacity {
             stream.retirement_state().finish(&ticket);
@@ -195,24 +204,80 @@ impl RetirementExecutor {
             job.id(),
             JobRecord {
                 job: job.clone(),
+                logical_released: false,
                 active_attempt: None,
                 retry_scheduled: false,
             },
         );
-        match priority {
-            RetirementPriority::Interactive => state.interactive_pending.push_back(job),
-            RetirementPriority::Proactive => state.proactive_pending.push_back(job),
-        }
-        drop(state);
-        self.inner.notify.notify_one();
-        RetirementAdmissionResult::Ticket(ticket)
+        RetirementAdmissionResult::Admitted(ticket)
     }
 
-    /// The handler-ordering slice calls this after fencing, reader wakeup, and
-    /// logical registry removal. Physical success intentionally does not imply
-    /// this phase.
-    pub(crate) fn complete_logical(&self, ticket: &RetirementTicket) {
-        ticket.complete_logical(LogicalCompletion::Completed);
+    /// Releases one exact, pre-logical admission after the Store has completed
+    /// its fencing and path-reuse linearization. Only this transition exposes
+    /// the job to physical scheduling.
+    pub(crate) fn release_logical(
+        &self,
+        stream: &Arc<StreamState>,
+        ticket: &RetirementTicket,
+    ) -> bool {
+        {
+            let mut state = lock_recover(&self.inner.state);
+            let Some(record) = state.jobs.get_mut(&stream.id) else {
+                return false;
+            };
+            if record.logical_released
+                || !Arc::ptr_eq(&record.job.stream, stream)
+                || !record.job.ticket.same_identity(ticket)
+            {
+                return false;
+            }
+            record.logical_released = true;
+            let job = record.job.clone();
+            // Publish before exposing the job to the coordinator. The
+            // coordinator cannot observe the pending entry until this state
+            // lock is released, so physical cleanup cannot win the logical
+            // race.
+            job.ticket.complete_logical(LogicalCompletion::Completed);
+            match job.priority {
+                RetirementPriority::Interactive => state.interactive_pending.push_back(job),
+                RetirementPriority::Proactive => state.proactive_pending.push_back(job),
+            }
+        }
+        self.inner.notify.notify_one();
+        true
+    }
+
+    /// Rolls back a Store-side linearization failure before logical release.
+    /// Once release succeeds, only normal completion/shutdown owns the job.
+    pub(crate) fn cancel_prelogical(
+        &self,
+        stream: &Arc<StreamState>,
+        ticket: &RetirementTicket,
+    ) -> bool {
+        let mut state = lock_recover(&self.inner.state);
+        let job = {
+            let Some(record) = state.jobs.get(&stream.id) else {
+                return false;
+            };
+            if record.logical_released
+                || !Arc::ptr_eq(&record.job.stream, stream)
+                || !record.job.ticket.same_identity(ticket)
+            {
+                return false;
+            }
+            record.job.clone()
+        };
+        // Keep coordinator state and RetirementState synchronized. In
+        // particular, a new admission cannot see the old reservation after
+        // the record is gone and spuriously become an Existing caller.
+        job.ticket.complete_logical(LogicalCompletion::Cancelled);
+        job.ticket
+            .complete_first_attempt(FirstAttemptCompletion::Cancelled);
+        job.ticket
+            .complete_terminal(TerminalCleanupCompletion::Cancelled);
+        job.stream.retirement_state().finish(&job.ticket);
+        state.jobs.remove(&stream.id);
+        true
     }
 
     /// Cancels every retained ticket at a deterministic boundary, then drains
@@ -370,10 +435,19 @@ fn dispatch_ready(inner: &Arc<Inner>) {
                 None
             };
             let Some(job) = job else { return };
-            let Some(record) = state.jobs.get(&job.id()) else {
-                continue;
-            };
-            if record.active_attempt.is_some() || record.retry_scheduled {
+            let valid = state.jobs.get(&job.id()).is_some_and(|record| {
+                record.logical_released
+                    && record.active_attempt.is_none()
+                    && !record.retry_scheduled
+                    && Arc::ptr_eq(&record.job.stream, &job.stream)
+                    && record.job.ticket.same_identity(&job.ticket)
+            });
+            if !valid {
+                // An early entry is still retained in `jobs`; its eventual
+                // release enqueues a fresh, valid entry. A stale duplicate
+                // likewise has an active/retrying/replaced owner (or was
+                // already settled). Dropping only this queue copy keeps it
+                // from blocking later valid work without stranding a ticket.
                 continue;
             }
 
@@ -635,7 +709,26 @@ mod tests {
 
     fn ticket(result: RetirementAdmissionResult) -> RetirementTicket {
         match result {
-            RetirementAdmissionResult::Ticket(ticket) => ticket,
+            RetirementAdmissionResult::Admitted(ticket)
+            | RetirementAdmissionResult::Existing(ticket) => ticket,
+            RetirementAdmissionResult::Rejected(reason) => {
+                panic!("unexpected rejection: {reason:?}")
+            }
+        }
+    }
+
+    fn admit_released(
+        executor: &RetirementExecutor,
+        stream: Arc<StreamState>,
+        priority: RetirementPriority,
+        mode: LocalCleanupMode,
+    ) -> RetirementTicket {
+        match executor.admit(stream.clone(), priority, mode) {
+            RetirementAdmissionResult::Admitted(ticket) => {
+                assert!(executor.release_logical(&stream, &ticket));
+                ticket
+            }
+            RetirementAdmissionResult::Existing(_) => panic!("stream was already admitted"),
             RetirementAdmissionResult::Rejected(reason) => {
                 panic!("unexpected rejection: {reason:?}")
             }
@@ -646,28 +739,36 @@ mod tests {
     async fn retirement_queue_coordinator_deduplicates_ticket_and_retains_stream() {
         let (store, stream, directory) = store_stream("dedup");
         let executor = RetirementExecutor::new(callback(), config(2, 8, 0)).unwrap();
-        let first = ticket(executor.admit(
+        let first = match executor.admit(
             stream.clone(),
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
-        let duplicate = ticket(executor.admit(
+        ) {
+            RetirementAdmissionResult::Admitted(ticket) => ticket,
+            _ => panic!("first admission must own the gate"),
+        };
+        let duplicate = match executor.admit(
             stream.clone(),
             RetirementPriority::Proactive,
             LocalCleanupMode::Expiry,
-        ));
+        ) {
+            RetirementAdmissionResult::Existing(ticket) => ticket,
+            _ => panic!("duplicate must share the owner ticket"),
+        };
         assert!(first.same_identity(&duplicate));
         store.streams.remove("stream");
         let weak = Arc::downgrade(&stream);
+        let release_stream = stream.clone();
         drop(stream);
         assert!(weak.upgrade().is_some());
-        executor.complete_logical(&first);
+        assert!(executor.release_logical(&release_stream, &first));
         assert_eq!(first.wait_logical().await, LogicalCompletion::Completed);
         assert!(matches!(
             first.wait_terminal().await,
             TerminalCleanupCompletion::Succeeded { .. }
         ));
         executor.shutdown().await;
+        drop(release_stream);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -687,11 +788,12 @@ mod tests {
             Ok(LocalCleanupOutcome::default())
         });
         let executor = RetirementExecutor::new(cleanup, config(1, 8, 0)).unwrap();
-        let first_ticket = ticket(executor.admit(
+        let first_ticket = admit_released(
+            &executor,
             first,
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
+        );
         assert!(matches!(
             executor.admit(
                 second.clone(),
@@ -707,11 +809,12 @@ mod tests {
             first_ticket.wait_terminal().await,
             TerminalCleanupCompletion::Succeeded { .. }
         ));
-        let retry = ticket(executor.admit(
+        let retry = admit_released(
+            &executor,
             second,
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
+        );
         assert!(matches!(
             retry.wait_terminal().await,
             TerminalCleanupCompletion::Succeeded { .. }
@@ -743,11 +846,12 @@ mod tests {
         });
         let executor = RetirementExecutor::new(cleanup, config(8, 10, 2)).unwrap();
         for item in streams.iter().take(3) {
-            let _ = ticket(executor.admit(
+            let _ = admit_released(
+                &executor,
                 item.clone(),
                 RetirementPriority::Proactive,
                 LocalCleanupMode::Expiry,
-            ));
+            );
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -759,11 +863,12 @@ mod tests {
         })
         .await
         .expect("proactive cap should bound active work");
-        let interactive = ticket(executor.admit(
+        let interactive = admit_released(
+            &executor,
             streams[3].clone(),
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
+        );
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if executor.active_counts().0 == 1 {
@@ -819,16 +924,18 @@ mod tests {
         let executor =
             RetirementExecutor::new_with_dispatch_observer(cleanup, config(8, 10, 2), observer)
                 .unwrap();
-        let first_proactive = ticket(executor.admit(
+        let first_proactive = admit_released(
+            &executor,
             first.clone(),
             RetirementPriority::Proactive,
             LocalCleanupMode::Expiry,
-        ));
-        let second_proactive = ticket(executor.admit(
+        );
+        let second_proactive = admit_released(
+            &executor,
             second.clone(),
             RetirementPriority::Proactive,
             LocalCleanupMode::Expiry,
-        ));
+        );
         assert_eq!(dispatch_rx.recv().await, Some(first.id));
         assert_eq!(dispatch_rx.recv().await, Some(second.id));
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -841,21 +948,24 @@ mod tests {
         })
         .await
         .expect("two proactive jobs should occupy the configured cap");
-        let a = ticket(executor.admit(
+        let a = admit_released(
+            &executor,
             third.clone(),
             RetirementPriority::Proactive,
             LocalCleanupMode::Expiry,
-        ));
-        let b = ticket(executor.admit(
+        );
+        let b = admit_released(
+            &executor,
             fourth.clone(),
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
-        let c = ticket(executor.admit(
+        );
+        let c = admit_released(
+            &executor,
             fifth.clone(),
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
+        );
         assert_eq!(dispatch_rx.recv().await, Some(fourth.id));
         assert_eq!(dispatch_rx.recv().await, Some(fifth.id));
         *gate.0.lock().unwrap() = true;
@@ -874,11 +984,12 @@ mod tests {
         let (store, failing, directory) = store_stream("settle");
         let failure: CleanupCallback = Arc::new(|_, _| Err(io::Error::other("expected")));
         let executor = RetirementExecutor::new(failure, retry_config(2, Duration::ZERO)).unwrap();
-        let failed = ticket(executor.admit(
+        let failed = admit_released(
+            &executor,
             failing,
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
+        );
         assert_eq!(
             failed.wait_first_attempt().await,
             FirstAttemptCompletion::Failed
@@ -887,13 +998,13 @@ mod tests {
             failed.wait_terminal().await,
             TerminalCleanupCompletion::Failed
         );
-        executor.complete_logical(&failed);
         assert_eq!(failed.wait_logical().await, LogicalCompletion::Completed);
         executor.shutdown().await;
 
         let pending = RetirementExecutor::new(callback(), config(2, 8, 0)).unwrap();
+        let waiting_stream = stream(&store, "pending");
         let waiting = ticket(pending.admit(
-            stream(&store, "pending"),
+            waiting_stream,
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
         ));
@@ -926,11 +1037,12 @@ mod tests {
             }
         });
         let executor = RetirementExecutor::new(cleanup, retry_config(2, Duration::ZERO)).unwrap();
-        let scheduled_ticket = ticket(executor.admit(
+        let scheduled_ticket = admit_released(
+            &executor,
             stream,
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
+        );
         assert_eq!(
             scheduled_ticket.wait_first_attempt().await,
             FirstAttemptCompletion::Failed
@@ -957,11 +1069,12 @@ mod tests {
             Err(io::Error::other("permanent"))
         });
         let executor = RetirementExecutor::new(cleanup, retry_config(2, Duration::ZERO)).unwrap();
-        let scheduled_ticket = ticket(executor.admit(
+        let scheduled_ticket = admit_released(
+            &executor,
             stream.clone(),
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
+        );
         assert_eq!(
             scheduled_ticket.wait_first_attempt().await,
             FirstAttemptCompletion::Failed
@@ -1001,11 +1114,12 @@ mod tests {
         let executor =
             RetirementExecutor::new(cleanup.clone(), retry_config(2, Duration::from_secs(60)))
                 .unwrap();
-        let scheduled_ticket = ticket(executor.admit(
+        let scheduled_ticket = admit_released(
+            &executor,
             first,
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
+        );
         assert_eq!(
             scheduled_ticket.wait_first_attempt().await,
             FirstAttemptCompletion::Failed
@@ -1013,7 +1127,7 @@ mod tests {
         executor.shutdown().await;
         assert_eq!(
             scheduled_ticket.wait_logical().await,
-            LogicalCompletion::Cancelled
+            LogicalCompletion::Completed
         );
         assert_eq!(
             scheduled_ticket.wait_terminal().await,
@@ -1023,11 +1137,13 @@ mod tests {
 
         let dropped =
             RetirementExecutor::new(cleanup, retry_config(2, Duration::from_secs(60))).unwrap();
-        let dropped_ticket = ticket(dropped.admit(
-            stream(&store, "dropped"),
+        let dropped_stream = stream(&store, "dropped");
+        let dropped_ticket = admit_released(
+            &dropped,
+            dropped_stream,
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
+        );
         assert_eq!(
             dropped_ticket.wait_first_attempt().await,
             FirstAttemptCompletion::Failed
@@ -1035,7 +1151,7 @@ mod tests {
         drop(dropped);
         assert_eq!(
             dropped_ticket.wait_logical().await,
-            LogicalCompletion::Cancelled
+            LogicalCompletion::Completed
         );
         assert_eq!(
             dropped_ticket.wait_terminal().await,
@@ -1055,11 +1171,12 @@ mod tests {
             Ok(LocalCleanupOutcome::default())
         });
         let executor = RetirementExecutor::new(cleanup, retry_config(2, Duration::ZERO)).unwrap();
-        let ticket = ticket(executor.admit(
+        let ticket = admit_released(
+            &executor,
             stream,
             RetirementPriority::Interactive,
             LocalCleanupMode::Expiry,
-        ));
+        );
         assert!(matches!(
             ticket.wait_terminal().await,
             TerminalCleanupCompletion::Succeeded { .. }
@@ -1067,6 +1184,197 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Acquire), 1);
         assert_eq!(executor.scheduled_retry_count(), 0);
         executor.shutdown().await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_queue_logical_gate_owner_duplicate_and_one_time_release() {
+        let (store, stream, directory) = store_stream("gate-owner");
+        let (calls_tx, mut calls_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cleanup: CleanupCallback = Arc::new(move |_, _| {
+            let _ = calls_tx.send(());
+            Ok(LocalCleanupOutcome::default())
+        });
+        let executor = RetirementExecutor::new(cleanup, config(2, 8, 0)).unwrap();
+        let owner = match executor.admit(
+            stream.clone(),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ) {
+            RetirementAdmissionResult::Admitted(ticket) => ticket,
+            _ => panic!("first caller must own the logical gate"),
+        };
+        let duplicate = match executor.admit(
+            stream.clone(),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ) {
+            RetirementAdmissionResult::Existing(ticket) => ticket,
+            _ => panic!("duplicate must observe the retained ticket"),
+        };
+        assert!(owner.same_identity(&duplicate));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), calls_rx.recv())
+                .await
+                .is_err(),
+            "cleanup must not start before logical release"
+        );
+        assert!(executor.release_logical(&stream, &owner));
+        assert!(!executor.release_logical(&stream, &owner));
+        assert_eq!(owner.wait_logical().await, LogicalCompletion::Completed);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), calls_rx.recv())
+                .await
+                .expect("released cleanup should start"),
+            Some(())
+        );
+        assert!(matches!(
+            owner.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), calls_rx.recv())
+                .await
+                .is_err(),
+            "one release must submit exactly one cleanup"
+        );
+        executor.shutdown().await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_queue_logical_gate_stale_identity_and_cancel_are_noops() {
+        let (store, original, directory) = store_stream("gate-stale");
+        let mut replacement = stream(&store, "replacement");
+        store.streams.remove("replacement");
+        Arc::get_mut(&mut replacement)
+            .expect("test replacement must have no other owners")
+            .id = original.id;
+        let executor = RetirementExecutor::new(callback(), config(2, 8, 0)).unwrap();
+        let first = match executor.admit(
+            original.clone(),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ) {
+            RetirementAdmissionResult::Admitted(ticket) => ticket,
+            _ => panic!("first caller must own the logical gate"),
+        };
+        assert!(!executor.release_logical(&replacement, &first));
+        assert!(!executor.cancel_prelogical(&replacement, &first));
+        assert!(matches!(
+            executor.admit(
+                replacement.clone(),
+                RetirementPriority::Interactive,
+                LocalCleanupMode::Expiry
+            ),
+            RetirementAdmissionResult::Rejected(RetirementAdmission::IdentityConflict)
+        ));
+        assert!(replacement.retirement_state().is_clean());
+        assert!(executor.cancel_prelogical(&original, &first));
+        assert_eq!(first.wait_logical().await, LogicalCompletion::Cancelled);
+        assert_eq!(
+            first.wait_first_attempt().await,
+            FirstAttemptCompletion::Cancelled
+        );
+        assert_eq!(
+            first.wait_terminal().await,
+            TerminalCleanupCompletion::Cancelled
+        );
+
+        let replacement_ticket = match executor.admit(
+            original.clone(),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ) {
+            RetirementAdmissionResult::Admitted(ticket) => ticket,
+            _ => panic!("cancelled admission must permit a new owner"),
+        };
+        assert!(!executor.release_logical(&original, &first));
+        assert!(!executor.cancel_prelogical(&original, &first));
+        assert!(executor.release_logical(&original, &replacement_ticket));
+        assert!(!executor.cancel_prelogical(&original, &replacement_ticket));
+        assert!(matches!(
+            replacement_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        executor.shutdown().await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_queue_logical_gate_capacity_and_unreleased_shutdown_drop() {
+        let (store, first, directory) = store_stream("gate-capacity");
+        let second = stream(&store, "second");
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let cleanup_callbacks = callbacks.clone();
+        let cleanup: CleanupCallback = Arc::new(move |_, _| {
+            cleanup_callbacks.fetch_add(1, Ordering::AcqRel);
+            Ok(LocalCleanupOutcome::default())
+        });
+        let executor = RetirementExecutor::new(cleanup.clone(), config(1, 8, 0)).unwrap();
+        let first_ticket = match executor.admit(
+            first.clone(),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ) {
+            RetirementAdmissionResult::Admitted(ticket) => ticket,
+            _ => panic!("first caller must own the logical gate"),
+        };
+        assert!(matches!(
+            executor.admit(
+                second.clone(),
+                RetirementPriority::Interactive,
+                LocalCleanupMode::Expiry
+            ),
+            RetirementAdmissionResult::Rejected(RetirementAdmission::QueueFull)
+        ));
+        assert!(executor.cancel_prelogical(&first, &first_ticket));
+        let second_ticket = match executor.admit(
+            second,
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ) {
+            RetirementAdmissionResult::Admitted(ticket) => ticket,
+            _ => panic!("rollback must free the bounded admission slot"),
+        };
+        executor.shutdown().await;
+        assert_eq!(
+            second_ticket.wait_logical().await,
+            LogicalCompletion::Cancelled
+        );
+        assert_eq!(
+            second_ticket.wait_first_attempt().await,
+            FirstAttemptCompletion::Cancelled
+        );
+        assert_eq!(
+            second_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Cancelled
+        );
+        assert_eq!(callbacks.load(Ordering::Acquire), 0);
+
+        let dropped = RetirementExecutor::new(cleanup, config(1, 8, 0)).unwrap();
+        let dropped_stream = stream(&store, "dropped");
+        let dropped_ticket = match dropped.admit(
+            dropped_stream,
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ) {
+            RetirementAdmissionResult::Admitted(ticket) => ticket,
+            _ => panic!("drop test needs an unreleased owner"),
+        };
+        drop(dropped);
+        assert_eq!(
+            dropped_ticket.wait_logical().await,
+            LogicalCompletion::Cancelled
+        );
+        assert_eq!(
+            dropped_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Cancelled
+        );
+        assert_eq!(callbacks.load(Ordering::Acquire), 0);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }
