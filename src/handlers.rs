@@ -104,6 +104,73 @@ pub(crate) mod test_support {
     }
 }
 
+#[cfg(test)]
+mod append_fence_test_support {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::sync::Barrier;
+
+    struct AfterWalPauseState {
+        path: String,
+        reached: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    static AFTER_WAL_PAUSE: Mutex<Option<AfterWalPauseState>> = Mutex::new(None);
+
+    pub(super) struct AfterWalPause {
+        path: String,
+        reached: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    pub(super) fn pause_after_wal(path: &str) -> AfterWalPause {
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *AFTER_WAL_PAUSE.lock().unwrap() = Some(AfterWalPauseState {
+            path: path.to_string(),
+            reached: reached.clone(),
+            release: release.clone(),
+        });
+        AfterWalPause {
+            path: path.to_string(),
+            reached,
+            release,
+        }
+    }
+
+    impl AfterWalPause {
+        pub(super) async fn wait_until_handler(&self) {
+            self.reached.wait().await;
+        }
+
+        pub(super) async fn release_handler(&self) {
+            self.release.wait().await;
+        }
+    }
+
+    impl Drop for AfterWalPause {
+        fn drop(&mut self) {
+            let mut pause = AFTER_WAL_PAUSE.lock().unwrap();
+            if pause.as_ref().is_some_and(|pause| {
+                pause.path == self.path && Arc::ptr_eq(&pause.reached, &self.reached)
+            }) {
+                *pause = None;
+            }
+        }
+    }
+
+    pub(super) async fn wait_after_wal(stream: &StreamState) {
+        let barriers = AFTER_WAL_PAUSE.lock().unwrap().as_ref().and_then(|pause| {
+            (pause.path == stream.path).then(|| (pause.reached.clone(), pause.release.clone()))
+        });
+        if let Some((reached, release)) = barriers {
+            reached.wait().await;
+            release.wait().await;
+        }
+    }
+}
+
 fn long_poll_timeout_dur() -> Duration {
     Duration::from_millis(LONG_POLL_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -743,11 +810,17 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
         }
         CreateResult::Created(st) => {
             let notify_subscription = wire.is_some();
+            let mut _inflight_append = None;
             if let Some(wire) = wire {
                 let lock_t0 = crate::telemetry::Timer::start();
                 let mut ap = st.appender.lock().await;
                 crate::telemetry::record_append_lock_wait(lock_t0.elapsed_secs());
+                _inflight_append = Some(match InflightAppendGuard::begin(&st, &ap) {
+                    Some(guard) => guard,
+                    None => return text_response(404, "stream not found"),
+                });
                 let pre_written = ap.written;
+                let pre_last_access = st.shared.read().unwrap().last_access;
                 let new_tail = match write_wire(&st, &mut ap, &wire) {
                     Ok(t) => t,
                     Err(_) => return text_response(500, "write failed"),
@@ -772,6 +845,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                         {
                             let mut sh = st.shared.write().unwrap();
                             sh.tail = sh.file_base + pre_written;
+                            sh.last_access = pre_last_access;
                         }
                         return text_response(500, "wal stage failed");
                     }
@@ -780,15 +854,26 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                 if let Some(lsn) = staged_lsn {
                     wait_durable_lsn(&store, &st, lsn).await;
                 }
+                #[cfg(test)]
+                append_fence_test_support::wait_after_wal(&st).await;
+                if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
+                    return text_response(404, "stream not found");
+                }
                 // Durable now (wal) / page-cache written (memory): expose to readers.
                 publish_durable_tail(&store, &st, new_tail, &wire);
             }
             if notify_subscription {
+                if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
+                    return text_response(404, "stream not found");
+                }
                 store
                     .subscriptions
                     .clone()
                     .on_stream_append(store.clone(), &st.path)
                     .await;
+            }
+            if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
+                return text_response(404, "stream not found");
             }
             let t = st.tail();
             let mut b = ResponseBuilder::new(201)
@@ -1177,6 +1262,10 @@ async fn handle_append_inner(
     crate::telemetry::record_append_lock_wait(lock_t0.elapsed_secs());
     crate::srvstats::record_applock_wait(srv_lock_t0.elapsed());
 
+    if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
+        ret!(text_response(404, "stream not found"), Conflict);
+    }
+
     // Closed checks (precedence: closed → seq regression → gap).
     {
         let s = st.shared.read().unwrap();
@@ -1297,6 +1386,11 @@ async fn handle_append_inner(
         }
     }
 
+    let _inflight_append = match InflightAppendGuard::begin(&st, &ap) {
+        Some(guard) => guard,
+        None => ret!(text_response(404, "stream not found"), Conflict),
+    };
+
     // Write + state updates. `new_tail` carries the writer tail to publish to
     // readers only AFTER durability (below), so a live reader never observes
     // bytes a crash could roll back (PROTOCOL.md §4.1).
@@ -1306,13 +1400,14 @@ async fn handle_append_inner(
     // append must leave NO trace — neither bytes (resurrected by the next
     // append/checkpoint) nor producer/seq dedup state (which would swallow the
     // client's retry as a duplicate: silent loss from the client's view).
-    let (prev_producer, prev_seq_header) = {
+    let (prev_producer, prev_seq_header, prev_last_access) = {
         let sh = st.shared.read().unwrap();
         (
             producer
                 .as_ref()
                 .map(|p| (p.id.clone(), sh.producers.get(&p.id).cloned())),
             sh.last_seq_header.clone(),
+            sh.last_access,
         )
     };
     if !wire.is_empty() {
@@ -1401,6 +1496,7 @@ async fn handle_append_inner(
                         }
                     }
                     sh.last_seq_header = prev_seq_header.clone();
+                    sh.last_access = prev_last_access;
                     if close_req {
                         sh.closed = false;
                         sh.closed_by = None;
@@ -1420,6 +1516,12 @@ async fn handle_append_inner(
         wait_durable_lsn(&store, &st, lsn).await;
         crate::srvstats::record_durwait(dur_t0.elapsed());
     }
+    #[cfg(test)]
+    append_fence_test_support::wait_after_wal(&st).await;
+
+    if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
+        ret!(text_response(404, "stream not found"), Conflict);
+    }
 
     // Durable now (wal) / page-cache written (memory): expose the new bytes to
     // readers, mirroring the close-visibility ordering below.
@@ -1432,10 +1534,16 @@ async fn handle_append_inner(
     // closure that is not yet durable (PROTOCOL.md §4.1).
     // Producer/access updates are debounced (documented crash window; see store::Meta).
     if close_req {
+        if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
+            ret!(text_response(404, "stream not found"), Conflict);
+        }
         let st2 = st.clone();
         let meta_res = tokio::task::spawn_blocking(move || write_meta_sync(&st2, true)).await;
         if !matches!(meta_res, Ok(Ok(()))) {
             ret!(text_response(500, "close not durable"), Conflict);
+        }
+        if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
+            ret!(text_response(404, "stream not found"), Conflict);
         }
         let tail = {
             let mut s = st.shared.write().unwrap();
@@ -1489,14 +1597,24 @@ async fn handle_append_inner(
         store.mark_meta_dirty(&st);
     }
     if !wire.is_empty() {
+        if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
+            ret!(text_response(404, "stream not found"), Conflict);
+        }
         maybe_seal_bg(&store, &st);
     }
     if notify_subscriptions && new_tail.is_some() {
+        if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
+            ret!(text_response(404, "stream not found"), Conflict);
+        }
         store
             .subscriptions
             .clone()
             .on_stream_append(store.clone(), &st.path)
             .await;
+    }
+
+    if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
+        ret!(text_response(404, "stream not found"), Conflict);
     }
 
     let tail = st.tail();
@@ -2378,6 +2496,195 @@ async fn handle_delete(store: Arc<Store>, path: String) -> Resp {
             ResponseBuilder::new(204).body(empty())
         }
         _ => text_response(500, "delete not durable"),
+    }
+}
+
+#[cfg(test)]
+mod append_fence_tests {
+    use super::*;
+    use crate::store::{CreateResult, Store, StreamConfig};
+    use crate::tier::TierConfig;
+    use crate::wal::walset::WalSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::UNIX_EPOCH;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn directory(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ds-append-fence-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn config(ttl_seconds: Option<u64>) -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    fn post(path: &str, body: &'static [u8]) -> Req {
+        Req {
+            method: Method::Post,
+            path: path.into(),
+            query: None,
+            headers: vec![("content-type".into(), "application/octet-stream".into())],
+            body: Bytes::from_static(body),
+        }
+    }
+
+    fn put(path: &str, body: &'static [u8]) -> Req {
+        Req {
+            method: Method::Put,
+            path: path.into(),
+            query: None,
+            headers: vec![("content-type".into(), "application/octet-stream".into())],
+            body: Bytes::from_static(body),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_fence_admission_rejects_fenced_stream() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let directory = directory("admission");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        let state = match store
+            .create("append-fenced", config(None), None, 0)
+            .unwrap()
+        {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        let appender = state.appender.lock().await;
+        state.fence_while_holding_appender(&appender);
+        drop(appender);
+
+        assert_eq!(
+            handle(store.clone(), post("append-fenced", b"x"))
+                .await
+                .status,
+            404
+        );
+        assert_eq!(state.inflight_appends.load(Ordering::Acquire), 0);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_fence_midflight_append_skips_publication_and_success() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let directory = directory("midflight-append");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        let state = match store
+            .create("append-midflight", config(None), None, 0)
+            .unwrap()
+        {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        let pause = append_fence_test_support::pause_after_wal("append-midflight");
+        let task_store = store.clone();
+        let task =
+            tokio::spawn(async move { handle(task_store, post("append-midflight", b"x")).await });
+
+        tokio::time::timeout(Duration::from_secs(5), pause.wait_until_handler())
+            .await
+            .expect("append must reach the post-WAL fence check");
+        let appender = state.appender.lock().await;
+        state.fence_while_holding_appender(&appender);
+        drop(appender);
+        tokio::time::timeout(Duration::from_secs(5), pause.release_handler())
+            .await
+            .expect("append must resume after fencing");
+
+        assert_eq!(task.await.unwrap().status, 404);
+        assert_eq!(state.tail().bytes, 0);
+        assert_eq!(state.inflight_appends.load(Ordering::Acquire), 0);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_initial_fence_midflight_skips_publication_and_success() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let directory = directory("midflight-create");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        let pause = append_fence_test_support::pause_after_wal("create-midflight");
+        let task_store = store.clone();
+        let task =
+            tokio::spawn(async move { handle(task_store, put("create-midflight", b"x")).await });
+
+        tokio::time::timeout(Duration::from_secs(5), pause.wait_until_handler())
+            .await
+            .expect("create must reach the post-WAL fence check");
+        let state = store.get("create-midflight").expect("created stream");
+        let appender = state.appender.lock().await;
+        state.fence_while_holding_appender(&appender);
+        drop(appender);
+        tokio::time::timeout(Duration::from_secs(5), pause.release_handler())
+            .await
+            .expect("create must resume after fencing");
+
+        assert_eq!(task.await.unwrap().status, 404);
+        assert_eq!(state.tail().bytes, 0);
+        assert_eq!(state.inflight_appends.load(Ordering::Acquire), 0);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_fence_stage_failure_rolls_back_ttl_and_releases_guard() {
+        let _durability = test_support::DurabilityGuard::wal();
+        let directory = directory("stage-failure");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        let wal = WalSet::open(&directory, Some(1), 1).unwrap();
+        assert!(store.wal.set(wal.clone()).is_ok());
+        let state = match store
+            .create("ttl-rollback", config(Some(60)), None, 0)
+            .unwrap()
+        {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        let original_access = UNIX_EPOCH;
+        state.shared.write().unwrap().last_access = original_access;
+        wal.shard_for(state.id).fail_next_write();
+
+        let request = Req {
+            method: Method::Post,
+            path: "ttl-rollback".into(),
+            query: None,
+            headers: vec![
+                ("content-type".into(), "application/octet-stream".into()),
+                (H_SEQ.into(), "7".into()),
+                (H_PRODUCER_ID.into(), "producer".into()),
+                (H_PRODUCER_EPOCH.into(), "0".into()),
+                (H_PRODUCER_SEQ.into(), "0".into()),
+            ],
+            body: Bytes::from_static(b"x"),
+        };
+        assert_eq!(handle(store.clone(), request).await.status, 500);
+        let shared = state.shared.read().unwrap();
+        assert_eq!(shared.last_access, original_access);
+        assert!(shared.producers.is_empty());
+        assert_eq!(shared.last_seq_header, None);
+        drop(shared);
+        assert!(state.appender.try_lock().is_ok());
+        assert_eq!(state.inflight_appends.load(Ordering::Acquire), 0);
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }
 
