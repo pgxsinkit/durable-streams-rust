@@ -383,7 +383,7 @@ async fn dispatch(
             Method::Put => handle_create(store, req, path).await,
             Method::Post => handle_append(store, req, path).await,
             Method::Get => handle_read(store, req, path).await,
-            Method::Head => handle_head(store, path),
+            Method::Head => handle_head(store, path).await,
             Method::Delete => handle_delete(store, path).await,
             Method::Options => unreachable!("OPTIONS handled before route dispatch"),
             Method::Other => text_response(405, "method not allowed"),
@@ -1880,19 +1880,15 @@ async fn materialize_resolved(
 // ---------- GET (catch-up / long-poll / SSE) ----------
 
 async fn handle_read(store: Arc<Store>, req: Req, path: String) -> Resp {
-    let st = match store.get(&path) {
+    let st = match store.registered_stream(&path) {
         Some(s) => s,
         None => return text_response(404, "stream not found"),
     };
-    if st.shared.read().unwrap().soft_deleted {
-        return gone();
-    }
-    // Only TTL is reset by a read, and touch() takes the write lock — skip it for
-    // non-TTL streams to keep their read path lock-free.
-    if st.config.ttl_seconds.is_some() {
-        st.touch();
-        store.mark_meta_dirty(&st); // sliding TTL must survive restarts
-    }
+    let st = match store.request_liveness(st, true).await {
+        RequestLiveness::Live(st) => st,
+        RequestLiveness::Gone => return gone(),
+        RequestLiveness::Missing => return text_response(404, "stream not found"),
+    };
     let q = match parse_query(req.query.as_deref()) {
         Ok(q) => q,
         Err(m) => return text_response(400, m),
@@ -2555,15 +2551,16 @@ async fn read_range_bytes(st: &Arc<StreamState>, start: u64, end: u64) -> std::i
 
 // ---------- HEAD ----------
 
-fn handle_head(store: Arc<Store>, path: String) -> Resp {
-    let st = match store.get(&path) {
+async fn handle_head(store: Arc<Store>, path: String) -> Resp {
+    let st = match store.registered_stream(&path) {
         Some(s) => s,
         None => return text_response(404, "stream not found"),
     };
-    if st.shared.read().unwrap().soft_deleted {
-        return gone();
-    }
-    // HEAD must not reset the TTL.
+    let st = match store.request_liveness(st, false).await {
+        RequestLiveness::Live(st) => st,
+        RequestLiveness::Gone => return gone(),
+        RequestLiveness::Missing => return text_response(404, "stream not found"),
+    };
     let t = st.tail();
     let mut b = ResponseBuilder::new(200)
         .h("content-type", st.config.content_type.clone())
@@ -2781,9 +2778,13 @@ mod explicit_delete_handler_tests {
     }
 
     fn config(expires_at: Option<SystemTime>) -> StreamConfig {
+        config_with_ttl(None, expires_at)
+    }
+
+    fn config_with_ttl(ttl_seconds: Option<u64>, expires_at: Option<SystemTime>) -> StreamConfig {
         StreamConfig {
             content_type: "application/octet-stream".into(),
-            ttl_seconds: None,
+            ttl_seconds,
             expires_at,
             expires_at_raw: None,
             create_closed: false,
@@ -2802,9 +2803,23 @@ mod explicit_delete_handler_tests {
     }
 
     fn create(store: &Store, path: &str, expires_at: Option<SystemTime>) -> Arc<StreamState> {
-        match store.create(path, config(expires_at), None, 0).unwrap() {
+        create_with_config(store, path, config(expires_at))
+    }
+
+    fn create_with_config(store: &Store, path: &str, config: StreamConfig) -> Arc<StreamState> {
+        match store.create(path, config, None, 0).unwrap() {
             CreateResult::Created(stream) => stream,
             _ => panic!("expected stream creation"),
+        }
+    }
+
+    fn request(method: Method, path: &str) -> Req {
+        Req {
+            method,
+            path: path.into(),
+            query: None,
+            headers: Vec::new(),
+            body: Bytes::new(),
         }
     }
 
@@ -3107,6 +3122,164 @@ mod explicit_delete_handler_tests {
         assert!(stream.file_path.exists());
         drop(stream);
         drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_expiry_get_touches_and_head_does_not() {
+        let (directory, store) = store("live-touch");
+        store.init_retirement_executor().unwrap();
+        let get_stream = create_with_config(&store, "get", config_with_ttl(Some(3_600), None));
+        let head_stream = create_with_config(&store, "head", config_with_ttl(Some(3_600), None));
+        let before = SystemTime::now() - Duration::from_secs(1);
+        get_stream.shared.write().unwrap().last_access = before;
+        head_stream.shared.write().unwrap().last_access = before;
+
+        assert_eq!(
+            handle(store.clone(), request(Method::Get, "get"))
+                .await
+                .status,
+            200
+        );
+        assert!(get_stream.shared.read().unwrap().last_access > before);
+        assert!(get_stream.meta_dirty.load(Ordering::Acquire));
+        assert_eq!(
+            handle(store.clone(), request(Method::Head, "head"))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(head_stream.shared.read().unwrap().last_access, before);
+        assert!(!head_stream.meta_dirty.load(Ordering::Acquire));
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_expiry_get_and_head_retire_without_waiting_for_cleanup() {
+        let (directory, store) = store("expired");
+        store.init_retirement_executor().unwrap();
+        let get_stream = create(&store, "get", Some(SystemTime::UNIX_EPOCH));
+        let head_stream = create(&store, "head", Some(SystemTime::UNIX_EPOCH));
+
+        assert_eq!(
+            handle(store.clone(), request(Method::Get, "get"))
+                .await
+                .status,
+            404
+        );
+        assert!(get_stream.fenced.load(Ordering::Acquire));
+        assert_eq!(
+            handle(store.clone(), request(Method::Head, "head"))
+                .await
+                .status,
+            404
+        );
+        assert!(head_stream.fenced.load(Ordering::Acquire));
+        wait_for_removal(&get_stream).await;
+        wait_for_removal(&head_stream).await;
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_expiry_queue_full_has_no_direct_fallback() {
+        let (directory, store) = store("queue-full-expiry");
+        store
+            .init_retirement_executor_for_test(RetirementConfig {
+                queue_capacity: 1,
+                ..RetirementConfig::default()
+            })
+            .unwrap();
+        let first = create(&store, "first", Some(SystemTime::UNIX_EPOCH));
+        let second = create(&store, "second", Some(SystemTime::UNIX_EPOCH));
+        let appender = first.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&first, &appender).unwrap();
+        drop(appender);
+        let owner_store = store.clone();
+        let owner =
+            tokio::spawn(async move { handle(owner_store, request(Method::Get, "first")).await });
+        wait_fenced(&first).await;
+
+        assert_eq!(
+            handle(store.clone(), request(Method::Get, "second"))
+                .await
+                .status,
+            404
+        );
+        assert!(!second.fenced.load(Ordering::Acquire));
+        assert!(second.file_path.exists());
+        drop(guard);
+        assert_eq!(
+            timeout(Duration::from_secs(5), owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            404
+        );
+        wait_for_removal(&first).await;
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_expiry_soft_tombstone_is_gone_for_get_and_head() {
+        let _fault = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = store("soft-tombstone");
+        store.init_retirement_executor().unwrap();
+        let stream = create(&store, "stream", None);
+        stream.shared.write().unwrap().ref_count = 1;
+        assert_eq!(
+            handle_delete(store.clone(), "stream".into()).await.status,
+            204
+        );
+        assert!(store.registered_stream("stream").is_some());
+        assert!(stream.fenced.load(Ordering::Acquire));
+        assert!(stream.shared.read().unwrap().soft_deleted);
+
+        assert_eq!(
+            handle(store.clone(), request(Method::Get, "stream"))
+                .await
+                .status,
+            410
+        );
+        assert_eq!(
+            handle(store.clone(), request(Method::Head, "stream"))
+                .await
+                .status,
+            410
+        );
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_expiry_liveness_loses_to_a_fence_without_touching_ttl() {
+        let (directory, store) = store("fence-race");
+        store.init_retirement_executor().unwrap();
+        let stream = create_with_config(&store, "stream", config_with_ttl(Some(3_600), None));
+        let before = SystemTime::now() - Duration::from_secs(1);
+        stream.shared.write().unwrap().last_access = before;
+        let appender = stream.appender.lock().await;
+        let reader_store = store.clone();
+        let reader =
+            tokio::spawn(async move { handle(reader_store, request(Method::Get, "stream")).await });
+        tokio::task::yield_now().await;
+        stream.fence_while_holding_appender(&appender);
+        drop(appender);
+
+        assert_eq!(
+            timeout(Duration::from_secs(5), reader)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            404
+        );
+        assert_eq!(stream.shared.read().unwrap().last_access, before);
+        assert!(!stream.meta_dirty.load(Ordering::Acquire));
+        shutdown(&store).await;
         let _ = std::fs::remove_dir_all(directory);
     }
 }

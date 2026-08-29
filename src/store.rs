@@ -539,8 +539,11 @@ impl StreamState {
     }
 
     pub fn touch(&self) {
-        let mut s = self.shared.write().unwrap();
-        s.last_access = SystemTime::now();
+        self.touch_at(SystemTime::now());
+    }
+
+    pub(crate) fn touch_at(&self, now: SystemTime) {
+        self.shared.write().unwrap().last_access = now;
     }
 
     pub fn is_expired(&self) -> bool {
@@ -668,6 +671,13 @@ pub(crate) enum ExplicitRetirementResult {
     Rejected(crate::retirement::RetirementAdmission),
     Unavailable,
     Cancelled(crate::retirement::RetirementTicket),
+}
+
+/// Result of the appender-serialized request liveness check used by GET/HEAD.
+pub(crate) enum RequestLiveness {
+    Live(Arc<StreamState>),
+    Gone,
+    Missing,
 }
 
 impl Store {
@@ -975,13 +985,56 @@ impl Store {
         self.streams.get(path).map(|stream| stream.clone())
     }
 
+    /// Serialize GET/HEAD liveness against an explicit retirement fence. A GET
+    /// refreshes sliding TTL only after the exact live identity wins the lock.
+    pub(crate) async fn request_liveness(
+        self: &Arc<Self>,
+        stream: Arc<StreamState>,
+        touch_ttl: bool,
+    ) -> RequestLiveness {
+        let appender = stream.appender.lock().await;
+        if !self.is_exact_registered(&stream) {
+            return RequestLiveness::Missing;
+        }
+        if stream.shared.read().unwrap().soft_deleted {
+            return RequestLiveness::Gone;
+        }
+        if stream.fenced.load(Ordering::Acquire) {
+            return RequestLiveness::Missing;
+        }
+
+        let now = SystemTime::now();
+        if stream.is_expired_at(now) {
+            drop(appender);
+            let _ = self.retire_expiry(stream).await;
+            return RequestLiveness::Missing;
+        }
+        if touch_ttl && stream.config.ttl_seconds.is_some() {
+            stream.touch_at(now);
+            self.mark_meta_dirty(&stream);
+        }
+        drop(appender);
+        RequestLiveness::Live(stream)
+    }
+
     /// Retire one exact registered stream incarnation. This only linearizes
     /// Store state and schedules the bounded physical phase; 005c maps the
     /// returned ticket to the explicit DELETE response.
-    #[allow(dead_code)] // TODO(retirement-005c): explicit DELETE calls this.
     pub(crate) async fn retire_explicit(
         self: &Arc<Self>,
         stream: Arc<StreamState>,
+    ) -> ExplicitRetirementResult {
+        self.retire(stream, LocalCleanupMode::ExplicitDelete).await
+    }
+
+    async fn retire_expiry(self: &Arc<Self>, stream: Arc<StreamState>) -> ExplicitRetirementResult {
+        self.retire(stream, LocalCleanupMode::Expiry).await
+    }
+
+    async fn retire(
+        self: &Arc<Self>,
+        stream: Arc<StreamState>,
+        mode: LocalCleanupMode,
     ) -> ExplicitRetirementResult {
         match self.streams.get(&stream.path) {
             None => return ExplicitRetirementResult::Missing,
@@ -1000,7 +1053,7 @@ impl Store {
         let ticket = match executor.admit(
             stream.clone(),
             crate::retirement::RetirementPriority::Interactive,
-            LocalCleanupMode::ExplicitDelete,
+            mode,
         ) {
             crate::retirement::RetirementAdmissionResult::Admitted(ticket) => ticket,
             crate::retirement::RetirementAdmissionResult::Existing(ticket) => {
@@ -1015,14 +1068,14 @@ impl Store {
             let appender = stream.appender.lock().await;
             if !self.is_exact_live(&stream) || stream.fenced.load(Ordering::Acquire) {
                 drop(appender);
-                return self.cancel_explicit_retirement(&executor, &stream, ticket);
+                return self.cancel_retirement(&executor, &stream, ticket);
             }
             stream.fence_while_holding_appender(&appender);
         }
         stream.wait_for_inflight_appends_zero().await;
 
         if !self.is_exact_live(&stream) {
-            return self.cancel_explicit_retirement(&executor, &stream, ticket);
+            return self.cancel_retirement(&executor, &stream, ticket);
         }
         stream.wake_deletion();
         self.subscriptions
@@ -1030,13 +1083,13 @@ impl Store {
             .on_stream_deleted(Arc::clone(self), &stream.path)
             .await;
         if !self.is_exact_live(&stream) {
-            return self.cancel_explicit_retirement(&executor, &stream, ticket);
+            return self.cancel_retirement(&executor, &stream, ticket);
         }
 
         let soft_deleted = {
             let mut shared = stream.shared.write().unwrap();
             if shared.soft_deleted {
-                return self.cancel_explicit_retirement(&executor, &stream, ticket);
+                return self.cancel_retirement(&executor, &stream, ticket);
             }
             if shared.ref_count > 0 {
                 shared.soft_deleted = true;
@@ -1050,7 +1103,7 @@ impl Store {
                 current.id == stream.id && Arc::ptr_eq(current, &stream)
             });
             if removed.is_none() {
-                return self.cancel_explicit_retirement(&executor, &stream, ticket);
+                return self.cancel_retirement(&executor, &stream, ticket);
             }
             self.remove_inventory(&stream.path, stream.id);
         }
@@ -1066,7 +1119,7 @@ impl Store {
     }
 
     #[allow(dead_code)]
-    fn cancel_explicit_retirement(
+    fn cancel_retirement(
         &self,
         executor: &crate::retirement::RetirementExecutor,
         stream: &Arc<StreamState>,
