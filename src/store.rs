@@ -635,6 +635,9 @@ pub struct Store {
     /// Serializes initialization so a racing second initializer cannot spawn a
     /// discarded worker pool before losing `OnceLock::set`.
     retirement_init: StdMutex<()>,
+    /// A boot collector is deliberately started once, after the executor and
+    /// any WAL attachment are ready. It holds only a Weak Store in its task.
+    recovery_collector_started: AtomicBool,
     /// Streams with a pending non-durable sidecar flush (memory-mode appends,
     /// TTL read touches), drained in batch by the periodic meta sweeper
     /// (`sweep_meta_once`). The `meta_dirty` CAS in `mark_meta_dirty` keeps
@@ -725,6 +728,55 @@ pub(crate) enum AppenderLiveness {
     Gone,
     Missing,
     Expired,
+}
+
+/// Owned supervision handle for the one boot-time soft-tombstone collector.
+/// Dropping it aborts the task so a server shutdown cannot leave a background
+/// admission loop alive after its executor has been stopped.
+pub(crate) struct RecoveryCollector {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RecoveryCollector {
+    pub(crate) async fn shutdown(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for RecoveryCollector {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+enum SoftParentCollectionAdmission {
+    HandedOff(crate::retirement::RetirementTicket),
+    Existing(crate::retirement::RetirementTicket),
+    Deferred(crate::retirement::RetirementAdmission),
+    Unavailable,
+    Skipped,
+}
+
+const RECOVERY_COLLECTION_PAGE_SIZE: usize = 32;
+const RECOVERY_COLLECTION_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+#[cfg(test)]
+static RECOVERY_COLLECTION_PAGE_SIZE_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
+
+fn recovery_collection_page_size() -> usize {
+    #[cfg(test)]
+    {
+        let configured = RECOVERY_COLLECTION_PAGE_SIZE_FOR_TEST.load(Ordering::Acquire);
+        if configured != 0 {
+            return configured;
+        }
+    }
+    RECOVERY_COLLECTION_PAGE_SIZE
 }
 
 impl Store {
@@ -951,6 +1003,7 @@ impl Store {
             wal: std::sync::OnceLock::new(),
             retirement_executor: std::sync::OnceLock::new(),
             retirement_init: StdMutex::new(()),
+            recovery_collector_started: AtomicBool::new(false),
             meta_sweep: StdMutex::new(Vec::new()),
             subscriptions: Arc::new(crate::subscriptions::SubscriptionManager::new()?),
             inventory: RwLock::new(InventoryProjection {
@@ -1025,6 +1078,121 @@ impl Store {
         &self,
     ) -> Option<&Arc<crate::retirement::RetirementExecutor>> {
         self.retirement_executor.get()
+    }
+
+    /// Start the one supervised, mode-independent boot collector after recovery
+    /// has attached WAL (if any), refreshed inventory, and installed retirement.
+    /// It deliberately does not delay readiness behind physical cleanup: its
+    /// bounded cursor continues retrying every exact persisted tombstone until
+    /// handoff or shutdown.
+    pub(crate) fn start_recovery_collector(self: &Arc<Self>) -> std::io::Result<RecoveryCollector> {
+        if self.retirement_executor().is_none() {
+            return Err(std::io::Error::other(
+                "recovery collector requires retirement executor initialization",
+            ));
+        }
+        if self.recovery_collector_started.swap(true, Ordering::AcqRel) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "recovery collector already started",
+            ));
+        }
+        let store = Arc::downgrade(self);
+        Ok(RecoveryCollector {
+            task: Some(tokio::spawn(async move {
+                Store::run_recovery_collector(store).await
+            })),
+        })
+    }
+
+    async fn run_recovery_collector(store: std::sync::Weak<Store>) {
+        let mut after = None;
+        let mut progress_ticket = None;
+        let mut pass_deferred = false;
+        let mut pass_progressed = false;
+        loop {
+            let Some(store) = store.upgrade() else { return };
+            let (candidates, next, more) = store.recovery_collection_page(after.as_deref());
+            // Admission retains every job's ticket itself. The collector keeps
+            // just one progress signal, so a large recovery inventory cannot
+            // become an unbounded local ticket allocation.
+            for stream in candidates {
+                #[cfg(test)]
+                recovery_collector_test_support::wait_after_page_capture(&stream).await;
+                match store.admit_soft_parent_collection(&stream) {
+                    Ok(SoftParentCollectionAdmission::HandedOff(ticket)) => {
+                        pass_progressed = true;
+                        progress_ticket = Some(ticket)
+                    }
+                    Ok(SoftParentCollectionAdmission::Existing(ticket)) => {
+                        progress_ticket = Some(ticket)
+                    }
+                    Ok(SoftParentCollectionAdmission::Deferred(
+                        crate::retirement::RetirementAdmission::ShuttingDown,
+                    )) => return,
+                    Ok(SoftParentCollectionAdmission::Deferred(_))
+                    | Ok(SoftParentCollectionAdmission::Unavailable) => pass_deferred = true,
+                    Ok(SoftParentCollectionAdmission::Skipped) => {}
+                    Err(error) => eprintln!(
+                        "recovery tombstone collection deferred for stream id={} path={:?}: {error}",
+                        stream.id, stream.path
+                    ),
+                }
+            }
+            drop(store);
+
+            if more {
+                after = next;
+                continue;
+            }
+            // A boot collector is finite, not a steady-state scanner. It
+            // restarts only after this full bounded pass made a handoff or had
+            // backpressure; a clean pass is the quiescent completion boundary.
+            if !pass_deferred && !pass_progressed {
+                return;
+            }
+            after = None;
+            if pass_deferred {
+                if let Some(ticket) = progress_ticket.take() {
+                    // A first attempt can leave its job retained for retry, so
+                    // terminal completion—not first-attempt completion—is the
+                    // only ticket event that proves the admission slot freed.
+                    let _ = ticket.wait_terminal().await;
+                } else {
+                    // Saturation can predate this collector (for example an
+                    // already admitted startup job), leaving no ticket to
+                    // retain. This bounded delay avoids a hot full-inventory
+                    // poll; the next finite pass observes its eventual state.
+                    tokio::time::sleep(RECOVERY_COLLECTION_RETRY_DELAY).await;
+                }
+            }
+            pass_deferred = false;
+            pass_progressed = false;
+        }
+    }
+
+    /// Clone at most one inventory page, then re-resolve every entry in the
+    /// registry. No DashMap/inventory/shared guard survives this return.
+    fn recovery_collection_page(
+        &self,
+        after: Option<&str>,
+    ) -> (Vec<Arc<StreamState>>, Option<String>, bool) {
+        let (_, entries, more) = self
+            .inventory_page(None, after, recovery_collection_page_size())
+            .expect("fresh inventory generation must be readable");
+        let next = entries.last().map(|entry| entry.path.clone());
+        let candidates = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let stream = self.registered_stream(&entry.path)?;
+                (stream.id == entry.stream_id && stream.fenced.load(Ordering::Acquire) && {
+                    let shared = stream.shared.read().unwrap();
+                    shared.soft_deleted && shared.ref_count == 0
+                })
+                .then_some(stream)
+            })
+            .collect();
+        (candidates, next, more)
     }
 
     /// Clone the currently registered stream without triggering lazy expiry.
@@ -1589,7 +1757,10 @@ impl Store {
                 file: file.clone(),
                 written,
             }),
-            fenced: AtomicBool::new(false),
+            // A durable soft tombstone was already logically retired before
+            // the crash. Reconstruct its fence before inserting it, so no boot
+            // request can win an append/read lifecycle race ahead of collection.
+            fenced: AtomicBool::new(meta.soft_deleted),
             inflight_appends: AtomicUsize::new(0),
             inflight_appends_zero: tokio::sync::Notify::new(),
             parent_ref_released: AtomicBool::new(false),
@@ -1881,7 +2052,19 @@ impl Store {
             shared.soft_deleted && shared.ref_count == 0
         };
         if needs_collection {
-            self.admit_soft_parent_collection(&parent)?;
+            match self.admit_soft_parent_collection(&parent)? {
+                SoftParentCollectionAdmission::Deferred(reason) => eprintln!(
+                    "retirement cascade deferred for stream id={} path={:?}: {reason:?}",
+                    parent.id, parent.path
+                ),
+                SoftParentCollectionAdmission::Unavailable => eprintln!(
+                    "retirement cascade deferred for stream id={} path={:?}: executor unavailable",
+                    parent.id, parent.path
+                ),
+                SoftParentCollectionAdmission::HandedOff(_)
+                | SoftParentCollectionAdmission::Existing(_)
+                | SoftParentCollectionAdmission::Skipped => {}
+            }
         }
         Ok(())
     }
@@ -1890,7 +2073,10 @@ impl Store {
     /// retirement already fenced it, woke readers, notified subscriptions, and
     /// forgot WAL residency; this hand-off deliberately repeats none of those
     /// asynchronous logical phases.
-    fn admit_soft_parent_collection(&self, parent: &Arc<StreamState>) -> std::io::Result<()> {
+    fn admit_soft_parent_collection(
+        &self,
+        parent: &Arc<StreamState>,
+    ) -> std::io::Result<SoftParentCollectionAdmission> {
         if !parent.fenced.load(Ordering::Acquire)
             || !self.is_exact_registered(parent)
             || !{
@@ -1899,14 +2085,10 @@ impl Store {
             }
         {
             // A replacement or stale old Arc is never collectible by path alone.
-            return Ok(());
+            return Ok(SoftParentCollectionAdmission::Skipped);
         }
         let Some(executor) = self.retirement_executor() else {
-            eprintln!(
-                "retirement cascade deferred for stream id={} path={:?}: executor unavailable",
-                parent.id, parent.path
-            );
-            return Ok(());
+            return Ok(SoftParentCollectionAdmission::Unavailable);
         };
         let executor = Arc::clone(executor);
         let ticket = match executor.admit(
@@ -1915,16 +2097,11 @@ impl Store {
             LocalCleanupMode::CascadeCollection,
         ) {
             crate::retirement::RetirementAdmissionResult::Admitted(ticket) => ticket,
-            crate::retirement::RetirementAdmissionResult::Existing(_) => return Ok(()),
+            crate::retirement::RetirementAdmissionResult::Existing(ticket) => {
+                return Ok(SoftParentCollectionAdmission::Existing(ticket));
+            }
             crate::retirement::RetirementAdmissionResult::Rejected(reason) => {
-                // The child has completed; retain this durable exact tombstone
-                // without a reservation. A later collector/recovery slice owns
-                // retrying this intentionally deferred cascade admission.
-                eprintln!(
-                    "retirement cascade deferred for stream id={} path={:?}: {reason:?}",
-                    parent.id, parent.path
-                );
-                return Ok(());
+                return Ok(SoftParentCollectionAdmission::Deferred(reason));
             }
         };
 
@@ -1935,18 +2112,18 @@ impl Store {
             }
         {
             let _ = executor.cancel_prelogical(parent, &ticket);
-            return Ok(());
+            return Ok(SoftParentCollectionAdmission::Skipped);
         }
         let removed = self.streams.remove_if(&parent.path, |_, current| {
             current.id == parent.id && Arc::ptr_eq(current, parent)
         });
         if removed.is_none() {
             let _ = executor.cancel_prelogical(parent, &ticket);
-            return Ok(());
+            return Ok(SoftParentCollectionAdmission::Skipped);
         }
         self.remove_inventory(&parent.path, parent.id);
         if executor.release_logical(parent, &ticket) {
-            return Ok(());
+            return Ok(SoftParentCollectionAdmission::HandedOff(ticket));
         }
 
         // Release can lose only to shutdown/stale state. Restore exactly this
@@ -1963,7 +2140,7 @@ impl Store {
         &self,
         parent: &Arc<StreamState>,
     ) -> std::io::Result<()> {
-        self.admit_soft_parent_collection(parent)
+        self.admit_soft_parent_collection(parent).map(|_| ())
     }
 
     pub fn create(
@@ -3211,6 +3388,204 @@ mod retirement_executor_lifecycle_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn recovery_collector_fences_and_collects_only_zero_ref_tombstones() {
+        let (directory, store) = temporary_store("recovered-tombstones");
+        let collect = match store.create("collect", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create collect tombstone"),
+        };
+        let retain = match store.create("retain", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create retained tombstone"),
+        };
+        {
+            let mut shared = collect.shared.write().unwrap();
+            shared.soft_deleted = true;
+            shared.ref_count = 0;
+        }
+        {
+            let mut shared = retain.shared.write().unwrap();
+            shared.soft_deleted = true;
+            shared.ref_count = 1;
+        }
+        write_meta_sync(&collect, true).unwrap();
+        write_meta_sync(&retain, true).unwrap();
+        drop(collect);
+        drop(retain);
+        drop(store);
+
+        let recovered = Arc::new(
+            Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap(),
+        );
+        let collected = recovered.registered_stream("collect").unwrap();
+        let retained = recovered.registered_stream("retain").unwrap();
+        assert!(collected.fenced.load(Ordering::Acquire));
+        assert!(retained.fenced.load(Ordering::Acquire));
+        assert!(retained.shared.read().unwrap().soft_deleted);
+        assert_eq!(retained.shared.read().unwrap().ref_count, 1);
+
+        recovered.init_retirement_executor().unwrap();
+        recovered.refresh_inventory();
+        let collector = recovered.start_recovery_collector().unwrap();
+        wait_until_cascade_cleanup(&recovered, &collected).await;
+        assert!(Arc::ptr_eq(
+            recovered.registered_stream("retain").as_ref().unwrap(),
+            &retained
+        ));
+        collector.shutdown().await;
+        recovered.retirement_executor().unwrap().shutdown().await;
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_collector_advances_all_pages_after_queue_backpressure() {
+        let _fault_guard = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = temporary_store("recovery-pages");
+        for path in ["a", "b", "c"] {
+            let stream = match store.create(path, stream_config(), None, 0).unwrap() {
+                CreateResult::Created(stream) => stream,
+                _ => panic!("create recovered tombstone"),
+            };
+            stream.shared.write().unwrap().soft_deleted = true;
+            write_meta_sync(&stream, true).unwrap();
+        }
+        drop(store);
+
+        let recovered = Arc::new(
+            Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap(),
+        );
+        let config = crate::retirement::RetirementConfig {
+            queue_capacity: 1,
+            ..crate::retirement::RetirementConfig::default()
+        };
+        recovered.init_retirement_executor_for_test(config).unwrap();
+        recovered.refresh_inventory();
+        RECOVERY_COLLECTION_PAGE_SIZE_FOR_TEST.store(1, Ordering::Release);
+        let collector = recovered.start_recovery_collector().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ["a", "b", "c"]
+                .iter()
+                .any(|path| recovered.registered_stream(path).is_some())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all pages must progress after a saturated first page");
+        RECOVERY_COLLECTION_PAGE_SIZE_FOR_TEST.store(0, Ordering::Release);
+        collector.shutdown().await;
+        recovered.retirement_executor().unwrap().shutdown().await;
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_collector_shutdown_joins_before_captured_admission() {
+        let (directory, store) = temporary_store("recovery-collector-shutdown");
+        let stream = match store.create("collect", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create recovered tombstone"),
+        };
+        stream.shared.write().unwrap().soft_deleted = true;
+        write_meta_sync(&stream, true).unwrap();
+        drop(store);
+
+        let recovered = Arc::new(
+            Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap(),
+        );
+        let captured = recovered.registered_stream("collect").unwrap();
+        recovered.init_retirement_executor().unwrap();
+        recovered.refresh_inventory();
+        let pause = recovery_collector_test_support::pause_after_page_capture(&captured);
+        let collector = recovered.start_recovery_collector().unwrap();
+        pause.wait_until_held().await;
+
+        collector.shutdown().await;
+        assert!(Arc::ptr_eq(
+            recovered.registered_stream("collect").as_ref().unwrap(),
+            &captured
+        ));
+        let (_, inventory, _) = recovered.inventory_page(None, None, 10).unwrap();
+        assert!(inventory
+            .iter()
+            .any(|entry| entry.path == "collect" && entry.stream_id == captured.id));
+
+        // The collector task has joined, so releasing the hook cannot admit the
+        // already captured candidate after shutdown.
+        pause.release();
+        tokio::task::yield_now().await;
+        assert!(recovered.registered_stream("collect").is_some());
+        recovered.retirement_executor().unwrap().shutdown().await;
+        drop(pause);
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_collector_revalidates_a_replaced_captured_identity() {
+        let (directory, store) = temporary_store("recovery-collector-replacement");
+        let stream = match store.create("collect", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create recovered tombstone"),
+        };
+        stream.shared.write().unwrap().soft_deleted = true;
+        write_meta_sync(&stream, true).unwrap();
+        drop(store);
+
+        let recovered = Arc::new(
+            Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap(),
+        );
+        let captured = recovered.registered_stream("collect").unwrap();
+        recovered.init_retirement_executor().unwrap();
+        recovered.refresh_inventory();
+        let pause = recovery_collector_test_support::pause_after_page_capture(&captured);
+        let collector = recovered.start_recovery_collector().unwrap();
+        pause.wait_until_held().await;
+
+        assert!(recovered
+            .streams
+            .remove_if("collect", |_, current| {
+                current.id == captured.id && Arc::ptr_eq(current, &captured)
+            })
+            .is_some());
+        let replacement = match recovered
+            .create("collect", stream_config(), None, 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("replacement must win the vacant path"),
+        };
+        pause.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !Arc::ptr_eq(
+                recovered.registered_stream("collect").as_ref().unwrap(),
+                &replacement,
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("collector must not remove the replacement");
+        let (_, inventory, _) = recovered.inventory_page(None, None, 10).unwrap();
+        assert!(inventory
+            .iter()
+            .any(|entry| entry.path == "collect" && entry.stream_id == replacement.id));
+        assert!(
+            captured.file_path.exists(),
+            "stale captured Arc is not cleaned"
+        );
+
+        collector.shutdown().await;
+        recovered.retirement_executor().unwrap().shutdown().await;
+        drop(pause);
+        drop(replacement);
+        drop(captured);
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn saturated_cascade_retains_exact_tombstone_for_later_collection() {
         let (directory, store) = temporary_store("cascade-saturated");
         let config = crate::retirement::RetirementConfig {
@@ -3744,6 +4119,118 @@ mod sweep_meta_test_support {
         release
             .recv_timeout(Duration::from_secs(5))
             .expect("test must release sweep eligibility within five seconds");
+    }
+}
+
+#[cfg(test)]
+mod recovery_collector_test_support {
+    use super::*;
+
+    struct PauseState {
+        stream: std::sync::Weak<StreamState>,
+        held: Arc<AtomicBool>,
+        reached: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    static PAUSES: std::sync::LazyLock<StdMutex<HashMap<String, PauseState>>> =
+        std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+    /// Pauses exactly one captured collector candidate before its exact
+    /// admission revalidation. Dropping it releases an in-flight collector so
+    /// a failed assertion cannot strand a test task.
+    pub(crate) struct CapturePause {
+        path: String,
+        stream: Arc<StreamState>,
+        held: Arc<AtomicBool>,
+        reached: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    pub(crate) fn pause_after_page_capture(stream: &Arc<StreamState>) -> CapturePause {
+        let held = Arc::new(AtomicBool::new(false));
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut pauses = PAUSES.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(
+            !pauses.contains_key(&stream.path),
+            "a recovery collector capture pause is already installed for {}",
+            stream.path
+        );
+        pauses.insert(
+            stream.path.clone(),
+            PauseState {
+                stream: Arc::downgrade(stream),
+                held: Arc::clone(&held),
+                reached: Arc::clone(&reached),
+                release: Arc::clone(&release),
+            },
+        );
+        CapturePause {
+            path: stream.path.clone(),
+            stream: Arc::clone(stream),
+            held,
+            reached,
+            release,
+        }
+    }
+
+    impl CapturePause {
+        pub(crate) async fn wait_until_held(&self) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !self.held.load(Ordering::Acquire) {
+                    self.reached.notified().await;
+                }
+            })
+            .await
+            .expect("collector should reach its capture pause within five seconds");
+        }
+
+        pub(crate) fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    impl Drop for CapturePause {
+        fn drop(&mut self) {
+            self.release.notify_one();
+            let mut pauses = PAUSES.lock().unwrap_or_else(|error| error.into_inner());
+            if pauses.get(&self.path).is_some_and(|state| {
+                state
+                    .stream
+                    .upgrade()
+                    .is_some_and(|current| Arc::ptr_eq(&current, &self.stream))
+            }) {
+                pauses.remove(&self.path);
+            }
+        }
+    }
+
+    pub(crate) async fn wait_after_page_capture(stream: &Arc<StreamState>) {
+        let state = {
+            let pauses = PAUSES.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(state) = pauses.get(&stream.path) else {
+                return;
+            };
+            if !state
+                .stream
+                .upgrade()
+                .is_some_and(|current| Arc::ptr_eq(&current, stream))
+            {
+                return;
+            }
+            (
+                Arc::clone(&state.held),
+                Arc::clone(&state.reached),
+                Arc::clone(&state.release),
+            )
+        };
+        state.0.store(true, Ordering::Release);
+        state.1.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), state.2.notified())
+            .await
+            .expect("test must release recovery collector capture pause within five seconds");
+        state.0.store(false, Ordering::Release);
     }
 }
 

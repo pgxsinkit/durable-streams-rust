@@ -683,6 +683,14 @@ fn main() {
         store
             .init_retirement_executor()
             .expect("failed to initialize retirement executor");
+        // Both durability modes rebuild the same exact projection before the
+        // mode-independent recovered-tombstone collector snapshots it. The
+        // collector itself is supervised below and never blocks readiness on
+        // physical cleanup/retry work.
+        store.refresh_inventory();
+        let recovery_collector = store
+            .start_recovery_collector()
+            .expect("failed to start recovered tombstone collector");
         let retirement_for_shutdown = Arc::clone(
             store
                 .retirement_executor()
@@ -716,6 +724,7 @@ fn main() {
                 #[cfg(target_os = "linux")]
                 sse_reactor::shutdown();
                 engine_raw::drain(std::time::Duration::from_secs(25)).await;
+                recovery_collector.shutdown().await;
                 retirement_for_shutdown.shutdown().await;
                 // Stop + join the dedicated committer threads (Tier-2a) AFTER the
                 // request drain, so any commit a just-drained request staged is

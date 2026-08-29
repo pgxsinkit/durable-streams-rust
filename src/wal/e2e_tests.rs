@@ -22,7 +22,7 @@ use bytes::Bytes;
 use crate::api::{Method, Req};
 use crate::handlers;
 use crate::handlers::test_support::DurabilityGuard;
-use crate::store::Store;
+use crate::store::{write_meta_sync, Store};
 use crate::tier::TierConfig;
 use crate::wal::shard::CommitterHandle;
 use crate::wal::walset::WalSet;
@@ -169,6 +169,71 @@ async fn append_acked(store: &Arc<Store>, path: &str, content_type: &str, body: 
         "append to {path} expected 2xx ack, got {}",
         resp.status
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_collector_runs_after_full_wal_boot_and_preserves_retained_tombstone_bytes() {
+    let dir = tmp("recovery-collector-full-wal-boot");
+    let first = Harness::boot(&dir, Some(1), 1).unwrap();
+    create_stream(&first.store, "collect", OCTET).await;
+    create_stream(&first.store, "retain", OCTET).await;
+    append_acked(&first.store, "retain", OCTET, b"retained-ack").await;
+    let collect = first.store.registered_stream("collect").unwrap();
+    let retain = first.store.registered_stream("retain").unwrap();
+    collect.shared.write().unwrap().soft_deleted = true;
+    {
+        let mut shared = retain.shared.write().unwrap();
+        shared.soft_deleted = true;
+        shared.ref_count = 1;
+    }
+    write_meta_sync(&collect, true).unwrap();
+    write_meta_sync(&retain, true).unwrap();
+    first.crash();
+
+    // Harness::boot is the production ordering: Store sidecar recovery, WAL
+    // replay, reset, WAL attachment, executor initialization, then committers.
+    let mut recovered = Harness::boot(&dir, Some(1), 1).unwrap();
+    let collected = recovered.store.registered_stream("collect").unwrap();
+    let retained = recovered.store.registered_stream("retain").unwrap();
+    assert!(collected.fenced.load(std::sync::atomic::Ordering::Acquire));
+    assert!(retained.fenced.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        std::fs::read(&retained.file_path).unwrap(),
+        b"retained-ack",
+        "WAL recovery/reset completed before the collector can observe survivors"
+    );
+
+    recovered.store.refresh_inventory();
+    let collector = recovered.store.start_recovery_collector().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while recovered.store.registered_stream("collect").is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("zero-ref recovered tombstone should hand off through proactive retirement");
+    assert!(Arc::ptr_eq(
+        recovered
+            .store
+            .registered_stream("retain")
+            .as_ref()
+            .unwrap(),
+        &retained
+    ));
+    assert!(retained.file_path.exists());
+    let (_, inventory, _) = recovered.store.inventory_page(None, None, 10).unwrap();
+    assert!(inventory.iter().any(|entry| entry.path == "retain"));
+
+    collector.shutdown().await;
+    recovered
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    recovered.stop_committers();
+    drop(recovered);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The data-file path for a stream by name (the read surface; spec §8). Resolves
