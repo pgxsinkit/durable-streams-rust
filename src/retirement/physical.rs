@@ -204,7 +204,7 @@ impl PhysicalExecutor {
     }
 
     #[cfg(test)]
-    fn worker_count(&self) -> usize {
+    pub(crate) fn worker_count(&self) -> usize {
         self.shared.workers_live.load(Ordering::Acquire)
     }
 }

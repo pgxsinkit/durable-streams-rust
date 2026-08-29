@@ -600,6 +600,12 @@ pub struct Store {
     /// the `WalSet`, runs WAL recovery, and `set`s it here — all before serving.
     /// The hot-path read (`store.wal.get()`) is lock-free.
     pub wal: std::sync::OnceLock<Arc<crate::wal::walset::WalSet>>,
+    /// Process-lifetime bounded physical cleanup pool. It is installed only
+    /// after recovery completes, before the server becomes reachable.
+    retirement_executor: std::sync::OnceLock<Arc<crate::retirement::RetirementExecutor>>,
+    /// Serializes initialization so a racing second initializer cannot spawn a
+    /// discarded worker pool before losing `OnceLock::set`.
+    retirement_init: StdMutex<()>,
     /// Streams with a pending non-durable sidecar flush (memory-mode appends,
     /// TTL read touches), drained in batch by the periodic meta sweeper
     /// (`sweep_meta_once`). The `meta_dirty` CAS in `mark_meta_dirty` keeps
@@ -872,6 +878,8 @@ impl Store {
             tier_config,
             blobstore,
             wal: std::sync::OnceLock::new(),
+            retirement_executor: std::sync::OnceLock::new(),
+            retirement_init: StdMutex::new(()),
             meta_sweep: StdMutex::new(Vec::new()),
             subscriptions: Arc::new(crate::subscriptions::SubscriptionManager::new()?),
             inventory: RwLock::new(InventoryProjection {
@@ -881,6 +889,57 @@ impl Store {
         };
         store.recover(&streams_dir)?;
         Ok(store)
+    }
+
+    /// Install the one process-lifetime retirement executor after recovery.
+    ///
+    /// Requiring `Arc<Self>` makes the callback's weak Store capture explicit.
+    /// The initialization mutex covers construction as well as `OnceLock::set`,
+    /// so a second caller fails before it can spawn another fixed worker pool.
+    pub(crate) fn init_retirement_executor(
+        self: &Arc<Self>,
+    ) -> std::io::Result<&Arc<crate::retirement::RetirementExecutor>> {
+        let _init = self
+            .retirement_init
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.retirement_executor.get().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "retirement executor already initialized",
+            ));
+        }
+
+        let store = Arc::downgrade(self);
+        let cleanup: crate::retirement::CleanupCallback = Arc::new(move |stream, mode| {
+            let store = store.upgrade().ok_or_else(|| {
+                std::io::Error::other("retirement cleanup ran after Store was dropped")
+            })?;
+            // 005b2 extends this callback with retirement finalization. This
+            // lifecycle slice deliberately delegates only to local cleanup.
+            store.cleanup_local_stream(stream, mode)
+        });
+        let executor = Arc::new(
+            crate::retirement::RetirementExecutor::new(
+                cleanup,
+                crate::retirement::RetirementConfig::default(),
+            )
+            .map_err(std::io::Error::other)?,
+        );
+        self.retirement_executor
+            .set(executor)
+            .map_err(|_| std::io::Error::other("retirement executor initialization raced"))?;
+        Ok(self
+            .retirement_executor
+            .get()
+            .expect("retirement executor was just initialized"))
+    }
+
+    /// Narrow access point for the later Store retirement mutations.
+    pub(crate) fn retirement_executor(
+        &self,
+    ) -> Option<&Arc<crate::retirement::RetirementExecutor>> {
+        self.retirement_executor.get()
     }
 
     /// Directory holding staged sealed chunk files (separate from `streams/` so
@@ -1855,6 +1914,118 @@ mod stream_lifecycle_tests {
         assert!(*before_signal.borrow());
         assert!(*state.subscribe_deletion().borrow());
 
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod retirement_executor_lifecycle_tests {
+    use super::*;
+    use crate::retirement::{
+        RetirementAdmissionResult, RetirementPriority, TerminalCleanupCompletion,
+    };
+
+    fn stream_config() -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
+    }
+
+    fn temporary_store(tag: &str) -> (PathBuf, Arc<Store>) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "ds-retirement-executor-lifecycle-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = Arc::new(
+            Store::new_with_tier(directory.clone(), crate::tier::TierConfig::default()).unwrap(),
+        );
+        (directory, store)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_executor_lifecycle_initializes_once_and_shuts_down_workers() {
+        let (directory, store) = temporary_store("once");
+        let executor = Arc::clone(
+            store
+                .init_retirement_executor()
+                .expect("first initialization succeeds"),
+        );
+        assert!(Arc::ptr_eq(
+            &executor,
+            store
+                .retirement_executor()
+                .expect("initialized executor is accessible")
+        ));
+        let second_initialization = match store.init_retirement_executor() {
+            Ok(_) => panic!("second initialization must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            second_initialization.kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(executor.worker_count() > 0);
+        executor.shutdown().await;
+        assert_eq!(executor.worker_count(), 0);
+
+        drop(executor);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_executor_lifecycle_callback_cleans_the_exact_stream() {
+        let (directory, store) = temporary_store("callback");
+        let executor = Arc::clone(store.init_retirement_executor().unwrap());
+        let stream = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected stream creation"),
+        };
+        let ticket = match executor.admit(
+            stream.clone(),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ) {
+            RetirementAdmissionResult::Admitted(ticket) => ticket,
+            _ => panic!("first admission owns the logical gate"),
+        };
+        assert!(executor.release_logical(&stream, &ticket));
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(!stream.file_path.exists());
+        executor.shutdown().await;
+
+        drop(executor);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_executor_lifecycle_weak_callback_does_not_retain_store() {
+        let (directory, store) = temporary_store("weak");
+        let executor = Arc::clone(store.init_retirement_executor().unwrap());
+        let weak_store = Arc::downgrade(&store);
+
+        drop(store);
+        assert!(
+            weak_store.upgrade().is_none(),
+            "the executor callback must not retain Store"
+        );
+        executor.shutdown().await;
+        drop(executor);
+        assert!(weak_store.upgrade().is_none());
         let _ = std::fs::remove_dir_all(directory);
     }
 }

@@ -674,6 +674,21 @@ fn main() {
             // `--features telemetry`; off the hot commit/append path.
             wal::telemetry::spawn_emitter(Arc::clone(&walset));
             wal_for_shutdown = Some(walset);
+        }
+
+        // This is deliberately after Store + WAL recovery/attachment, but
+        // before readiness or socket exposure. The callback holds only a Weak
+        // Store, and the retained handle gives graceful shutdown a deterministic
+        // worker-join boundary even after `serve` releases its Store clone.
+        store
+            .init_retirement_executor()
+            .expect("failed to initialize retirement executor");
+        let retirement_for_shutdown = Arc::clone(
+            store
+                .retirement_executor()
+                .expect("retirement executor was just initialized"),
+        );
+        if handlers::durability() == handlers::DurabilityMode::Wal {
             if let Some(readiness) = &readiness {
                 readiness.ready();
             }
@@ -701,6 +716,7 @@ fn main() {
                 #[cfg(target_os = "linux")]
                 sse_reactor::shutdown();
                 engine_raw::drain(std::time::Duration::from_secs(25)).await;
+                retirement_for_shutdown.shutdown().await;
                 // Stop + join the dedicated committer threads (Tier-2a) AFTER the
                 // request drain, so any commit a just-drained request staged is
                 // covered by each committer's final drain before the thread exits.

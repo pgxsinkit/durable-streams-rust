@@ -338,6 +338,11 @@ impl RetirementExecutor {
     fn scheduled_retry_count(&self) -> usize {
         lock_recover(&self.inner.state).retries.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn worker_count(&self) -> usize {
+        self.inner.physical.worker_count()
+    }
 }
 
 impl Drop for RetirementExecutor {
