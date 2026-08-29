@@ -289,6 +289,10 @@ pub struct StreamState {
     pub(crate) inflight_appends: AtomicUsize,
     #[allow(dead_code)]
     pub(crate) inflight_appends_zero: tokio::sync::Notify,
+    /// Set by a completed child's physical worker after its immediate parent
+    /// was decremented in memory. A retry then persists/collects that same
+    /// parent without decrementing it a second time.
+    parent_ref_released: AtomicBool,
     /// Never persisted: deduplication, attempt count, and failure cooldown are
     /// rebuilt on create and recovery by the retirement foundation.
     pub(crate) retirement_state: StdMutex<crate::retirement::RetirementState>,
@@ -683,6 +687,9 @@ pub(crate) enum LocalCleanupMode {
     /// Lazy expiry: unlink synchronously, but permit crash resurrection before
     /// the directory entry is synced.
     Expiry,
+    /// Hard-collect an already fenced, soft-deleted fork parent whose durable
+    /// refcount reached zero. This is never a new public delete.
+    CascadeCollection,
 }
 
 /// Files reclaimed by one synchronous local cleanup attempt.
@@ -1313,7 +1320,8 @@ impl Store {
                 "retirement cleanup requires a fenced stream",
             ));
         }
-        if stream.shared.read().unwrap().soft_deleted {
+        if stream.shared.read().unwrap().soft_deleted && mode != LocalCleanupMode::CascadeCollection
+        {
             if !self.is_exact_registered(stream) {
                 return Err(std::io::Error::other(
                     "soft retirement lost its exact registry tombstone",
@@ -1329,8 +1337,15 @@ impl Store {
             ));
         }
         self.gc_remote_segments(stream);
-        let outcome = self.cleanup_local_stream(stream, mode)?;
-        self.release_parent(stream);
+        // A cascade is the eventual hard half of a durably persisted tombstone.
+        // Use explicit unlink durability rather than weakening that completed
+        // logical delete based on the expired/original request that created it.
+        let cleanup_mode = match mode {
+            LocalCleanupMode::CascadeCollection => LocalCleanupMode::ExplicitDelete,
+            mode => mode,
+        };
+        let outcome = self.cleanup_local_stream(stream, cleanup_mode)?;
+        self.release_parent(stream)?;
         Ok(outcome)
     }
 
@@ -1577,6 +1592,7 @@ impl Store {
             fenced: AtomicBool::new(false),
             inflight_appends: AtomicUsize::new(0),
             inflight_appends_zero: tokio::sync::Notify::new(),
+            parent_ref_released: AtomicBool::new(false),
             retirement_state: StdMutex::new(crate::retirement::RetirementState::default()),
             deletion_tx,
             shared: RwLock::new(Shared {
@@ -1731,7 +1747,7 @@ impl Store {
             });
             if removed.is_some() {
                 self.remove_inventory(&st.path, st.id);
-                self.release_parent(st);
+                let _ = self.release_parent(st);
             }
             Ok(outcome)
         }
@@ -1828,34 +1844,126 @@ impl Store {
         Ok(outcome)
     }
 
-    /// Decrement the parent's fork refcount; cascade-collect soft-deleted parents
-    /// whose last fork just went away.
-    pub fn release_parent(&self, st: &Arc<StreamState>) {
-        let mut cur = st.parent.clone();
-        while let Some(parent) = cur {
-            let gone = {
-                let mut s = parent.shared.write().unwrap();
-                s.ref_count = s.ref_count.saturating_sub(1);
-                s.soft_deleted && s.ref_count == 0
-            };
-            if !gone {
-                // Persist the decremented refcount.
-                let p2 = parent.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = write_meta_sync(&p2, true);
-                });
-                break;
+    /// Release exactly one immediate fork parent from a completed hard cleanup.
+    /// The child's physical worker persists the decrement and, only for a fenced
+    /// soft tombstone at zero, hands that parent to a separate proactive bounded
+    /// job. There is intentionally no detached chain traversal here.
+    fn release_parent(&self, child: &Arc<StreamState>) -> std::io::Result<()> {
+        let Some(parent) = child.parent.as_ref().cloned() else {
+            return Ok(());
+        };
+
+        if !child.parent_ref_released.swap(true, Ordering::AcqRel) {
+            let mut shared = parent.shared.write().unwrap();
+            if shared.ref_count == 0 {
+                child.parent_ref_released.store(false, Ordering::Release);
+                return Err(std::io::Error::other(
+                    "fork child released a parent with no outstanding reference",
+                ));
             }
-            self.streams
-                .remove_if(&parent.path, |_, v| Arc::ptr_eq(v, &parent));
-            self.gc_remote_segments(&parent);
-            let fp = parent.file_path.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = std::fs::remove_file(meta_path(&fp));
-                let _ = std::fs::remove_file(fp);
-            });
-            cur = parent.parent.clone();
+            shared.ref_count -= 1;
         }
+
+        // A retry after an I/O error reaches this write again but cannot repeat
+        // the decrement above. The new count is durable before a zero-ref parent
+        // can ever be made collectible.
+        write_meta_sync(&parent, true)?;
+
+        #[cfg(test)]
+        if take_parent_release_fail_once_for(child) {
+            return Err(std::io::Error::other(
+                "injected parent-release failure after durable decrement",
+            ));
+        }
+
+        let needs_collection = {
+            let shared = parent.shared.read().unwrap();
+            shared.soft_deleted && shared.ref_count == 0
+        };
+        if needs_collection {
+            self.admit_soft_parent_collection(&parent)?;
+        }
+        Ok(())
+    }
+
+    /// Admit a zero-ref soft tombstone to the bounded cascade lane. Its original
+    /// retirement already fenced it, woke readers, notified subscriptions, and
+    /// forgot WAL residency; this hand-off deliberately repeats none of those
+    /// asynchronous logical phases.
+    fn admit_soft_parent_collection(&self, parent: &Arc<StreamState>) -> std::io::Result<()> {
+        if !parent.fenced.load(Ordering::Acquire)
+            || !self.is_exact_registered(parent)
+            || !{
+                let shared = parent.shared.read().unwrap();
+                shared.soft_deleted && shared.ref_count == 0
+            }
+        {
+            // A replacement or stale old Arc is never collectible by path alone.
+            return Ok(());
+        }
+        let Some(executor) = self.retirement_executor() else {
+            eprintln!(
+                "retirement cascade deferred for stream id={} path={:?}: executor unavailable",
+                parent.id, parent.path
+            );
+            return Ok(());
+        };
+        let executor = Arc::clone(executor);
+        let ticket = match executor.admit(
+            Arc::clone(parent),
+            crate::retirement::RetirementPriority::Proactive,
+            LocalCleanupMode::CascadeCollection,
+        ) {
+            crate::retirement::RetirementAdmissionResult::Admitted(ticket) => ticket,
+            crate::retirement::RetirementAdmissionResult::Existing(_) => return Ok(()),
+            crate::retirement::RetirementAdmissionResult::Rejected(reason) => {
+                // The child has completed; retain this durable exact tombstone
+                // without a reservation. A later collector/recovery slice owns
+                // retrying this intentionally deferred cascade admission.
+                eprintln!(
+                    "retirement cascade deferred for stream id={} path={:?}: {reason:?}",
+                    parent.id, parent.path
+                );
+                return Ok(());
+            }
+        };
+
+        if !parent.fenced.load(Ordering::Acquire)
+            || !{
+                let shared = parent.shared.read().unwrap();
+                shared.soft_deleted && shared.ref_count == 0
+            }
+        {
+            let _ = executor.cancel_prelogical(parent, &ticket);
+            return Ok(());
+        }
+        let removed = self.streams.remove_if(&parent.path, |_, current| {
+            current.id == parent.id && Arc::ptr_eq(current, parent)
+        });
+        if removed.is_none() {
+            let _ = executor.cancel_prelogical(parent, &ticket);
+            return Ok(());
+        }
+        self.remove_inventory(&parent.path, parent.id);
+        if executor.release_logical(parent, &ticket) {
+            return Ok(());
+        }
+
+        // Release can lose only to shutdown/stale state. Restore exactly this
+        // fenced tombstone (never a replacement), then settle the reservation.
+        self.restore_exact_registration(parent);
+        let _ = executor.cancel_prelogical(parent, &ticket);
+        Err(std::io::Error::other(
+            "retirement cascade logical release was cancelled",
+        ))
+    }
+
+    #[cfg(test)]
+    fn retry_soft_parent_collection_for_test(
+        &self,
+        parent: &Arc<StreamState>,
+    ) -> std::io::Result<()> {
+        self.admit_soft_parent_collection(parent)
     }
 
     pub fn create(
@@ -1913,6 +2021,7 @@ impl Store {
             fenced: AtomicBool::new(false),
             inflight_appends: AtomicUsize::new(0),
             inflight_appends_zero: tokio::sync::Notify::new(),
+            parent_ref_released: AtomicBool::new(false),
             retirement_state: StdMutex::new(crate::retirement::RetirementState::default()),
             deletion_tx,
             shared: RwLock::new(Shared {
@@ -2004,6 +2113,10 @@ pub(crate) static DELETE_FAULT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex
 #[cfg(test)]
 static DELETE_FAULT_STREAM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 #[cfg(test)]
+static PARENT_RELEASE_FAIL_TARGET: std::sync::LazyLock<
+    StdMutex<Option<std::sync::Weak<StreamState>>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
 static DELETE_FAULT_TARGET: std::sync::LazyLock<StdMutex<Option<std::sync::Weak<StreamState>>>> =
     std::sync::LazyLock::new(|| StdMutex::new(None));
 
@@ -2011,6 +2124,24 @@ static DELETE_FAULT_TARGET: std::sync::LazyLock<StdMutex<Option<std::sync::Weak<
 pub(crate) fn set_delete_fault_for(stream: &Arc<StreamState>, fault: u8) {
     *DELETE_FAULT_TARGET.lock().unwrap() = Some(Arc::downgrade(stream));
     DELETE_FAULT_STREAM.store(fault, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn set_parent_release_fail_once_for(stream: &Arc<StreamState>) {
+    *PARENT_RELEASE_FAIL_TARGET.lock().unwrap() = Some(Arc::downgrade(stream));
+}
+
+#[cfg(test)]
+fn take_parent_release_fail_once_for(stream: &Arc<StreamState>) -> bool {
+    let mut target = PARENT_RELEASE_FAIL_TARGET.lock().unwrap();
+    let matches = target
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+        .is_some_and(|target| Arc::ptr_eq(&target, stream));
+    if matches {
+        *target = None;
+    }
+    matches
 }
 
 #[cfg(test)]
@@ -2886,6 +3017,235 @@ mod retirement_executor_lifecycle_tests {
 
         store.retirement_executor().unwrap().shutdown().await;
         drop(live);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    async fn retire_owner_and_wait(store: &Arc<Store>, stream: Arc<StreamState>) {
+        let ticket = match store.retire_explicit(stream).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("exact retirement must own its stream"),
+        };
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+    }
+
+    async fn wait_until_cascade_cleanup(store: &Store, stream: &StreamState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.registered_stream(&stream.path).is_some() || stream.file_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded cascade collection should remove the exact tombstone and files");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_parent_cascade_persists_each_decrement_and_collects_once() {
+        let (directory, store) = temporary_store("cascade-two-forks");
+        store.init_retirement_executor().unwrap();
+        let parent = match store.create("parent", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create parent"),
+        };
+        let first = match store
+            .create("first", stream_config(), Some(Arc::clone(&parent)), 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create first child"),
+        };
+        let second = match store
+            .create("second", stream_config(), Some(Arc::clone(&parent)), 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create second child"),
+        };
+        retire_owner_and_wait(&store, Arc::clone(&parent)).await;
+        assert!(parent.shared.read().unwrap().soft_deleted);
+        assert_eq!(parent.shared.read().unwrap().ref_count, 2);
+
+        retire_owner_and_wait(&store, first).await;
+        assert!(store.is_exact_registered(&parent));
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+        let persisted: Meta =
+            serde_json::from_slice(&std::fs::read(meta_path(&parent.file_path)).unwrap()).unwrap();
+        assert_eq!(persisted.ref_count, 1);
+
+        retire_owner_and_wait(&store, second).await;
+        wait_until_cascade_cleanup(&store, &parent).await;
+        assert!(!parent.file_path.exists());
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(parent);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_parent_cascade_never_removes_a_replacement_identity_or_inventory() {
+        let (directory, store) = temporary_store("cascade-replacement");
+        store.init_retirement_executor().unwrap();
+        let parent = match store.create("parent", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create parent"),
+        };
+        let child = match store
+            .create("child", stream_config(), Some(Arc::clone(&parent)), 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create child"),
+        };
+        retire_owner_and_wait(&store, Arc::clone(&parent)).await;
+        store.streams.remove_if("parent", |_, current| {
+            current.id == parent.id && Arc::ptr_eq(current, &parent)
+        });
+        let replacement = match store.create("parent", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create replacement"),
+        };
+
+        retire_owner_and_wait(&store, child).await;
+        assert!(Arc::ptr_eq(
+            store.registered_stream("parent").as_ref().unwrap(),
+            &replacement
+        ));
+        let (_, entries, _) = store.inventory_page(None, None, 10).unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path == "parent" && entry.stream_id == replacement.id));
+        assert!(
+            parent.file_path.exists(),
+            "stale old Arc is not hard-collected"
+        );
+        assert!(replacement.file_path.exists());
+
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(replacement);
+        drop(parent);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_parent_cascade_advances_one_bounded_job_per_level() {
+        let (directory, store) = temporary_store("cascade-chain");
+        store.init_retirement_executor().unwrap();
+        let root = match store.create("root", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create root"),
+        };
+        let middle = match store
+            .create("middle", stream_config(), Some(Arc::clone(&root)), 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create middle"),
+        };
+        let leaf = match store
+            .create("leaf", stream_config(), Some(Arc::clone(&middle)), 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create leaf"),
+        };
+        retire_owner_and_wait(&store, Arc::clone(&root)).await;
+        retire_owner_and_wait(&store, Arc::clone(&middle)).await;
+        retire_owner_and_wait(&store, leaf).await;
+        wait_until_cascade_cleanup(&store, &middle).await;
+        wait_until_cascade_cleanup(&store, &root).await;
+        assert!(!middle.file_path.exists());
+        assert!(!root.file_path.exists());
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(middle);
+        drop(root);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_cleanup_retry_does_not_double_decrement_its_parent() {
+        let _fault_guard = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = temporary_store("cascade-retry");
+        let config = crate::retirement::RetirementConfig {
+            retry_base: Duration::ZERO,
+            ..crate::retirement::RetirementConfig::default()
+        };
+        store.init_retirement_executor_for_test(config).unwrap();
+        let parent = match store.create("parent", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create parent"),
+        };
+        let child = match store
+            .create("child", stream_config(), Some(Arc::clone(&parent)), 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create child"),
+        };
+        retire_owner_and_wait(&store, Arc::clone(&parent)).await;
+        set_parent_release_fail_once_for(&child);
+        let ticket = match store.retire_explicit(child).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("child retirement owns cleanup"),
+        };
+        assert_eq!(
+            ticket.wait_first_attempt().await,
+            crate::retirement::FirstAttemptCompletion::Failed
+        );
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        wait_until_cascade_cleanup(&store, &parent).await;
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+        *PARENT_RELEASE_FAIL_TARGET.lock().unwrap() = None;
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(parent);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn saturated_cascade_retains_exact_tombstone_for_later_collection() {
+        let (directory, store) = temporary_store("cascade-saturated");
+        let config = crate::retirement::RetirementConfig {
+            queue_capacity: 1,
+            ..crate::retirement::RetirementConfig::default()
+        };
+        store.init_retirement_executor_for_test(config).unwrap();
+        let parent = match store.create("parent", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create parent"),
+        };
+        let child = match store
+            .create("child", stream_config(), Some(Arc::clone(&parent)), 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create child"),
+        };
+        retire_owner_and_wait(&store, Arc::clone(&parent)).await;
+        retire_owner_and_wait(&store, child).await;
+        assert!(store.is_exact_registered(&parent));
+        assert!(parent.fenced.load(Ordering::Acquire));
+        assert!(parent.shared.read().unwrap().soft_deleted);
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+        let persisted: Meta =
+            serde_json::from_slice(&std::fs::read(meta_path(&parent.file_path)).unwrap()).unwrap();
+        assert!(persisted.soft_deleted);
+        assert_eq!(persisted.ref_count, 0);
+
+        store
+            .retry_soft_parent_collection_for_test(&parent)
+            .unwrap();
+        wait_until_cascade_cleanup(&store, &parent).await;
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(parent);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }
