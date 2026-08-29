@@ -2852,6 +2852,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_a_stream_fences_its_wake_and_allows_the_next_stream_to_wake() {
+        let _fault_guard = crate::store::DELETE_FAULT_LOCK.lock().await;
         let _guard = DurabilityGuard::memory();
         let (store, dir) = test_store("delete-wake");
         create_json_stream(&store, "/root/wake/pool").await;
@@ -2915,6 +2916,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_an_explicit_stream_does_not_leave_phantom_pending_work() {
+        let _fault_guard = crate::store::DELETE_FAULT_LOCK.lock().await;
         let _guard = DurabilityGuard::memory();
         let (store, dir) = test_store("delete-explicit");
         create_json_stream(&store, "/root/wake/pool").await;
@@ -3180,6 +3182,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_an_unrelated_link_does_not_fence_a_claimed_worker() {
+        let _fault_guard = crate::store::DELETE_FAULT_LOCK.lock().await;
         let _guard = DurabilityGuard::memory();
         let (store, dir) = test_store("delete-while-claimed");
         create_json_stream(&store, "/root/wake/pool").await;
@@ -3266,6 +3269,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_pull_wake_delivery_retries_after_the_wake_stream_returns() {
+        let _fault_guard = crate::store::DELETE_FAULT_LOCK.lock().await;
         let _guard = DurabilityGuard::memory();
         let (store, dir) = test_store("retry-wake");
         create_json_stream(&store, "/root/wake/pool").await;

@@ -617,6 +617,7 @@ pub struct InventoryEntry {
     pub closed: bool,
     pub deleted: bool,
     pub durable_bytes: u64,
+    stream_id: u64,
 }
 
 struct InventoryProjection {
@@ -634,14 +635,39 @@ pub enum CreateResult {
     Conflict,
 }
 
+/// Local cleanup durability requested by the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalCleanupMode {
+    /// An acknowledged DELETE: make every successful local unlink durable.
+    ExplicitDelete,
+    /// Lazy expiry: unlink synchronously, but permit crash resurrection before
+    /// the directory entry is synced.
+    Expiry,
+}
+
+/// Files reclaimed by one synchronous local cleanup attempt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LocalCleanupOutcome {
+    pub(crate) reclaimed_local_bytes: u64,
+}
+
 impl Store {
     fn publish_inventory(&self, st: &StreamState) {
+        // Keep the registry shard locked through projection publication. A
+        // replacement cannot install between this identity check and the write.
+        let Some(current) = self.streams.get(&st.path) else {
+            return;
+        };
+        if current.id != st.id {
+            return;
+        }
         let s = st.shared.read().unwrap();
         let entry = InventoryEntry {
             path: st.path.clone(),
             closed: s.closed_durable,
             deleted: s.soft_deleted,
             durable_bytes: s.durable_tail,
+            stream_id: st.id,
         };
         let mut inventory = self.inventory.write().unwrap();
         inventory.entries.insert(entry.path.clone(), entry);
@@ -662,6 +688,7 @@ impl Store {
                     closed: shared.closed_durable,
                     deleted: shared.soft_deleted,
                     durable_bytes: shared.durable_tail,
+                    stream_id: stream.id,
                 },
             );
         }
@@ -669,9 +696,14 @@ impl Store {
         inventory.entries = entries;
         inventory.generation = inventory.generation.wrapping_add(1);
     }
-    fn remove_inventory(&self, path: &str) {
+    fn remove_inventory(&self, path: &str, expected_id: u64) {
         let mut inventory = self.inventory.write().unwrap();
-        if inventory.entries.remove(path).is_some() {
+        if inventory
+            .entries
+            .get(path)
+            .is_some_and(|entry| entry.stream_id == expected_id)
+        {
+            inventory.entries.remove(path);
             inventory.generation = inventory.generation.wrapping_add(1);
         }
     }
@@ -1177,37 +1209,43 @@ impl Store {
             return Some(st);
         }
         if st.is_expired() {
-            // Expiry is a removal too: retain the inventory projection until
-            // unlink + parent fsync succeeds, just like an acknowledged DELETE.
-            let _ = self.delete_or_soft_delete_durable(&st);
+            // Expiry retains the projection until synchronous local unlink
+            // succeeds; unlike an acknowledged DELETE it does not sync the
+            // parent directory, so a crash may resurrect the old incarnation.
+            let _ = self.delete_or_soft_delete_expiry(&st);
             return None;
         }
         Some(st)
     }
 
-    /// Hard-delete when nothing references the stream; soft-delete otherwise.
-    ///
-    /// NON-durable, detached variant for the expiry sweep on the read path: the
-    /// on-disk removals / soft-meta write run on a fire-and-forget blocking
-    /// task, so a crash can undo them (an expired stream re-expires on the next
-    /// access — harmless). The DELETE handler must NOT use this: an acked
-    /// DELETE undone by a crash resurrects the stream with all its data — use
-    /// [`Store::delete_or_soft_delete_durable`] there.
-    #[allow(dead_code)]
-    pub fn delete_or_soft_delete(&self, st: &Arc<StreamState>) {
-        let _ = self.delete_impl(st, false);
+    /// Remove an expired stream synchronously without syncing the parent
+    /// directory. A crash can resurrect its unlinked files, which is acceptable
+    /// for lazy expiry; I/O errors are still returned to the caller.
+    pub(crate) fn delete_or_soft_delete_expiry(
+        &self,
+        st: &Arc<StreamState>,
+    ) -> std::io::Result<LocalCleanupOutcome> {
+        self.delete_impl(st, LocalCleanupMode::Expiry)
     }
 
-    /// [`Store::delete_or_soft_delete`] with the DELETE-ack durability contract:
+    /// Hard-delete when nothing references the stream; soft-delete otherwise,
+    /// with the DELETE-ack durability contract:
     /// the file + sidecar unlinks (and their parent-directory entry) — or the
     /// soft-delete meta flag — are durable on disk before this returns, so a
     /// post-ack crash can never resurrect the stream. Synchronous file I/O +
     /// fsync: call from a blocking context.
-    pub fn delete_or_soft_delete_durable(&self, st: &Arc<StreamState>) -> std::io::Result<()> {
-        self.delete_impl(st, true)
+    pub fn delete_or_soft_delete_durable(
+        &self,
+        st: &Arc<StreamState>,
+    ) -> std::io::Result<LocalCleanupOutcome> {
+        self.delete_impl(st, LocalCleanupMode::ExplicitDelete)
     }
 
-    fn delete_impl(&self, st: &Arc<StreamState>, durable: bool) -> std::io::Result<()> {
+    fn delete_impl(
+        &self,
+        st: &Arc<StreamState>,
+        mode: LocalCleanupMode,
+    ) -> std::io::Result<LocalCleanupOutcome> {
         let soft = {
             let mut s = st.shared.write().unwrap();
             if s.ref_count > 0 {
@@ -1218,56 +1256,125 @@ impl Store {
             }
         };
         if soft {
-            if durable {
-                #[cfg(test)]
-                if DELETE_FAULT.load(Ordering::Relaxed) == 1 {
-                    st.shared.write().unwrap().soft_deleted = false;
-                    return Err(std::io::Error::other(
-                        "injected soft-delete metadata failure",
-                    ));
-                }
-                if let Err(error) = write_meta_sync(st, true) {
-                    st.shared.write().unwrap().soft_deleted = false;
-                    return Err(error);
-                }
-                self.publish_inventory(st);
-            } else {
-                let st2 = st.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = write_meta_sync(&st2, true);
-                });
+            #[cfg(test)]
+            if DELETE_FAULT.load(Ordering::Relaxed) == 1 {
+                st.shared.write().unwrap().soft_deleted = false;
+                return Err(std::io::Error::other(
+                    "injected soft-delete metadata failure",
+                ));
             }
+            if let Err(error) = write_meta_sync(st, true) {
+                st.shared.write().unwrap().soft_deleted = false;
+                return Err(error);
+            }
+            self.publish_inventory(st);
+            Ok(LocalCleanupOutcome::default())
         } else {
             // Reclaim this stream's offloaded segments (remote objects + any
             // staged local chunk files) — safe only here, on a true hard delete
             // with no remaining fork references.
             self.gc_remote_segments(st);
-            let fp = st.file_path.clone();
-            if durable {
-                #[cfg(test)]
-                if DELETE_FAULT.load(Ordering::Relaxed) == 2 {
-                    return Err(std::io::Error::other(
-                        "injected hard-delete durability failure",
-                    ));
-                }
-                // Both unlinks live in the same directory; one dir fsync makes
-                // them crash-durable together.
-                let _ = std::fs::remove_file(meta_path(&fp));
-                let _ = std::fs::remove_file(&fp);
-                fsync_parent_dir(&fp)?;
-                self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
-                self.remove_inventory(&st.path);
-            } else {
-                tokio::task::spawn_blocking(move || {
-                    let _ = std::fs::remove_file(meta_path(&fp));
-                    let _ = std::fs::remove_file(fp);
-                });
-                self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
-                self.remove_inventory(&st.path);
+            let outcome = self.cleanup_local_stream(st, mode)?;
+            let removed = self.streams.remove_if(&st.path, |_, current| {
+                current.id == st.id && Arc::ptr_eq(current, st)
+            });
+            if removed.is_some() {
+                self.remove_inventory(&st.path, st.id);
+                self.release_parent(st);
             }
-            self.release_parent(st);
+            Ok(outcome)
         }
-        Ok(())
+    }
+
+    /// Synchronously reclaim local files for this exact stream incarnation.
+    /// NotFound is an idempotent retry; all other metadata, unlink, and sync
+    /// errors are surfaced without changing registry or inventory state.
+    pub(crate) fn cleanup_local_stream(
+        &self,
+        st: &StreamState,
+        mode: LocalCleanupMode,
+    ) -> std::io::Result<LocalCleanupOutcome> {
+        #[cfg(test)]
+        if DELETE_FAULT.load(Ordering::Relaxed) == 2 {
+            return Err(std::io::Error::other("injected local cleanup failure"));
+        }
+
+        let mut paths = HashSet::from([st.file_path.clone(), meta_path(&st.file_path)]);
+        {
+            let manifest = st.tier.manifest.lock().unwrap();
+            paths.extend(
+                manifest
+                    .segments
+                    .iter()
+                    .filter_map(|segment| match &segment.placement {
+                        crate::tier::Placement::Local(path) => Some(path.clone()),
+                        crate::tier::Placement::Remote(_) => None,
+                    }),
+            );
+        }
+        let file_prefix = format!(
+            "{}.seg.",
+            st.file_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("stream")
+        );
+        match std::fs::read_dir(self.segments_dir()) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(&file_prefix))
+                    {
+                        paths.insert(entry.path());
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let _meta_lock = st
+            .meta_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut outcome = LocalCleanupOutcome::default();
+        for path in &paths {
+            let bytes = match std::fs::metadata(path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            match std::fs::remove_file(path) {
+                Ok(()) => outcome.reclaimed_local_bytes += bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        if mode == LocalCleanupMode::ExplicitDelete {
+            #[cfg(test)]
+            if DELETE_FAULT.load(Ordering::Relaxed) == 3 {
+                return Err(std::io::Error::other(
+                    "injected parent-directory sync failure",
+                ));
+            }
+            let mut synced_dirs = HashSet::new();
+            for path in &paths {
+                if let Some(parent) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+                    if synced_dirs.insert(parent.to_path_buf()) {
+                        match File::open(parent) {
+                            Ok(directory) => directory.sync_all()?,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(outcome)
     }
 
     /// Decrement the parent's fork refcount; cascade-collect soft-deleted parents
@@ -1439,6 +1546,8 @@ impl Store {
 
 #[cfg(test)]
 static DELETE_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+pub(crate) static DELETE_FAULT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn config_matches(existing: &StreamState, requested: &StreamConfig) -> bool {
     let ex = &existing.config;
@@ -3044,6 +3153,7 @@ mod tier_tests {
     /// `deleted`-flag coordination with seal/offload.
     #[tokio::test]
     async fn hard_delete_reclaims_offloaded_segments() {
+        let _fault_guard = DELETE_FAULT_LOCK.lock().await;
         fn count_files(root: &std::path::Path) -> usize {
             let mut n = 0;
             if let Ok(rd) = std::fs::read_dir(root) {
@@ -3082,7 +3192,7 @@ mod tier_tests {
         );
 
         // Hard delete (ref_count == 0 → hard delete → gc_remote_segments).
-        store.delete_or_soft_delete(&st);
+        store.delete_or_soft_delete_durable(&st).unwrap();
 
         // The GC runs as a detached task — wait for it to reclaim everything.
         let mut waited = 0;
@@ -3233,6 +3343,7 @@ mod meta_sweep_tests {
     /// resurrected by a later sweep (the file unlinks already happened).
     #[tokio::test]
     async fn sweep_skips_hard_deleted_stream() {
+        let _fault_guard = DELETE_FAULT_LOCK.lock().await;
         let dir = tmp_dir("deleted");
         let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
         let st = create(&store, "s");
@@ -3255,6 +3366,7 @@ mod meta_sweep_tests {
 
     #[test]
     fn durable_delete_faults_preserve_inventory_publication_order() {
+        let _fault_guard = DELETE_FAULT_LOCK.blocking_lock();
         let dir = tmp_dir("inventory-delete-fault");
         let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
         let soft = create(&store, "soft");
@@ -3281,7 +3393,8 @@ mod meta_sweep_tests {
     }
 
     #[test]
-    fn expiry_keeps_inventory_until_durable_unlink_succeeds() {
+    fn expiry_keeps_inventory_until_local_unlink_succeeds() {
+        let _fault_guard = DELETE_FAULT_LOCK.blocking_lock();
         let dir = tmp_dir("expiry-delete-fault");
         let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
         let mut config = octet_cfg();
@@ -3299,6 +3412,161 @@ mod meta_sweep_tests {
         assert!(store.get("expired").is_none());
         let (_, entries, _) = store.inventory_page(None, None, 10).unwrap();
         assert!(!entries.iter().any(|entry| entry.path == "expired"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inventory_identity_stale_state_cannot_publish_or_remove_replacement() {
+        let _fault_guard = DELETE_FAULT_LOCK.blocking_lock();
+        let dir = tmp_dir("identity-replacement");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let old = create(&store, "same");
+        let old_id = old.id;
+        store.streams.remove_if("same", |_, current| {
+            current.id == old.id && Arc::ptr_eq(current, &old)
+        });
+        let replacement = create(&store, "same");
+        let (generation, entries, _) = store.inventory_page(None, None, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].stream_id, replacement.id);
+
+        store.publish_inventory_tail(&old);
+        assert_eq!(store.inventory_page(None, None, 10).unwrap().0, generation);
+
+        store.delete_or_soft_delete_durable(&old).unwrap();
+        let (after_delete, entries, _) = store.inventory_page(None, None, 10).unwrap();
+        assert_eq!(after_delete, generation, "identity mismatch is a no-op");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "same");
+        assert_eq!(entries[0].stream_id, replacement.id);
+        assert_ne!(old_id, replacement.id);
+        assert!(replacement.file_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn physical_cleanup_reclaims_exact_local_bytes_and_is_idempotent() {
+        let _fault_guard = DELETE_FAULT_LOCK.blocking_lock();
+        let dir = tmp_dir("cleanup-bytes");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let st = create(&store, "bytes");
+        std::fs::write(&st.file_path, b"data-file").unwrap();
+        let meta = meta_path(&st.file_path);
+        let segment_dir = store.segments_dir();
+        std::fs::create_dir_all(&segment_dir).unwrap();
+        let segment = segment_dir.join(format!(
+            "{}.seg.0000000000000000",
+            st.file_path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&segment, b"staged-segment").unwrap();
+        let expected = std::fs::metadata(&st.file_path).unwrap().len()
+            + std::fs::metadata(&meta).unwrap().len()
+            + std::fs::metadata(&segment).unwrap().len();
+
+        let outcome = store
+            .cleanup_local_stream(&st, LocalCleanupMode::ExplicitDelete)
+            .unwrap();
+        assert_eq!(outcome.reclaimed_local_bytes, expected);
+        assert!(!st.file_path.exists());
+        assert!(!meta.exists());
+        assert!(!segment.exists());
+        assert_eq!(
+            store
+                .cleanup_local_stream(&st, LocalCleanupMode::ExplicitDelete)
+                .unwrap()
+                .reclaimed_local_bytes,
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn physical_cleanup_explicit_sync_failure_retains_inventory_until_retry() {
+        let _fault_guard = DELETE_FAULT_LOCK.blocking_lock();
+        let dir = tmp_dir("cleanup-sync-failure");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let st = create(&store, "sync");
+        DELETE_FAULT.store(3, Ordering::Relaxed);
+        assert!(store.delete_or_soft_delete_durable(&st).is_err());
+        assert!(store.get("sync").is_some());
+        assert!(store
+            .inventory_page(None, None, 10)
+            .unwrap()
+            .1
+            .iter()
+            .any(|entry| entry.path == "sync"));
+
+        assert!(store.delete_or_soft_delete_durable(&st).is_err());
+        assert!(store
+            .inventory_page(None, None, 10)
+            .unwrap()
+            .1
+            .iter()
+            .any(|entry| entry.path == "sync"));
+        DELETE_FAULT.store(0, Ordering::Relaxed);
+        store.delete_or_soft_delete_durable(&st).unwrap();
+        assert!(store.get("sync").is_none());
+        assert!(!store
+            .inventory_page(None, None, 10)
+            .unwrap()
+            .1
+            .iter()
+            .any(|entry| entry.path == "sync"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn physical_cleanup_expiry_propagates_io_and_skips_directory_sync() {
+        let _fault_guard = DELETE_FAULT_LOCK.blocking_lock();
+        let dir = tmp_dir("cleanup-expiry");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let failing = create(&store, "failing");
+        DELETE_FAULT.store(2, Ordering::Relaxed);
+        assert!(store
+            .cleanup_local_stream(&failing, LocalCleanupMode::Expiry)
+            .is_err());
+        assert!(failing.file_path.exists());
+        DELETE_FAULT.store(0, Ordering::Relaxed);
+
+        let expiry = create(&store, "expiry");
+        DELETE_FAULT.store(3, Ordering::Relaxed);
+        let outcome = store
+            .cleanup_local_stream(&expiry, LocalCleanupMode::Expiry)
+            .unwrap();
+        DELETE_FAULT.store(0, Ordering::Relaxed);
+        assert!(outcome.reclaimed_local_bytes > 0);
+        assert!(!expiry.file_path.exists());
+        assert!(!meta_path(&expiry.file_path).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn physical_cleanup_soft_delete_reclaims_no_local_bytes() {
+        let _fault_guard = DELETE_FAULT_LOCK.blocking_lock();
+        let dir = tmp_dir("cleanup-soft");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let st = create(&store, "soft");
+        st.shared.write().unwrap().ref_count = 1;
+
+        assert_eq!(
+            store
+                .delete_or_soft_delete_durable(&st)
+                .unwrap()
+                .reclaimed_local_bytes,
+            0
+        );
+        assert!(st.file_path.exists());
+        assert!(store
+            .inventory_page(None, None, 10)
+            .unwrap()
+            .1
+            .iter()
+            .any(|entry| entry.path == "soft" && entry.deleted));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

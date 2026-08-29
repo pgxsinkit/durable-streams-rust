@@ -2598,7 +2598,7 @@ async fn handle_delete(store: Arc<Store>, path: String) -> Resp {
     let store2 = Arc::clone(&store);
     let st2 = Arc::clone(&st);
     match tokio::task::spawn_blocking(move || store2.delete_or_soft_delete_durable(&st2)).await {
-        Ok(Ok(())) => {
+        Ok(Ok(_)) => {
             store
                 .subscriptions
                 .clone()
