@@ -680,6 +680,14 @@ pub(crate) enum RequestLiveness {
     Missing,
 }
 
+/// Liveness decision that must be made while the stream appender is locked.
+pub(crate) enum AppenderLiveness {
+    Live,
+    Gone,
+    Missing,
+    Expired,
+}
+
 impl Store {
     fn publish_inventory(&self, st: &StreamState) {
         // Keep the registry shard locked through projection publication. A
@@ -993,28 +1001,44 @@ impl Store {
         touch_ttl: bool,
     ) -> RequestLiveness {
         let appender = stream.appender.lock().await;
-        if !self.is_exact_registered(&stream) {
-            return RequestLiveness::Missing;
-        }
-        if stream.shared.read().unwrap().soft_deleted {
-            return RequestLiveness::Gone;
-        }
-        if stream.fenced.load(Ordering::Acquire) {
-            return RequestLiveness::Missing;
-        }
-
         let now = SystemTime::now();
-        if stream.is_expired_at(now) {
-            drop(appender);
-            let _ = self.retire_expiry(stream).await;
-            return RequestLiveness::Missing;
+        match self.liveness_while_appender_locked(&stream, now) {
+            AppenderLiveness::Missing => RequestLiveness::Missing,
+            AppenderLiveness::Gone => RequestLiveness::Gone,
+            AppenderLiveness::Expired => {
+                drop(appender);
+                let _ = self.retire_expiry(stream).await;
+                RequestLiveness::Missing
+            }
+            AppenderLiveness::Live => {
+                if touch_ttl && stream.config.ttl_seconds.is_some() {
+                    stream.touch_at(now);
+                    self.mark_meta_dirty(&stream);
+                }
+                drop(appender);
+                RequestLiveness::Live(stream)
+            }
         }
-        if touch_ttl && stream.config.ttl_seconds.is_some() {
-            stream.touch_at(now);
-            self.mark_meta_dirty(&stream);
+    }
+
+    /// The caller holds `stream.appender`, serializing this decision against
+    /// fencing and all accepted append/close mutations.
+    pub(crate) fn liveness_while_appender_locked(
+        &self,
+        stream: &Arc<StreamState>,
+        now: SystemTime,
+    ) -> AppenderLiveness {
+        if !self.is_exact_registered(stream) {
+            AppenderLiveness::Missing
+        } else if stream.shared.read().unwrap().soft_deleted {
+            AppenderLiveness::Gone
+        } else if stream.fenced.load(Ordering::Acquire) {
+            AppenderLiveness::Missing
+        } else if stream.is_expired_at(now) {
+            AppenderLiveness::Expired
+        } else {
+            AppenderLiveness::Live
         }
-        drop(appender);
-        RequestLiveness::Live(stream)
     }
 
     /// Retire one exact registered stream incarnation. This only linearizes
@@ -1027,7 +1051,10 @@ impl Store {
         self.retire(stream, LocalCleanupMode::ExplicitDelete).await
     }
 
-    async fn retire_expiry(self: &Arc<Self>, stream: Arc<StreamState>) -> ExplicitRetirementResult {
+    pub(crate) async fn retire_expiry(
+        self: &Arc<Self>,
+        stream: Arc<StreamState>,
+    ) -> ExplicitRetirementResult {
         self.retire(stream, LocalCleanupMode::Expiry).await
     }
 
@@ -1067,6 +1094,10 @@ impl Store {
         {
             let appender = stream.appender.lock().await;
             if !self.is_exact_live(&stream) || stream.fenced.load(Ordering::Acquire) {
+                drop(appender);
+                return self.cancel_retirement(&executor, &stream, ticket);
+            }
+            if mode == LocalCleanupMode::Expiry && !stream.is_expired_at(SystemTime::now()) {
                 drop(appender);
                 return self.cancel_retirement(&executor, &stream, ticket);
             }

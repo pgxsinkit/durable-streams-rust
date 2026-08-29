@@ -1203,7 +1203,7 @@ async fn handle_append_inner(
     // Load-telemetry probe: bumps the in-flight gauge and records service time on
     // drop (covers every return path). No-op unless `--server-stats` is on.
     let _probe = crate::srvstats::AppendProbe::start();
-    let st = match store.get(&path) {
+    let st = match store.registered_stream(&path) {
         Some(s) => s,
         None => return (text_response(404, "stream not found"), Conflict, false),
     };
@@ -1213,9 +1213,32 @@ async fn handle_append_inner(
             return ($resp, $oc, is_json)
         };
     }
-    if st.shared.read().unwrap().soft_deleted {
-        ret!(gone(), Conflict);
+    // Serialize per stream: producer validation + write + state update under one
+    // lock. Time the wait separately — lock contention is a key bottleneck.
+    let lock_t0 = crate::telemetry::Timer::start();
+    let srv_lock_t0 = std::time::Instant::now();
+    let mut ap = st.appender.lock().await;
+    crate::telemetry::record_append_lock_wait(lock_t0.elapsed_secs());
+    crate::srvstats::record_applock_wait(srv_lock_t0.elapsed());
+
+    match store.liveness_while_appender_locked(&st, SystemTime::now()) {
+        AppenderLiveness::Live => {}
+        AppenderLiveness::Gone => ret!(gone(), Conflict),
+        AppenderLiveness::Missing => ret!(text_response(404, "stream not found"), Conflict),
+        AppenderLiveness::Expired => {
+            drop(ap);
+            let _ = store.retire_expiry(st).await;
+            ret!(text_response(404, "stream not found"), Conflict);
+        }
     }
+
+    // Keep the accepted liveness guard through durability and the complete
+    // response fence, including duplicate and close-only branches below.
+    let _inflight_append = match InflightAppendGuard::begin(&st, &ap) {
+        Some(guard) => guard,
+        None => ret!(text_response(404, "stream not found"), Conflict),
+    };
+
     let producer = match parse_producer_headers(&req) {
         Ok(p) => p,
         Err(m) => ret!(text_response(400, m), Conflict),
@@ -1223,7 +1246,6 @@ async fn handle_append_inner(
     let close_req = header_is_true(&req, H_CLOSED);
     let seq_header = header_str(&req, H_SEQ).map(|s| s.to_string());
     let req_ct = header_str(&req, "content-type").map(|s| s.to_string());
-
     let body = req.body.clone();
 
     if body.is_empty() && !close_req {
@@ -1232,16 +1254,16 @@ async fn handle_append_inner(
     if !body.is_empty() {
         match &req_ct {
             None => ret!(text_response(400, "missing Content-Type"), Conflict),
-            Some(ct) => {
-                if media_type(ct) != media_type(&st.config.content_type) {
-                    // closed check has precedence over content-type mismatch
-                    let t = st.tail();
-                    if t.closed && !close_req {
-                        ret!(closed_conflict(t.bytes), Closed);
-                    }
-                    ret!(text_response(409, "content-type mismatch"), Conflict);
+            Some(ct) if media_type(ct) != media_type(&st.config.content_type) => {
+                // Closed still takes precedence over a type mismatch, after the
+                // request has won its lifecycle decision.
+                let t = st.tail();
+                if t.closed && !close_req {
+                    ret!(closed_conflict(t.bytes), Closed);
                 }
+                ret!(text_response(409, "content-type mismatch"), Conflict);
             }
+            Some(_) => {}
         }
     }
 
@@ -1253,18 +1275,6 @@ async fn handle_append_inner(
             Err(m) => ret!(text_response(400, m), Conflict),
         }
     };
-
-    // Serialize per stream: producer validation + write + state update under one
-    // lock. Time the wait separately — lock contention is a key bottleneck.
-    let lock_t0 = crate::telemetry::Timer::start();
-    let srv_lock_t0 = std::time::Instant::now();
-    let mut ap = st.appender.lock().await;
-    crate::telemetry::record_append_lock_wait(lock_t0.elapsed_secs());
-    crate::srvstats::record_applock_wait(srv_lock_t0.elapsed());
-
-    if st.fenced.load(std::sync::atomic::Ordering::Acquire) {
-        ret!(text_response(404, "stream not found"), Conflict);
-    }
 
     // Closed checks (precedence: closed → seq regression → gap).
     {
@@ -1385,11 +1395,6 @@ async fn handle_append_inner(
             }
         }
     }
-
-    let _inflight_append = match InflightAppendGuard::begin(&st, &ap) {
-        Some(guard) => guard,
-        None => ret!(text_response(404, "stream not found"), Conflict),
-    };
 
     // Write + state updates. `new_tail` carries the writer tail to publish to
     // readers only AFTER durability (below), so a live reader never observes
@@ -3287,11 +3292,15 @@ mod explicit_delete_handler_tests {
 #[cfg(test)]
 mod append_fence_tests {
     use super::*;
-    use crate::store::{CreateResult, Store, StreamConfig};
+    use crate::retirement::{RetirementConfig, TerminalCleanupCompletion};
+    use crate::store::{
+        CreateResult, ExplicitRetirementResult, InflightAppendGuard, ProducerState, Store,
+        StreamConfig,
+    };
     use crate::tier::TierConfig;
     use crate::wal::walset::WalSet;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::SystemTime;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -3333,6 +3342,42 @@ mod append_fence_tests {
             query: None,
             headers: vec![("content-type".into(), "application/octet-stream".into())],
             body: Bytes::from_static(body),
+        }
+    }
+
+    fn close(path: &str) -> Req {
+        Req {
+            method: Method::Post,
+            path: path.into(),
+            query: None,
+            headers: vec![(H_CLOSED.into(), "true".into())],
+            body: Bytes::new(),
+        }
+    }
+
+    async fn wait_fenced(state: &StreamState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.fenced.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement must fence the stream");
+    }
+
+    async fn wait_removed(state: &StreamState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.file_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded cleanup must remove the stream");
+    }
+
+    async fn shutdown(store: &Store) {
+        if let Some(executor) = store.retirement_executor() {
+            executor.shutdown().await;
         }
     }
 
@@ -3471,6 +3516,284 @@ mod append_fence_tests {
         assert!(state.appender.try_lock().is_ok());
         assert_eq!(state.inflight_appends.load(Ordering::Acquire), 0);
 
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_expiry_body_retires_without_mutation() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let directory = directory("expired-body");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        store.init_retirement_executor().unwrap();
+        let state = match store.create("expired", config(Some(1)), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        state.shared.write().unwrap().last_access = UNIX_EPOCH;
+
+        assert_eq!(
+            handle(store.clone(), post("expired", b"x")).await.status,
+            404
+        );
+        {
+            let shared = state.shared.read().unwrap();
+            assert_eq!(shared.last_access, UNIX_EPOCH);
+            assert_eq!(shared.tail, 0);
+            assert!(shared.producers.is_empty());
+            assert!(!shared.closed);
+        }
+        assert!(!state.meta_dirty.load(Ordering::Acquire));
+        assert!(state.fenced.load(Ordering::Acquire));
+        wait_removed(&state).await;
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_expiry_close_only_does_not_touch_or_close() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let directory = directory("expired-close");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        store.init_retirement_executor().unwrap();
+        let state = match store.create("expired", config(Some(1)), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        state.shared.write().unwrap().last_access = UNIX_EPOCH;
+
+        assert_eq!(handle(store.clone(), close("expired")).await.status, 404);
+        {
+            let shared = state.shared.read().unwrap();
+            assert_eq!(shared.last_access, UNIX_EPOCH);
+            assert!(!shared.closed);
+            assert!(!shared.closed_durable);
+        }
+        assert!(!state.meta_dirty.load(Ordering::Acquire));
+        wait_removed(&state).await;
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_expiry_precedes_duplicate_and_idempotent_close_success() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let directory = directory("expired-idempotency");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        store.init_retirement_executor().unwrap();
+        let duplicate = match store.create("duplicate", config(Some(1)), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        {
+            let mut shared = duplicate.shared.write().unwrap();
+            shared.last_access = UNIX_EPOCH;
+            shared.producers.insert(
+                "producer".into(),
+                ProducerState {
+                    epoch: 0,
+                    last_seq: 7,
+                },
+            );
+        }
+        let duplicate_request = Req {
+            method: Method::Post,
+            path: "duplicate".into(),
+            query: None,
+            headers: vec![
+                ("content-type".into(), "application/octet-stream".into()),
+                (H_PRODUCER_ID.into(), "producer".into()),
+                (H_PRODUCER_EPOCH.into(), "0".into()),
+                (H_PRODUCER_SEQ.into(), "7".into()),
+            ],
+            body: Bytes::from_static(b"x"),
+        };
+        assert_eq!(handle(store.clone(), duplicate_request).await.status, 404);
+
+        let closed = match store.create("closed", config(Some(1)), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        {
+            let mut shared = closed.shared.write().unwrap();
+            shared.last_access = UNIX_EPOCH;
+            shared.closed = true;
+            shared.closed_durable = true;
+        }
+        assert_eq!(handle(store.clone(), close("closed")).await.status, 404);
+        wait_removed(&duplicate).await;
+        wait_removed(&closed).await;
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_expiry_queue_full_has_no_direct_fallback() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let directory = directory("expired-queue-full");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        store
+            .init_retirement_executor_for_test(RetirementConfig {
+                queue_capacity: 1,
+                ..RetirementConfig::default()
+            })
+            .unwrap();
+        let first = match store.create("first", config(Some(1)), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        let second = match store.create("second", config(Some(1)), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        first.shared.write().unwrap().last_access = UNIX_EPOCH;
+        second.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let appender = first.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&first, &appender).unwrap();
+        drop(appender);
+        let owner_store = store.clone();
+        let owner = tokio::spawn(async move { handle(owner_store, post("first", b"x")).await });
+        wait_fenced(&first).await;
+
+        assert_eq!(
+            handle(store.clone(), post("second", b"x")).await.status,
+            404
+        );
+        assert!(!second.fenced.load(Ordering::Acquire));
+        assert!(second.file_path.exists());
+        drop(guard);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            404
+        );
+        wait_removed(&first).await;
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_liveness_is_decided_when_the_appender_lock_is_acquired() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let directory = directory("expiry-at-lock");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        store.init_retirement_executor().unwrap();
+        let state = match store.create("stream", config(Some(1)), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        let appender = state.appender.lock().await;
+        let waiting_store = store.clone();
+        let waiting =
+            tokio::spawn(async move { handle(waiting_store, post("stream", b"x")).await });
+        tokio::task::yield_now().await;
+        state.shared.write().unwrap().last_access = UNIX_EPOCH;
+        drop(appender);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            404
+        );
+        assert_eq!(state.tail().bytes, 0);
+        wait_removed(&state).await;
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_liveness_loses_to_a_fence_while_waiting_for_the_appender_lock() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let directory = directory("fence-at-lock");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        let state = match store.create("stream", config(None), None, 0).unwrap() {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        let appender = state.appender.lock().await;
+        let waiting_store = store.clone();
+        let waiting =
+            tokio::spawn(async move { handle(waiting_store, post("stream", b"x")).await });
+        tokio::task::yield_now().await;
+        state.fence_while_holding_appender(&appender);
+        drop(appender);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            404
+        );
+        assert_eq!(state.tail().bytes, 0);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expiry_retirement_rechecks_the_deadline_before_fencing() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let directory = directory("expiry-recheck");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        store.init_retirement_executor().unwrap();
+        let state = match store
+            .create("stream", config(Some(3_600)), None, 0)
+            .unwrap()
+        {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+        state.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let appender = state.appender.lock().await;
+        let retiring_store = store.clone();
+        let retiring_state = state.clone();
+        let retiring =
+            tokio::spawn(async move { retiring_store.retire_expiry(retiring_state).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.retirement_state().is_clean() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expiry admission must reserve its exact ticket");
+        state.shared.write().unwrap().last_access = SystemTime::now();
+        drop(appender);
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), retiring)
+                .await
+                .unwrap()
+                .unwrap(),
+            ExplicitRetirementResult::Cancelled(_)
+        ));
+        assert!(!state.fenced.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(
+            &store.registered_stream("stream").unwrap(),
+            &state
+        ));
+
+        let ticket = match store.retire_explicit(state.clone()).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("explicit retirement must remain unconditional"),
+        };
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        wait_removed(&state).await;
+        shutdown(&store).await;
         let _ = std::fs::remove_dir_all(directory);
     }
 }
