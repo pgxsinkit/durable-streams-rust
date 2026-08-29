@@ -152,6 +152,14 @@ impl WalSet {
         &self.shards[(fnv1a(stream_id) % self.n as u64) as usize]
     }
 
+    /// Remove one retired stable stream ID from its routed shard's checkpoint
+    /// maintenance residency. Store retirement wires this in a later slice;
+    /// this primitive intentionally does not alter WAL records or segments.
+    #[allow(dead_code)] // wired into Store retirement by x82l-b2
+    pub async fn forget_stream(&self, stream_id: u64) -> io::Result<()> {
+        self.shard_for(stream_id).forget_stream(stream_id).await
+    }
+
     /// The shards, for per-shard parallel recovery (spec §9). The sets of
     /// streams a shard owns are disjoint (`shard_for` routes deterministically),
     /// so replaying shards concurrently needs no cross-shard synchronization.
@@ -226,6 +234,8 @@ fn read_persisted_n(path: &Path) -> io::Result<Option<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{CreateResult, Store, StreamConfig};
+    use crate::tier::TierConfig;
     use std::path::PathBuf;
 
     fn tmp(tag: &str) -> PathBuf {
@@ -266,5 +276,60 @@ mod tests {
             WalSet::open(&d, Some(8), 8).is_err(),
             "mismatched --wal-shards rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn forget_stream_routes_only_to_the_stable_id_shard() {
+        let directory = tmp("forget-route");
+        let walset = WalSet::open(&directory, Some(2), 2).unwrap();
+        let store = Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap();
+        let config = StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        };
+        let retired = match store.create("retired", config.clone(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create retired stream"),
+        };
+        let retired_shard = Arc::clone(walset.shard_for(retired.id));
+        let survivor = (0..32)
+            .find_map(|candidate| {
+                match store
+                    .create(&format!("survivor-{candidate}"), config.clone(), None, 0)
+                    .unwrap()
+                {
+                    CreateResult::Created(stream)
+                        if !Arc::ptr_eq(walset.shard_for(stream.id), &retired_shard) =>
+                    {
+                        Some(stream)
+                    }
+                    CreateResult::Created(_) | CreateResult::Exists(_) | CreateResult::Conflict => {
+                        None
+                    }
+                }
+            })
+            .expect("two-shard routing must produce a distinct shard within 32 stable IDs");
+        let survivor_shard = Arc::clone(walset.shard_for(survivor.id));
+        assert!(
+            !Arc::ptr_eq(&retired_shard, &survivor_shard),
+            "test requires distinct routed shards"
+        );
+        retired_shard.register_dirty(retired.id, Arc::clone(&retired));
+        survivor_shard.register_dirty(survivor.id, Arc::clone(&survivor));
+        retired
+            .fenced
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        walset.forget_stream(retired.id).await.unwrap();
+
+        assert!(!retired_shard.is_dirty(retired.id));
+        assert!(survivor_shard.is_dirty(survivor.id));
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

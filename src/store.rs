@@ -2890,6 +2890,26 @@ pub fn write_meta_sync(st: &StreamState, durable: bool) -> std::io::Result<()> {
     write_meta_sync_while_holding_meta_lock(st, durable)
 }
 
+/// Flush a WAL-checkpoint deferred sidecar only while this identity is still
+/// unfenced. The shared metadata lock serializes with Store sweep and physical
+/// cleanup; a fenced stream's physical finalizer owns any authoritative durable
+/// tombstone write instead.
+pub(crate) fn flush_wal_checkpoint_meta(st: &StreamState) -> bool {
+    let _meta_lock = st
+        .meta_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if st.fenced.load(Ordering::Acquire) {
+        st.meta_dirty.store(false, Ordering::Release);
+        return false;
+    }
+    if !st.meta_dirty.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+    let _ = write_meta_sync_while_holding_meta_lock(st, false);
+    true
+}
+
 /// Writes a sidecar while the caller owns `st.meta_lock`.
 ///
 /// This intentionally does not inspect `fenced`: the physical soft-retirement

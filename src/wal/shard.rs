@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use super::codec::{encode_into, Record, RecordKind};
 use super::segment::{seg_path, FileSegment, SegmentWriter, SEGMENT_BYTES};
@@ -331,6 +331,12 @@ pub struct Shard {
     /// racing the drain sees a stale stream epoch and re-registers into the next
     /// interval's collection — no touched stream is ever dropped.
     dirty_epoch: AtomicU64,
+    /// Serializes every checkpoint-maintenance phase with retirement's future
+    /// `forget_stream` hand-off: dirty drain/capture through tail persistence,
+    /// recycle, and deferred sidecar flushing. This async mutex is deliberately
+    /// owned across `spawn_blocking`, so contending callers park their futures
+    /// instead of blocking a Tokio worker on a std mutex.
+    checkpoint_maintenance: Arc<AsyncMutex<()>>,
     /// Resident copy of the CUMULATIVE per-stream durable-tail map persisted at
     /// `<shard_dir>/tails` (task 11b). `None` until the first checkpoint needs it
     /// (then seeded from disk once); afterwards `persist_durable_tails` merges and
@@ -508,6 +514,7 @@ impl Shard {
             // Epoch starts at 1; StreamStates start at dirty_epoch 0, so the first
             // append on every stream registers it (0 != 1).
             dirty_epoch: AtomicU64::new(1),
+            checkpoint_maintenance: Arc::new(AsyncMutex::new(())),
             tails_cache: Mutex::new(None),
             stats: ShardStats::default(),
             #[cfg(test)]
@@ -801,6 +808,9 @@ impl Shard {
     /// (the hot path records nothing). `reserve_and_stage` stays ignorant of
     /// `StreamState`; the `StreamState` is needed solely by `checkpoint`.
     pub fn register_dirty(&self, _stream_id: u64, st: Arc<StreamState>) {
+        if st.fenced.load(Ordering::Acquire) {
+            return;
+        }
         let epoch = self.dirty_epoch.load(Ordering::Relaxed);
         // Hot path: already registered for the current checkpoint interval. Pure
         // relaxed loads + a branch — never touches the `dirty` lock.
@@ -827,7 +837,13 @@ impl Shard {
                 |ns| self.stats.record_dirty_lock_wait(ns),
                 || self.dirty.lock().unwrap(),
             );
-            g.push(st);
+            // A retirement can fence after the lock-free claim but before this
+            // rare transition acquires the Vec. Recheck while holding the same
+            // lock `forget_stream` drains so a fenced stream cannot reappear
+            // after its maintenance hand-off returns.
+            if !st.fenced.load(Ordering::Acquire) {
+                g.push(st);
+            }
         }
     }
 
@@ -854,6 +870,7 @@ impl Shard {
     ///
     /// Returns the `checkpoint_lsn` persisted.
     pub async fn checkpoint(self: &Arc<Self>) -> io::Result<u64> {
+        let maintenance = Arc::clone(&self.checkpoint_maintenance).lock_owned().await;
         // 1. Snapshot the recycle floor = the highest durably-acked lsn.
         let checkpoint_lsn = self.durable_lsn.load(Ordering::Acquire);
 
@@ -897,6 +914,10 @@ impl Shard {
         // checkpoint_lsn → recycle. Acks never gate on any of this.
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || -> io::Result<u64> {
+            // Keep the exclusion alive in the detached blocking body. If the
+            // awaiting checkpoint future is cancelled, it cannot release this
+            // guard while the body still owns dirty/tails/meta maintenance.
+            let _maintenance = maintenance;
             let result = Self::checkpoint_blocking(&this, &drained, checkpoint_lsn);
             if result.is_err() {
                 // A failed checkpoint must NOT drop the drained dirty set: these
@@ -915,6 +936,34 @@ impl Shard {
         })
         .await
         .expect("checkpoint task panicked")
+    }
+
+    /// Forget an already-fenced retired stream from this shard's checkpoint-maintenance
+    /// residency. This does not alter WAL records or segment recycling; normal
+    /// checkpoint/recovery retains ownership of those bytes. It removes only
+    /// the stable stream ID from the pending dirty collection and cumulative
+    /// tail proof, so a completed earlier checkpoint cannot reintroduce it.
+    #[allow(dead_code)] // wired into Store retirement by x82l-b2
+    pub async fn forget_stream(self: &Arc<Self>, stream_id: u64) -> io::Result<()> {
+        let maintenance = Arc::clone(&self.checkpoint_maintenance).lock_owned().await;
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            // See checkpoint: the blocking hand-off, rather than its awaiting
+            // future, owns the exclusion through the final durable tail prune.
+            let _maintenance = maintenance;
+            this.forget_stream_blocking(stream_id)
+        })
+        .await
+        .expect("forget_stream task panicked")
+    }
+
+    #[allow(dead_code)] // reached from the deferred public hand-off above
+    fn forget_stream_blocking(&self, stream_id: u64) -> io::Result<()> {
+        self.dirty
+            .lock()
+            .unwrap()
+            .retain(|stream| stream.id != stream_id);
+        self.forget_durable_tail(stream_id)
     }
 
     /// The blocking body of [`Self::checkpoint`]: capture → barrier → tails →
@@ -1018,8 +1067,7 @@ impl Shard {
             //    like the debounced flush ignored them.
             let mut n_meta = 0u64;
             for st in drained {
-                if st.meta_dirty.swap(false, Ordering::AcqRel) {
-                    let _ = crate::store::write_meta_sync(st, false);
+                if crate::store::flush_wal_checkpoint_meta(st) {
                     n_meta += 1;
                 }
             }
@@ -1070,11 +1118,56 @@ impl Shard {
             let slot = map.entry(id).or_insert(0);
             *slot = (*slot).max(tail);
         }
+        // Checkpoint maintenance is totally serialized, and this runs in its
+        // blocking body, so holding the cache guard for the durable rewrite
+        // avoids cloning an O(total-streams) map every checkpoint without
+        // stalling a Tokio worker. `forget_durable_tail` keeps its clone-and-
+        // publish failure model because it needs to leave the old cache intact
+        // when its selective prune fails.
+        self.write_durable_tails_snapshot(map)
+    }
+
+    /// Remove one retired stable ID from the cumulative proof. The on-disk map
+    /// is rewritten before replacing the resident cache so an I/O error leaves
+    /// a retryable in-memory entry. A crash with an older unknown entry is safe:
+    /// recovery ignores IDs absent from its exact Store index, then boot reset
+    /// clears the entire recovered tail map.
+    #[allow(dead_code)] // reached from the deferred public hand-off above
+    fn forget_durable_tail(&self, stream_id: u64) -> io::Result<()> {
+        let snapshot = {
+            let cache = self.tails_cache.lock().unwrap();
+            let mut next = cache
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Self::read_durable_tails_at(&self.dir));
+            if next.remove(&stream_id).is_none() {
+                return Ok(());
+            }
+            next
+        };
+        self.write_durable_tails_snapshot(&snapshot)?;
+        *self.tails_cache.lock().unwrap() = Some(snapshot);
+        Ok(())
+    }
+
+    /// Persist the full, already-merged tail map. Empty maps are removed rather
+    /// than retained as stale empty files, with the directory fsync making that
+    /// prune crash-durable before maintenance returns.
+    fn write_durable_tails_snapshot(&self, map: &HashMap<u64, u64>) -> io::Result<usize> {
         // Serialize as `stream_id durable_tail` lines (sorted for a deterministic,
         // diff-friendly file). Plain decimal text, matching the `checkpoint` file.
         let mut entries: Vec<(u64, u64)> = map.iter().map(|(&k, &v)| (k, v)).collect();
         entries.sort_unstable();
         let n = entries.len();
+        let path = self.dir.join(TAILS_FILE);
+        if entries.is_empty() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => crate::store::fsync_parent_dir(&path)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            return Ok(0);
+        }
         let mut body = String::with_capacity(entries.len() * 16);
         {
             use std::fmt::Write as _;
@@ -1082,11 +1175,6 @@ impl Shard {
                 let _ = writeln!(body, "{id} {tail}");
             }
         }
-        // The resident map is fully merged and serialized; release it before the
-        // file IO below (nothing else contends today, but don't hold a lock over
-        // a write+fsync+rename gratuitously).
-        drop(cache);
-        let path = self.dir.join(TAILS_FILE);
         let tmp = self.dir.join(format!("{TAILS_FILE}.tmp"));
         std::fs::write(&tmp, &body)?;
         // fsync the tmp file's bytes before the rename so the durable-tail map is
@@ -2172,6 +2260,96 @@ mod tests {
 
         let _ = l1;
         h.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn forget_stream_prunes_checkpoint_residency_without_touching_other_ids() {
+        let dir = tmp("forget-residency");
+        let shard = Shard::open(dir.clone()).unwrap();
+        let committer = shard.spawn_committer();
+        let store =
+            crate::store::Store::new_with_tier(dir.clone(), crate::tier::TierConfig::default())
+                .unwrap();
+        let retired = match store.create("retired", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(stream) => stream,
+            _ => panic!("create retired stream"),
+        };
+        let survivor = match store.create("survivor", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(stream) => stream,
+            _ => panic!("create survivor stream"),
+        };
+        let retired_id = retired.id;
+        let survivor_id = survivor.id;
+
+        let retired_lsn = shard
+            .reserve_and_stage(RecordKind::Append, retired_id, 0, b"old")
+            .unwrap();
+        let survivor_lsn = shard
+            .reserve_and_stage(RecordKind::Append, survivor_id, 0, b"new")
+            .unwrap();
+        retired.shared.write().unwrap().tail = 3;
+        survivor.shared.write().unwrap().tail = 3;
+        shard.register_dirty(retired_id, Arc::clone(&retired));
+        shard.register_dirty(survivor_id, Arc::clone(&survivor));
+        shard.wait_durable(retired_lsn.max(survivor_lsn)).await;
+
+        // Checkpoint first: both IDs become cumulative tails residents.
+        shard.checkpoint().await.unwrap();
+        let tails = shard.read_durable_tails();
+        assert_eq!(tails.get(&retired_id), Some(&3));
+        assert_eq!(tails.get(&survivor_id), Some(&3));
+
+        retired.fenced.store(true, Ordering::Release);
+        shard.forget_stream(retired_id).await.unwrap();
+        assert!(!shard.is_dirty(retired_id));
+        let tails = shard.read_durable_tails();
+        assert!(!tails.contains_key(&retired_id));
+        assert_eq!(tails.get(&survivor_id), Some(&3));
+
+        // Forget-before-later-register/checkpoint: a fenced old identity stays
+        // absent while its distinct replacement/survivor remains eligible.
+        shard.register_dirty(retired_id, Arc::clone(&retired));
+        shard.register_dirty(survivor_id, Arc::clone(&survivor));
+        assert!(!shard.is_dirty(retired_id));
+        assert!(shard.is_dirty(survivor_id));
+        shard.checkpoint().await.unwrap();
+        assert!(!shard.read_durable_tails().contains_key(&retired_id));
+        assert_eq!(shard.read_durable_tails().get(&survivor_id), Some(&3));
+
+        committer.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_meta_flush_skips_a_fenced_stream() {
+        let dir = tmp("fenced-checkpoint-meta");
+        let shard = Shard::open(dir.clone()).unwrap();
+        let store =
+            crate::store::Store::new_with_tier(dir.clone(), crate::tier::TierConfig::default())
+                .unwrap();
+        let stream = match store.create("retired", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(stream) => stream,
+            _ => panic!("create stream"),
+        };
+        stream.meta_dirty.store(true, Ordering::Release);
+        shard.register_dirty(stream.id, Arc::clone(&stream));
+        let appender = stream.appender.lock().await;
+        stream.fence_while_holding_appender(&appender);
+        drop(appender);
+        // Model an already-accepted WAL append that dirtied the sidecar after
+        // retirement's first fence clear but before its full-ack drain.
+        stream.meta_dirty.store(true, Ordering::Release);
+        let sidecar = crate::store::meta_path(&stream.file_path);
+        std::fs::remove_file(&sidecar).unwrap();
+
+        shard.checkpoint().await.unwrap();
+
+        assert!(!stream.meta_dirty.load(Ordering::Acquire));
+        assert!(
+            !sidecar.exists(),
+            "checkpoint must not recreate a fenced stream's sidecar"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
