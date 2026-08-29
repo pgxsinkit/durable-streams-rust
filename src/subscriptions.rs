@@ -11,8 +11,8 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::api::{base64_encode, Body, Method, Req, Resp};
 use crate::store::{format_offset, parse_offset, ParsedOffset, Store};
@@ -46,6 +46,8 @@ const MAX_PATTERN_BYTES: usize = 1024;
 const MAX_PATTERN_SEGMENTS: usize = 64;
 const MAX_SUBSCRIPTION_ID_BYTES: usize = 256;
 const BASE64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const DEFAULT_DELETION_DELIVERY_QUEUE_CAPACITY: usize = 256;
+const DEFAULT_DELETION_DELIVERY_CONCURRENCY: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SubscriptionKind {
@@ -131,6 +133,7 @@ pub struct SubscriptionManager {
     token_key: hmac::Key,
     http: reqwest::Client,
     public_base_url: Option<String>,
+    deletion_delivery: DeletionDeliveryLane,
 }
 
 #[derive(Deserialize)]
@@ -208,8 +211,107 @@ enum Delivery {
     },
 }
 
+/// A post-transition reconciliation request. The authoritative in-memory
+/// deletion transition completes before this is admitted to the bounded lane.
+struct DeletionReconcileIntent {
+    key: String,
+    store: Weak<Store>,
+}
+
+struct DeletionDeliveryLane {
+    sender: mpsc::Sender<DeletionReconcileIntent>,
+    receiver: Arc<Mutex<mpsc::Receiver<DeletionReconcileIntent>>>,
+    concurrency: usize,
+    started: AtomicBool,
+    dropped: AtomicUsize,
+    #[cfg(test)]
+    test_hook: Option<Arc<DeletionDeliveryTestHook>>,
+}
+
+#[cfg(test)]
+struct DeletionDeliveryTestHook {
+    block_workers: AtomicBool,
+    entered: tokio::sync::Notify,
+    entered_workers: AtomicUsize,
+    release: tokio::sync::watch::Sender<bool>,
+    active_workers: AtomicUsize,
+    peak_workers: AtomicUsize,
+}
+
+#[cfg(test)]
+impl DeletionDeliveryTestHook {
+    fn new() -> Arc<Self> {
+        let (release, _) = tokio::sync::watch::channel(false);
+        Arc::new(Self {
+            block_workers: AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            entered_workers: AtomicUsize::new(0),
+            release,
+            active_workers: AtomicUsize::new(0),
+            peak_workers: AtomicUsize::new(0),
+        })
+    }
+
+    async fn wait_if_blocked(&self) {
+        if !self.block_workers.load(Ordering::Acquire) {
+            return;
+        }
+        let mut release = self.release.subscribe();
+        let active = self.active_workers.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut peak = self.peak_workers.load(Ordering::Acquire);
+        while active > peak {
+            match self.peak_workers.compare_exchange_weak(
+                peak,
+                active,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => peak = observed,
+            }
+        }
+        self.entered_workers.fetch_add(1, Ordering::AcqRel);
+        self.entered.notify_waiters();
+        while !*release.borrow_and_update() {
+            if release.changed().await.is_err() {
+                self.active_workers.fetch_sub(1, Ordering::AcqRel);
+                return;
+            }
+        }
+        self.active_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    async fn wait_for_workers(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = self.entered.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.entered_workers.load(Ordering::Acquire) >= expected {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("bounded deletion delivery workers must start");
+    }
+}
+
 impl SubscriptionManager {
     pub fn new() -> io::Result<Self> {
+        Self::new_with_deletion_delivery_limits(
+            DEFAULT_DELETION_DELIVERY_QUEUE_CAPACITY,
+            DEFAULT_DELETION_DELIVERY_CONCURRENCY,
+        )
+    }
+
+    fn new_with_deletion_delivery_limits(
+        deletion_delivery_capacity: usize,
+        deletion_delivery_concurrency: usize,
+    ) -> io::Result<Self> {
+        assert!(deletion_delivery_capacity > 0);
+        assert!(deletion_delivery_concurrency > 0);
         let rng = SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
             .map_err(|_| io::Error::other("failed to generate webhook signing key"))?;
@@ -235,6 +337,8 @@ impl SubscriptionManager {
             ),
             _ => None,
         };
+        let (deletion_delivery_sender, deletion_delivery_receiver) =
+            mpsc::channel(deletion_delivery_capacity);
         Ok(Self {
             state: Mutex::new(ManagerState::default()),
             subscription_count: AtomicUsize::new(0),
@@ -252,6 +356,15 @@ impl SubscriptionManager {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(io::Error::other)?,
+            deletion_delivery: DeletionDeliveryLane {
+                sender: deletion_delivery_sender,
+                receiver: Arc::new(Mutex::new(deletion_delivery_receiver)),
+                concurrency: deletion_delivery_concurrency,
+                started: AtomicBool::new(false),
+                dropped: AtomicUsize::new(0),
+                #[cfg(test)]
+                test_hook: None,
+            },
         })
     }
 
@@ -895,54 +1008,113 @@ impl SubscriptionManager {
         if self.subscription_count.load(Ordering::Acquire) == 0 {
             return;
         }
-        let deliveries = {
+        let intents = {
             let mut state = self.state.lock().await;
-            let mut deliveries = Vec::new();
-            for subscription in state.subscriptions.values_mut() {
-                let Some(relative) = relative_stream_path(&subscription.stream_root, absolute_path)
-                else {
-                    continue;
-                };
-                let was_linked = subscription.streams.contains_key(&relative);
-                let was_wake_stream =
-                    subscription.config.wake_stream.as_deref() == Some(relative.as_str());
-                if !was_linked && !was_wake_stream {
-                    continue;
-                }
-                let mut remove_link = false;
-                if let Some(link) = subscription.streams.get_mut(&relative) {
-                    if link.explicit {
-                        // Explicit membership survives deletion/recreation, but
-                        // the recreated stream starts a new offset lifetime.
-                        link.glob = false;
-                        link.acked_offset = format_offset(0);
-                    } else {
-                        remove_link = true;
-                    }
-                }
-                if remove_link {
-                    subscription.streams.remove(&relative);
-                }
-                if was_wake_stream
-                    && subscription.wake_id.is_some()
-                    && subscription.holder.is_none()
-                {
-                    clear_wake(subscription);
-                    if has_pending_work(subscription, &store) {
-                        let triggered = first_pending(subscription, &store);
-                        deliveries.push(self.create_wake(subscription, &store, triggered));
-                    }
-                } else if subscription.wake_id.is_some()
-                    && subscription.holder.is_none()
-                    && !has_pending_work(subscription, &store)
-                {
-                    clear_wake(subscription);
-                }
-            }
-            deliveries
+            apply_stream_deletion_transition(&mut state, absolute_path)
         };
-        for delivery in deliveries {
-            self.execute_delivery(store.clone(), delivery).await;
+        if intents.is_empty() {
+            return;
+        }
+        self.ensure_deletion_delivery_workers();
+        for key in intents {
+            self.enqueue_deletion_reconcile(&store, key);
+        }
+    }
+
+    fn ensure_deletion_delivery_workers(self: &Arc<Self>) {
+        if self
+            .deletion_delivery
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        for _ in 0..self.deletion_delivery.concurrency {
+            let receiver = self.deletion_delivery.receiver.clone();
+            let manager: Weak<Self> = Arc::downgrade(self);
+            #[cfg(test)]
+            let test_hook = self.deletion_delivery.test_hook.clone();
+            tokio::spawn(async move {
+                loop {
+                    let intent = {
+                        let mut receiver = receiver.lock().await;
+                        receiver.recv().await
+                    };
+                    let Some(intent) = intent else { return };
+                    #[cfg(test)]
+                    if let Some(test_hook) = &test_hook {
+                        test_hook.wait_if_blocked().await;
+                    }
+                    let Some(manager) = manager.upgrade() else {
+                        return;
+                    };
+                    manager.process_deletion_reconcile(intent).await;
+                }
+            });
+        }
+    }
+
+    fn enqueue_deletion_reconcile(&self, store: &Arc<Store>, key: String) {
+        if self
+            .deletion_delivery
+            .sender
+            .try_send(DeletionReconcileIntent {
+                key,
+                store: Arc::downgrade(store),
+            })
+            .is_err()
+        {
+            let dropped = self
+                .deletion_delivery
+                .dropped
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    dropped,
+                    "subscription deletion delivery lane saturated; dropping reconcile intent"
+                );
+            }
+        }
+    }
+
+    async fn process_deletion_reconcile(self: &Arc<Self>, intent: DeletionReconcileIntent) {
+        let Some(store) = intent.store.upgrade() else {
+            return;
+        };
+        let delivery = {
+            let mut state = self.state.lock().await;
+            let Some(subscription) = state.subscriptions.get_mut(&intent.key) else {
+                return;
+            };
+            if subscription.wake_id.is_none()
+                && subscription.holder.is_none()
+                && has_pending_work(subscription, &store)
+            {
+                let triggered = first_pending(subscription, &store);
+                Some(self.create_wake(subscription, &store, triggered))
+            } else {
+                None
+            }
+        };
+        if let Some(delivery) = delivery {
+            self.execute_deletion_delivery(store, delivery).await;
+        }
+    }
+
+    async fn execute_deletion_delivery(self: &Arc<Self>, store: Arc<Store>, delivery: Delivery) {
+        match delivery {
+            Delivery::Webhook {
+                key,
+                generation,
+                wake_id,
+            } => {
+                Arc::clone(self)
+                    .deliver_webhook(store, key, generation, wake_id)
+                    .await;
+            }
+            delivery @ Delivery::PullWake { .. } => self.execute_delivery(store, delivery).await,
         }
     }
 
@@ -1762,6 +1934,49 @@ fn clear_wake(subscription: &mut Subscription) {
     subscription.retry_count = 0;
 }
 
+/// Apply the authoritative, process-local deletion transition. This deliberately
+/// has no Store access: once the manager lock is released, a path may be reused
+/// regardless of whether asynchronous delivery reconciliation is admitted.
+fn apply_stream_deletion_transition(state: &mut ManagerState, absolute_path: &str) -> Vec<String> {
+    let mut intents = Vec::new();
+    for (key, subscription) in &mut state.subscriptions {
+        let Some(relative) = relative_stream_path(&subscription.stream_root, absolute_path) else {
+            continue;
+        };
+        let was_linked = subscription.streams.contains_key(&relative);
+        let was_wake_stream = subscription.config.wake_stream.as_deref() == Some(relative.as_str());
+        let wake_mentions_deleted = subscription.wake_snapshot.contains_key(&relative);
+        if !was_linked && !was_wake_stream {
+            continue;
+        }
+        let mut remove_link = false;
+        if let Some(link) = subscription.streams.get_mut(&relative) {
+            if link.explicit {
+                // Explicit membership survives deletion/recreation, but starts
+                // at the recreated stream's fresh offset lifetime.
+                link.glob = false;
+                link.acked_offset = ZERO_OFFSET.to_string();
+            } else {
+                remove_link = true;
+            }
+        }
+        if remove_link {
+            subscription.streams.remove(&relative);
+        }
+        // A claimed worker may still safely finish work for other streams. Its
+        // snapshot simply drops this deleted, non-pending link. Unclaimed
+        // wakes that describe the deleted incarnation are stale and reset
+        // before the path can be reused.
+        if subscription.holder.is_none() && (was_wake_stream || wake_mentions_deleted) {
+            clear_wake(subscription);
+        } else if subscription.holder.is_some() {
+            subscription.wake_snapshot.remove(&relative);
+        }
+        intents.push(key.clone());
+    }
+    intents
+}
+
 fn subscription_key(stream_root: &str, id: &str) -> String {
     format!("{stream_root}\0{id}")
 }
@@ -1990,6 +2205,65 @@ mod tests {
         )
     }
 
+    fn test_subscription(
+        id: &str,
+        streams: BTreeMap<String, StreamLink>,
+        wake_stream: Option<&str>,
+    ) -> Subscription {
+        Subscription {
+            id: id.into(),
+            stream_root: "/root".into(),
+            config: SubscriptionConfig {
+                kind: if wake_stream.is_some() {
+                    SubscriptionKind::PullWake
+                } else {
+                    SubscriptionKind::Webhook
+                },
+                pattern: Some("events/*".into()),
+                streams: Vec::new(),
+                webhook_url: wake_stream
+                    .is_none()
+                    .then(|| "http://127.0.0.1:1/hook".into()),
+                wake_stream: wake_stream.map(str::to_string),
+                lease_ttl_ms: 30_000,
+                description: None,
+            },
+            callback_base_url: "http://localhost:4562".into(),
+            created_at: "2026-08-28T00:00:00Z".into(),
+            status: SubscriptionStatus::Failed,
+            streams,
+            generation: 7,
+            wake_id: Some("stale-wake".into()),
+            wake_snapshot: BTreeMap::from([("events/a".into(), format_offset(9))]),
+            token: Some("stale-token".into()),
+            holder: Some("stale-holder".into()),
+            lease_nonce: 3,
+            retry_count: 2,
+        }
+    }
+
+    fn test_manager(
+        capacity: usize,
+        concurrency: usize,
+        hook: Option<Arc<DeletionDeliveryTestHook>>,
+    ) -> Arc<SubscriptionManager> {
+        let mut manager =
+            SubscriptionManager::new_with_deletion_delivery_limits(capacity, concurrency).unwrap();
+        manager.deletion_delivery.test_hook = hook;
+        Arc::new(manager)
+    }
+
+    async fn insert_test_subscription(manager: &SubscriptionManager, subscription: Subscription) {
+        let key = subscription_key(&subscription.stream_root, &subscription.id);
+        manager
+            .state
+            .lock()
+            .await
+            .subscriptions
+            .insert(key, subscription);
+        manager.subscription_count.fetch_add(1, Ordering::Release);
+    }
+
     fn json_request(method: Method, path: impl Into<String>, body: Value) -> Req {
         Req {
             method,
@@ -2010,6 +2284,321 @@ mod tests {
     async fn create_json_stream(store: &Arc<Store>, path: &str) {
         let response = handle(store.clone(), json_request(Method::Put, path, json!([]))).await;
         assert_eq!(response.status, 201, "create {path}");
+    }
+
+    #[test]
+    fn subscription_delete_transition_explicit_reset_glob_removal_and_stale_wake_clear() {
+        let mut state = ManagerState::default();
+        let mut explicit = test_subscription(
+            "explicit",
+            BTreeMap::from([(
+                "events/a".into(),
+                StreamLink {
+                    explicit: true,
+                    glob: true,
+                    acked_offset: format_offset(9),
+                },
+            )]),
+            None,
+        );
+        let mut glob = test_subscription(
+            "glob",
+            BTreeMap::from([(
+                "events/a".into(),
+                StreamLink {
+                    explicit: false,
+                    glob: true,
+                    acked_offset: format_offset(9),
+                },
+            )]),
+            None,
+        );
+        explicit.holder = None;
+        glob.holder = None;
+        state
+            .subscriptions
+            .insert(subscription_key("/root", "explicit"), explicit);
+        state
+            .subscriptions
+            .insert(subscription_key("/root", "glob"), glob);
+
+        let intents = apply_stream_deletion_transition(&mut state, "/root/events/a");
+        assert_eq!(intents.len(), 2);
+        let explicit = state
+            .subscriptions
+            .get(&subscription_key("/root", "explicit"))
+            .unwrap();
+        let link = explicit.streams.get("events/a").unwrap();
+        assert!(link.explicit);
+        assert!(!link.glob);
+        assert_eq!(link.acked_offset, ZERO_OFFSET);
+        assert!(explicit.wake_id.is_none());
+        assert!(explicit.wake_snapshot.is_empty());
+        assert!(explicit.token.is_none());
+        assert!(explicit.holder.is_none());
+        assert_eq!(explicit.status, SubscriptionStatus::Active);
+        assert!(!state
+            .subscriptions
+            .get(&subscription_key("/root", "glob"))
+            .unwrap()
+            .streams
+            .contains_key("events/a"));
+    }
+
+    #[test]
+    fn subscription_delete_transition_wake_stream_clears_stale_wake_without_store_access() {
+        let mut state = ManagerState::default();
+        let mut subscription = test_subscription("pull", BTreeMap::new(), Some("events/a"));
+        subscription.holder = None;
+        state
+            .subscriptions
+            .insert(subscription_key("/root", "pull"), subscription);
+
+        let intents = apply_stream_deletion_transition(&mut state, "/root/events/a");
+        assert_eq!(intents, vec![subscription_key("/root", "pull")]);
+        let subscription = state
+            .subscriptions
+            .get(&subscription_key("/root", "pull"))
+            .unwrap();
+        assert!(subscription.wake_id.is_none());
+        assert!(subscription.wake_snapshot.is_empty());
+        assert!(subscription.token.is_none());
+        assert!(subscription.holder.is_none());
+    }
+
+    #[test]
+    fn subscription_delete_transition_claimed_wake_stream_keeps_lease_identity() {
+        let mut state = ManagerState::default();
+        let mut subscription = test_subscription("pull", BTreeMap::new(), Some("wake/pool"));
+        subscription
+            .wake_snapshot
+            .insert("wake/pool".into(), format_offset(12));
+        let expected_identity = (
+            subscription.holder.clone(),
+            subscription.wake_id.clone(),
+            subscription.token.clone(),
+            subscription.lease_nonce,
+            subscription.generation,
+        );
+        state
+            .subscriptions
+            .insert(subscription_key("/root", "pull"), subscription);
+
+        let intents = apply_stream_deletion_transition(&mut state, "/root/wake/pool");
+        assert_eq!(intents, vec![subscription_key("/root", "pull")]);
+        let subscription = state
+            .subscriptions
+            .get(&subscription_key("/root", "pull"))
+            .unwrap();
+        assert_eq!(
+            (
+                subscription.holder.clone(),
+                subscription.wake_id.clone(),
+                subscription.token.clone(),
+                subscription.lease_nonce,
+                subscription.generation,
+            ),
+            expected_identity
+        );
+        assert_eq!(
+            subscription.wake_snapshot,
+            BTreeMap::from([("events/a".into(), format_offset(9))])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscription_delete_transition_returns_before_blocked_delivery_worker() {
+        let (store, directory) = test_store("blocked-delivery");
+        let hook = DeletionDeliveryTestHook::new();
+        hook.block_workers.store(true, Ordering::Release);
+        let manager = test_manager(1, 1, Some(hook.clone()));
+        insert_test_subscription(
+            &manager,
+            test_subscription(
+                "sub-1",
+                BTreeMap::from([(
+                    "events/a".into(),
+                    StreamLink {
+                        explicit: true,
+                        glob: false,
+                        acked_offset: format_offset(9),
+                    },
+                )]),
+                None,
+            ),
+        )
+        .await;
+        let entered = hook.entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.on_stream_deleted(store.clone(), "/root/events/a"),
+        )
+        .await
+        .expect("logical transition must not await delivery");
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .expect("bounded worker must receive the later reconcile intent");
+        let state = manager.state.lock().await;
+        let link = state
+            .subscriptions
+            .get(&subscription_key("/root", "sub-1"))
+            .unwrap()
+            .streams
+            .get("events/a")
+            .unwrap();
+        assert_eq!(link.acked_offset, ZERO_OFFSET);
+        drop(state);
+        hook.release.send_replace(true);
+
+        drop(manager);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscription_delete_transition_weak_intents_do_not_retain_manager_or_store() {
+        let (store, directory) = test_store("weak-intents");
+        let hook = DeletionDeliveryTestHook::new();
+        hook.block_workers.store(true, Ordering::Release);
+        let manager = test_manager(2, 1, Some(hook.clone()));
+        for id in ["one", "two"] {
+            insert_test_subscription(
+                &manager,
+                test_subscription(
+                    id,
+                    BTreeMap::from([(
+                        "events/a".into(),
+                        StreamLink {
+                            explicit: true,
+                            glob: false,
+                            acked_offset: format_offset(5),
+                        },
+                    )]),
+                    None,
+                ),
+            )
+            .await;
+        }
+        let weak_manager = Arc::downgrade(&manager);
+        let weak_store = Arc::downgrade(&store);
+
+        manager
+            .on_stream_deleted(store.clone(), "/root/events/a")
+            .await;
+        hook.wait_for_workers(1).await;
+        drop(manager);
+        drop(store);
+
+        assert!(weak_manager.upgrade().is_none());
+        assert!(weak_store.upgrade().is_none());
+        hook.release.send_replace(true);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscription_delete_transition_queue_saturation_drops_without_rollback() {
+        let (store, directory) = test_store("queue-saturation");
+        let hook = DeletionDeliveryTestHook::new();
+        hook.block_workers.store(true, Ordering::Release);
+        let manager = test_manager(1, 1, Some(hook.clone()));
+        for id in ["one", "two", "three"] {
+            insert_test_subscription(
+                &manager,
+                test_subscription(
+                    id,
+                    BTreeMap::from([(
+                        "events/a".into(),
+                        StreamLink {
+                            explicit: true,
+                            glob: true,
+                            acked_offset: format_offset(5),
+                        },
+                    )]),
+                    None,
+                ),
+            )
+            .await;
+        }
+        let entered = hook.entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+
+        manager
+            .on_stream_deleted(store.clone(), "/root/events/a")
+            .await;
+        assert_eq!(
+            manager.deletion_delivery.dropped.load(Ordering::Acquire),
+            2,
+            "capacity one admits one reconcile intent and drops the remainder"
+        );
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .expect("one worker must block on the admitted intent");
+        assert_eq!(hook.peak_workers.load(Ordering::Acquire), 1);
+        let state = manager.state.lock().await;
+        for id in ["one", "two", "three"] {
+            let link = state
+                .subscriptions
+                .get(&subscription_key("/root", id))
+                .unwrap()
+                .streams
+                .get("events/a")
+                .unwrap();
+            assert!(!link.glob);
+            assert_eq!(link.acked_offset, ZERO_OFFSET);
+        }
+        drop(state);
+        hook.release.send_replace(true);
+
+        drop(manager);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscription_delete_transition_lane_concurrency_is_bounded() {
+        let (store, directory) = test_store("bounded-concurrency");
+        let hook = DeletionDeliveryTestHook::new();
+        hook.block_workers.store(true, Ordering::Release);
+        let manager = test_manager(3, 2, Some(hook.clone()));
+        for id in ["one", "two", "three"] {
+            insert_test_subscription(
+                &manager,
+                test_subscription(
+                    id,
+                    BTreeMap::from([(
+                        "events/a".into(),
+                        StreamLink {
+                            explicit: true,
+                            glob: false,
+                            acked_offset: format_offset(5),
+                        },
+                    )]),
+                    None,
+                ),
+            )
+            .await;
+        }
+
+        manager
+            .on_stream_deleted(store.clone(), "/root/events/a")
+            .await;
+        hook.wait_for_workers(2).await;
+        assert_eq!(hook.peak_workers.load(Ordering::Acquire), 2);
+        assert_eq!(
+            manager.deletion_delivery.dropped.load(Ordering::Acquire),
+            0,
+            "capacity three admits all three intents while two workers run"
+        );
+        hook.release.send_replace(true);
+
+        drop(manager);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
