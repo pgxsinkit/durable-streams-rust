@@ -9,7 +9,7 @@
 use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{mpsc, Notify};
 
@@ -18,8 +18,8 @@ use crate::store::{LocalCleanupMode, StreamState};
 use super::{
     retry_backoff, CleanupCallback, FirstAttemptCompletion, LogicalCompletion,
     PhysicalAttemptResult, PhysicalExecutor, PhysicalSubmitError, RetirementAdmission,
-    RetirementConfig, RetirementPriority, RetirementReservation, RetirementTicket,
-    TerminalCleanupCompletion, MAX_CLEANUP_ATTEMPTS,
+    RetirementConfig, RetirementPriority, RetirementReservation, RetirementSnapshot,
+    RetirementTicket, TerminalCleanupCompletion, MAX_CLEANUP_ATTEMPTS,
 };
 
 /// The result of an admission attempt. Duplicate admissions return the exact
@@ -48,6 +48,17 @@ struct JobRecord {
     logical_released: bool,
     active_attempt: Option<u8>,
     retry_scheduled: bool,
+    first_attempt_completed: bool,
+    admitted_sequence: u64,
+}
+
+/// An intrusive, insertion-ordered index over the bounded job table.  A
+/// snapshot needs only the oldest node, while admission and removal relink at
+/// most two neighbours; none of those paths walks retained jobs.
+struct AdmissionNode {
+    admitted_at: Instant,
+    previous: Option<u64>,
+    next: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +92,23 @@ struct CoordinatorState {
     active_interactive: usize,
     active_proactive: usize,
     next_retry_sequence: u64,
+    next_admission_sequence: u64,
+    admitted: HashMap<u64, AdmissionNode>,
+    oldest_admission: Option<u64>,
+    newest_admission: Option<u64>,
+    cumulative_retry_attempts: u64,
+    terminal_cleanup_failed_current: u64,
+    terminal_successes: u64,
+    terminal_failures: u64,
+    terminal_cancellations: u64,
+    first_attempt_successes: u64,
+    first_attempt_failures: u64,
+    first_attempt_cancellations: u64,
+    reclaimed_local_bytes: u64,
+    latest_cleanup_wall_time: Option<SystemTime>,
+    last_successful_cleanup_wall_time: Option<SystemTime>,
+    latest_cleanup_duration: Option<Duration>,
+    last_successful_cleanup_duration: Option<Duration>,
     closed: bool,
 }
 
@@ -94,6 +122,7 @@ struct WorkerEvent {
     id: u64,
     attempt: u8,
     result: PhysicalAttemptResult,
+    duration: Duration,
 }
 
 struct Inner {
@@ -169,8 +198,9 @@ impl RetirementExecutor {
             return RetirementAdmissionResult::Rejected(RetirementAdmission::ShuttingDown);
         }
 
-        let ticket = {
+        let (ticket, cleared_terminal_failure) = {
             let mut retirement = stream.retirement_state();
+            let had_terminal_failure = retirement.has_terminal_failure();
             match retirement.reserve(Instant::now()) {
                 RetirementReservation::Existing(ticket) => {
                     return RetirementAdmissionResult::Existing(ticket);
@@ -178,9 +208,14 @@ impl RetirementExecutor {
                 RetirementReservation::CoolingDown => {
                     return RetirementAdmissionResult::Rejected(RetirementAdmission::CoolingDown);
                 }
-                RetirementReservation::New(ticket) => ticket,
+                RetirementReservation::New(ticket) => (ticket, had_terminal_failure),
             }
         };
+
+        if cleared_terminal_failure {
+            state.terminal_cleanup_failed_current =
+                state.terminal_cleanup_failed_current.saturating_sub(1);
+        }
 
         if state.jobs.contains_key(&stream.id) {
             // A path replacement must never overwrite the retained job just
@@ -200,6 +235,27 @@ impl RetirementExecutor {
             priority,
             mode,
         });
+        state.next_admission_sequence = state.next_admission_sequence.wrapping_add(1);
+        let admitted_sequence = state.next_admission_sequence;
+        let previous = state.newest_admission;
+        state.admitted.insert(
+            admitted_sequence,
+            AdmissionNode {
+                admitted_at: Instant::now(),
+                previous,
+                next: None,
+            },
+        );
+        if let Some(previous) = previous {
+            state
+                .admitted
+                .get_mut(&previous)
+                .expect("newest admission remains retained")
+                .next = Some(admitted_sequence);
+        } else {
+            state.oldest_admission = Some(admitted_sequence);
+        }
+        state.newest_admission = Some(admitted_sequence);
         state.jobs.insert(
             job.id(),
             JobRecord {
@@ -207,6 +263,8 @@ impl RetirementExecutor {
                 logical_released: false,
                 active_attempt: None,
                 retry_scheduled: false,
+                first_attempt_completed: false,
+                admitted_sequence,
             },
         );
         RetirementAdmissionResult::Admitted(ticket)
@@ -276,7 +334,9 @@ impl RetirementExecutor {
         job.ticket
             .complete_terminal(TerminalCleanupCompletion::Cancelled);
         job.stream.retirement_state().finish(&job.ticket);
-        state.jobs.remove(&stream.id);
+        remove_job(&mut state, stream.id);
+        state.terminal_cancellations = state.terminal_cancellations.saturating_add(1);
+        state.first_attempt_cancellations = state.first_attempt_cancellations.saturating_add(1);
         true
     }
 
@@ -304,7 +364,21 @@ impl RetirementExecutor {
             state.retries.clear();
             state.active_interactive = 0;
             state.active_proactive = 0;
-            std::mem::take(&mut state.jobs)
+            let jobs = std::mem::take(&mut state.jobs);
+            state.admitted.clear();
+            state.oldest_admission = None;
+            state.newest_admission = None;
+            let first_cancellations = jobs
+                .values()
+                .filter(|record| !record.first_attempt_completed)
+                .count();
+            state.terminal_cancellations = state
+                .terminal_cancellations
+                .saturating_add(u64::try_from(jobs.len()).unwrap_or(u64::MAX));
+            state.first_attempt_cancellations = state
+                .first_attempt_cancellations
+                .saturating_add(u64::try_from(first_cancellations).unwrap_or(u64::MAX));
+            jobs
         };
         for (_, record) in jobs {
             let job = record.job;
@@ -343,6 +417,78 @@ impl RetirementExecutor {
     pub(crate) fn worker_count(&self) -> usize {
         self.inner.physical.worker_count()
     }
+
+    pub(crate) fn snapshot(&self) -> RetirementSnapshot {
+        let state = lock_recover(&self.inner.state);
+        let physical = self.inner.physical.snapshot();
+        let oldest_admitted_age = state.oldest_admission.and_then(|sequence| {
+            state
+                .admitted
+                .get(&sequence)
+                .map(|node| Instant::now().saturating_duration_since(node.admitted_at))
+        });
+        RetirementSnapshot {
+            queue_capacity: self.inner.config.queue_capacity,
+            total_jobs: state.jobs.len(),
+            interactive_pending: state.interactive_pending.len(),
+            proactive_pending: state.proactive_pending.len(),
+            active_interactive: state.active_interactive,
+            active_proactive: state.active_proactive,
+            coordinator_capacity: self.inner.config.coordinator_capacity,
+            proactive_coordinator_capacity: self.inner.config.proactive_coordinator_capacity,
+            interactive_physical_capacity: self.inner.config.interactive_physical_capacity,
+            proactive_physical_capacity: self.inner.config.proactive_physical_capacity,
+            physical_interactive_queued: physical.interactive_queued,
+            physical_proactive_queued: physical.proactive_queued,
+            physical_interactive_active: physical.interactive_active,
+            physical_proactive_active: physical.proactive_active,
+            cleanup_workers_total: physical.workers_total,
+            cleanup_workers_live: physical.workers_live,
+            retry_heap_count: state.retries.len(),
+            cumulative_retry_attempts: state.cumulative_retry_attempts,
+            terminal_cleanup_failed_current: state.terminal_cleanup_failed_current,
+            terminal_successes: state.terminal_successes,
+            terminal_failures: state.terminal_failures,
+            terminal_cancellations: state.terminal_cancellations,
+            first_attempt_successes: state.first_attempt_successes,
+            first_attempt_failures: state.first_attempt_failures,
+            first_attempt_cancellations: state.first_attempt_cancellations,
+            reclaimed_local_bytes: state.reclaimed_local_bytes,
+            latest_cleanup_wall_time: state.latest_cleanup_wall_time,
+            last_successful_cleanup_wall_time: state.last_successful_cleanup_wall_time,
+            latest_cleanup_duration: state.latest_cleanup_duration,
+            last_successful_cleanup_duration: state.last_successful_cleanup_duration,
+            oldest_admitted_age,
+            closed: state.closed || physical.closed,
+        }
+    }
+}
+
+fn remove_job(state: &mut CoordinatorState, id: u64) -> Option<JobRecord> {
+    let record = state.jobs.remove(&id)?;
+    let node = state
+        .admitted
+        .remove(&record.admitted_sequence)
+        .expect("retained job has an admission node");
+    if let Some(previous) = node.previous {
+        state
+            .admitted
+            .get_mut(&previous)
+            .expect("previous admission remains retained")
+            .next = node.next;
+    } else {
+        state.oldest_admission = node.next;
+    }
+    if let Some(next) = node.next {
+        state
+            .admitted
+            .get_mut(&next)
+            .expect("next admission remains retained")
+            .previous = node.previous;
+    } else {
+        state.newest_admission = node.previous;
+    }
+    Some(record)
 }
 
 impl Drop for RetirementExecutor {
@@ -467,6 +613,10 @@ fn dispatch_ready(inner: &Arc<Inner>) {
             {
                 Ok(attempt) => {
                     let attempt_number = job.stream.retirement_state().record_attempt();
+                    if attempt_number > 1 {
+                        state.cumulative_retry_attempts =
+                            state.cumulative_retry_attempts.saturating_add(1);
+                    }
                     state
                         .jobs
                         .get_mut(&job.id())
@@ -496,11 +646,13 @@ fn dispatch_ready(inner: &Arc<Inner>) {
                 // created only after reserving an active coordinator slot and
                 // finishes when one fixed physical attempt completes.
                 tokio::spawn(async move {
+                    let completion = attempt.wait_completion().await;
                     let _ = events
                         .send(WorkerEvent {
                             id: job.id(),
                             attempt: attempt_number,
-                            result: attempt.wait().await,
+                            result: completion.result,
+                            duration: completion.duration,
                         })
                         .await;
                 });
@@ -518,14 +670,18 @@ fn push_front(state: &mut CoordinatorState, job: Arc<Job>) {
 }
 
 fn settle_without_attempt(state: &mut CoordinatorState, job: Arc<Job>, cancelled: bool) {
-    state.jobs.remove(&job.id());
+    remove_job(state, job.id());
     if cancelled {
+        state.terminal_cancellations = state.terminal_cancellations.saturating_add(1);
+        state.first_attempt_cancellations = state.first_attempt_cancellations.saturating_add(1);
         job.ticket.complete_logical(LogicalCompletion::Cancelled);
         job.ticket
             .complete_first_attempt(FirstAttemptCompletion::Cancelled);
         job.ticket
             .complete_terminal(TerminalCleanupCompletion::Cancelled);
     } else {
+        state.terminal_failures = state.terminal_failures.saturating_add(1);
+        state.first_attempt_failures = state.first_attempt_failures.saturating_add(1);
         job.ticket
             .complete_first_attempt(FirstAttemptCompletion::Failed);
         job.ticket
@@ -544,6 +700,16 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
             }
             _ => return,
         };
+        // No accounting is touched until the retained job and exact attempt
+        // have both matched: worker completions may arrive after cancel_all.
+        let wall_now = SystemTime::now();
+        state.latest_cleanup_wall_time = Some(wall_now);
+        state.latest_cleanup_duration = Some(event.duration);
+        if event.attempt == 1 {
+            if let Some(record) = state.jobs.get_mut(&event.id) {
+                record.first_attempt_completed = true;
+            }
+        }
         match job.priority {
             RetirementPriority::Interactive => {
                 state.active_interactive = state.active_interactive.saturating_sub(1)
@@ -552,11 +718,17 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
                 state.active_proactive = state.active_proactive.saturating_sub(1)
             }
         }
-        match event.result {
+        let outcome = match event.result {
             PhysicalAttemptResult::Succeeded {
                 reclaimed_local_bytes,
             } => {
-                state.jobs.remove(&event.id);
+                remove_job(&mut state, event.id);
+                state.terminal_successes = state.terminal_successes.saturating_add(1);
+                state.reclaimed_local_bytes = state
+                    .reclaimed_local_bytes
+                    .saturating_add(reclaimed_local_bytes);
+                state.last_successful_cleanup_wall_time = Some(wall_now);
+                state.last_successful_cleanup_duration = Some(event.duration);
                 AttemptOutcome::Succeeded(job, reclaimed_local_bytes)
             }
             PhysicalAttemptResult::Failed | PhysicalAttemptResult::Panicked
@@ -578,28 +750,50 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
                 AttemptOutcome::Retry(job)
             }
             PhysicalAttemptResult::Failed | PhysicalAttemptResult::Panicked => {
-                state.jobs.remove(&event.id);
+                remove_job(&mut state, event.id);
+                state.terminal_failures = state.terminal_failures.saturating_add(1);
+                state.terminal_cleanup_failed_current =
+                    state.terminal_cleanup_failed_current.saturating_add(1);
                 AttemptOutcome::Failed(job)
             }
             PhysicalAttemptResult::Cancelled => {
-                state.jobs.remove(&event.id);
+                remove_job(&mut state, event.id);
+                state.terminal_cancellations = state.terminal_cancellations.saturating_add(1);
                 AttemptOutcome::Cancelled(job)
             }
+        };
+        if event.attempt == 1 {
+            match &outcome {
+                AttemptOutcome::Succeeded(..) => {
+                    state.first_attempt_successes = state.first_attempt_successes.saturating_add(1)
+                }
+                AttemptOutcome::Retry(..) | AttemptOutcome::Failed(..) => {
+                    state.first_attempt_failures = state.first_attempt_failures.saturating_add(1)
+                }
+                AttemptOutcome::Cancelled(..) => {
+                    state.first_attempt_cancellations =
+                        state.first_attempt_cancellations.saturating_add(1)
+                }
+            }
         }
+        outcome
     };
     if event.attempt == 1 {
         match &outcome {
-            AttemptOutcome::Succeeded(job, reclaimed_local_bytes) => job
-                .ticket
-                .complete_first_attempt(FirstAttemptCompletion::Succeeded {
-                    reclaimed_local_bytes: *reclaimed_local_bytes,
-                }),
-            AttemptOutcome::Retry(job) | AttemptOutcome::Failed(job) => job
-                .ticket
-                .complete_first_attempt(FirstAttemptCompletion::Failed),
-            AttemptOutcome::Cancelled(job) => job
-                .ticket
-                .complete_first_attempt(FirstAttemptCompletion::Cancelled),
+            AttemptOutcome::Succeeded(job, reclaimed_local_bytes) => {
+                job.ticket
+                    .complete_first_attempt(FirstAttemptCompletion::Succeeded {
+                        reclaimed_local_bytes: *reclaimed_local_bytes,
+                    });
+            }
+            AttemptOutcome::Retry(job) | AttemptOutcome::Failed(job) => {
+                job.ticket
+                    .complete_first_attempt(FirstAttemptCompletion::Failed);
+            }
+            AttemptOutcome::Cancelled(job) => {
+                job.ticket
+                    .complete_first_attempt(FirstAttemptCompletion::Cancelled);
+            }
         }
     }
     match outcome {
@@ -807,6 +1001,10 @@ mod tests {
             ),
             RetirementAdmissionResult::Rejected(RetirementAdmission::QueueFull)
         ));
+        let saturated = executor.snapshot();
+        assert_eq!(saturated.total_jobs, 1);
+        assert_eq!(saturated.queue_capacity, 1);
+        assert!(saturated.active_interactive <= 1);
         assert!(second.retirement_state().is_clean());
         *gate.0.lock().unwrap() = true;
         gate.1.notify_all();
@@ -1059,6 +1257,17 @@ mod tests {
             }
         );
         assert_eq!(attempts.load(Ordering::Acquire), 2);
+        let snapshot = executor.snapshot();
+        assert_eq!(snapshot.first_attempt_failures, 1);
+        assert_eq!(snapshot.first_attempt_successes, 0);
+        assert_eq!(snapshot.cumulative_retry_attempts, 1);
+        assert_eq!(snapshot.terminal_successes, 1);
+        assert_eq!(snapshot.terminal_failures, 0);
+        assert_eq!(snapshot.first_attempt_cancellations, 0);
+        assert_eq!(snapshot.reclaimed_local_bytes, 9);
+        assert!(snapshot.latest_cleanup_wall_time.is_some());
+        assert!(snapshot.latest_cleanup_duration.is_some());
+        assert!(snapshot.last_successful_cleanup_duration.is_some());
         executor.shutdown().await;
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
@@ -1395,5 +1604,254 @@ mod tests {
             retry_backoff(u8::MAX, Duration::MAX),
             Duration::from_secs(60)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_snapshot_tracks_logical_and_physical_lifecycle() {
+        let (store, stream, directory) = store_stream("snapshot-lifecycle");
+        let reclaimed = 37;
+        let cleanup: CleanupCallback = Arc::new(move |_, _| {
+            Ok(LocalCleanupOutcome {
+                reclaimed_local_bytes: reclaimed,
+            })
+        });
+        let executor = RetirementExecutor::new(cleanup, config(2, 8, 0)).unwrap();
+        let empty = executor.snapshot();
+        assert_eq!(empty.queue_capacity, 2);
+        assert_eq!(empty.total_jobs, 0);
+        assert_eq!(empty.cleanup_workers_total, 4);
+        assert_eq!(empty.cleanup_workers_live, 4);
+
+        let ticket = ticket(executor.admit(
+            Arc::clone(&stream),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        let admitted = executor.snapshot();
+        assert_eq!(admitted.total_jobs, 1);
+        assert!(admitted.oldest_admitted_age.is_some());
+        assert_eq!(admitted.interactive_pending, 0);
+        assert!(executor.release_logical(&stream, &ticket));
+        assert_eq!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded {
+                reclaimed_local_bytes: reclaimed
+            }
+        );
+        let completed = executor.snapshot();
+        assert_eq!(completed.total_jobs, 0);
+        assert_eq!(completed.terminal_successes, 1);
+        assert_eq!(completed.first_attempt_successes, 1);
+        assert_eq!(completed.reclaimed_local_bytes, reclaimed);
+        assert!(completed.latest_cleanup_wall_time.is_some());
+        assert!(completed.last_successful_cleanup_duration.is_some());
+        assert_eq!(completed.oldest_admitted_age, None);
+        executor.shutdown().await;
+        assert!(executor.snapshot().closed);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_snapshot_counts_prelogical_cancellation_without_physical_reap() {
+        let (store, stream, directory) = store_stream("snapshot-cancel");
+        let executor = RetirementExecutor::new(
+            Arc::new(|_, _| Ok(LocalCleanupOutcome::default())),
+            config(1, 8, 0),
+        )
+        .unwrap();
+        let ticket = ticket(executor.admit(
+            Arc::clone(&stream),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        assert!(executor.cancel_prelogical(&stream, &ticket));
+        let snapshot = executor.snapshot();
+        assert_eq!(snapshot.total_jobs, 0);
+        assert_eq!(snapshot.terminal_cancellations, 1);
+        assert_eq!(snapshot.first_attempt_cancellations, 1);
+        assert_eq!(snapshot.terminal_successes, 0);
+        assert_eq!(snapshot.reclaimed_local_bytes, 0);
+        executor.shutdown().await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_snapshot_ignores_stale_worker_events_after_cancellation() {
+        let (store, stream, directory) = store_stream("snapshot-stale-event");
+        let executor = RetirementExecutor::new(
+            Arc::new(|_, _| Ok(LocalCleanupOutcome::default())),
+            config(1, 8, 0),
+        )
+        .unwrap();
+        let ticket = ticket(executor.admit(
+            Arc::clone(&stream),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        assert!(executor.cancel_prelogical(&stream, &ticket));
+        let before = executor.snapshot();
+        finish_attempt(
+            &executor.inner,
+            WorkerEvent {
+                id: stream.id,
+                attempt: 1,
+                result: PhysicalAttemptResult::Succeeded {
+                    reclaimed_local_bytes: 99,
+                },
+                duration: Duration::from_secs(1),
+            },
+        );
+        let after = executor.snapshot();
+        assert_eq!(
+            after.latest_cleanup_wall_time,
+            before.latest_cleanup_wall_time
+        );
+        assert_eq!(
+            after.latest_cleanup_duration,
+            before.latest_cleanup_duration
+        );
+        assert_eq!(after.terminal_successes, before.terminal_successes);
+        assert_eq!(after.reclaimed_local_bytes, before.reclaimed_local_bytes);
+        executor.shutdown().await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_snapshot_ignores_stale_worker_events_after_shutdown() {
+        let (store, stream, directory) = store_stream("snapshot-stale-shutdown");
+        let executor = RetirementExecutor::new(
+            Arc::new(|_, _| Ok(LocalCleanupOutcome::default())),
+            config(1, 8, 0),
+        )
+        .unwrap();
+        let _ticket = ticket(executor.admit(
+            Arc::clone(&stream),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        executor.shutdown().await;
+        let before = executor.snapshot();
+        assert_eq!(before.terminal_cancellations, 1);
+        assert_eq!(before.first_attempt_cancellations, 1);
+
+        finish_attempt(
+            &executor.inner,
+            WorkerEvent {
+                id: stream.id,
+                attempt: 1,
+                result: PhysicalAttemptResult::Succeeded {
+                    reclaimed_local_bytes: 99,
+                },
+                duration: Duration::from_secs(1),
+            },
+        );
+        assert_eq!(executor.snapshot(), before);
+
+        // Shutdown owns the cancellation transition; the Drop path's shared
+        // cancel_all call and any stale worker completion are both no-ops.
+        executor.cancel_all();
+        assert_eq!(executor.snapshot(), before);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_shutdown_and_drop_count_cancellation_once() {
+        let (store, stream, directory) = store_stream("snapshot-shutdown-drop-once");
+        let executor = RetirementExecutor::new(callback(), config(1, 8, 0)).unwrap();
+        let shutdown_ticket = ticket(executor.admit(
+            Arc::clone(&stream),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        executor.shutdown().await;
+        let after_shutdown = executor.snapshot();
+        assert_eq!(after_shutdown.terminal_cancellations, 1);
+        assert_eq!(after_shutdown.first_attempt_cancellations, 1);
+        executor.cancel_all();
+        assert_eq!(executor.snapshot(), after_shutdown);
+        drop(executor);
+        assert_eq!(
+            shutdown_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Cancelled
+        );
+
+        let dropped = RetirementExecutor::new(callback(), config(1, 8, 0)).unwrap();
+        let dropped_ticket = ticket(dropped.admit(
+            stream,
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        let dropped_inner = Arc::clone(&dropped.inner);
+        drop(dropped);
+        {
+            let state = lock_recover(&dropped_inner.state);
+            assert_eq!(state.terminal_cancellations, 1);
+            assert_eq!(state.first_attempt_cancellations, 1);
+        }
+        assert_eq!(
+            dropped_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Cancelled
+        );
+        drop(dropped_inner);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_snapshot_publishes_first_and_terminal_attempt_one_together() {
+        let (store, stream, directory) = store_stream("snapshot-attempt-one-atomic");
+        let executor = RetirementExecutor::new(callback(), config(1, 8, 0)).unwrap();
+        let ticket = ticket(executor.admit(
+            Arc::clone(&stream),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::Expiry,
+        ));
+        {
+            let mut state = lock_recover(&executor.inner.state);
+            let record = state.jobs.get_mut(&stream.id).expect("admitted job");
+            record.active_attempt = Some(1);
+            state.active_interactive = 1;
+        }
+
+        // finish_attempt is the completion barrier: its snapshot must never
+        // expose the terminal first attempt without its first-attempt count.
+        finish_attempt(
+            &executor.inner,
+            WorkerEvent {
+                id: stream.id,
+                attempt: 1,
+                result: PhysicalAttemptResult::Succeeded {
+                    reclaimed_local_bytes: 7,
+                },
+                duration: Duration::from_millis(3),
+            },
+        );
+        let snapshot = executor.snapshot();
+        assert_eq!(snapshot.terminal_successes, 1);
+        assert_eq!(snapshot.first_attempt_successes, 1);
+        assert_eq!(snapshot.active_interactive, 0);
+        assert_eq!(snapshot.total_jobs, 0);
+        assert_eq!(snapshot.reclaimed_local_bytes, 7);
+        assert!(snapshot.latest_cleanup_wall_time.is_some());
+        assert!(snapshot.last_successful_cleanup_wall_time.is_some());
+        assert_eq!(
+            ticket.wait_first_attempt().await,
+            FirstAttemptCompletion::Succeeded {
+                reclaimed_local_bytes: 7
+            }
+        );
+        assert_eq!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded {
+                reclaimed_local_bytes: 7
+            }
+        );
+        executor.shutdown().await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

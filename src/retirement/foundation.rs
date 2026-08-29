@@ -59,6 +59,44 @@ pub(crate) enum TerminalCleanupCompletion {
     Cancelled,
 }
 
+/// Immutable bounded health projection for the retirement executor. It
+/// intentionally contains no stream identity, path, ticket, or job handle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetirementSnapshot {
+    pub(crate) queue_capacity: usize,
+    pub(crate) total_jobs: usize,
+    pub(crate) interactive_pending: usize,
+    pub(crate) proactive_pending: usize,
+    pub(crate) active_interactive: usize,
+    pub(crate) active_proactive: usize,
+    pub(crate) coordinator_capacity: usize,
+    pub(crate) proactive_coordinator_capacity: usize,
+    pub(crate) interactive_physical_capacity: usize,
+    pub(crate) proactive_physical_capacity: usize,
+    pub(crate) physical_interactive_queued: usize,
+    pub(crate) physical_proactive_queued: usize,
+    pub(crate) physical_interactive_active: usize,
+    pub(crate) physical_proactive_active: usize,
+    pub(crate) cleanup_workers_total: usize,
+    pub(crate) cleanup_workers_live: usize,
+    pub(crate) retry_heap_count: usize,
+    pub(crate) cumulative_retry_attempts: u64,
+    pub(crate) terminal_cleanup_failed_current: u64,
+    pub(crate) terminal_successes: u64,
+    pub(crate) terminal_failures: u64,
+    pub(crate) terminal_cancellations: u64,
+    pub(crate) first_attempt_successes: u64,
+    pub(crate) first_attempt_failures: u64,
+    pub(crate) first_attempt_cancellations: u64,
+    pub(crate) reclaimed_local_bytes: u64,
+    pub(crate) latest_cleanup_wall_time: Option<SystemTime>,
+    pub(crate) last_successful_cleanup_wall_time: Option<SystemTime>,
+    pub(crate) latest_cleanup_duration: Option<Duration>,
+    pub(crate) last_successful_cleanup_duration: Option<Duration>,
+    pub(crate) oldest_admitted_age: Option<Duration>,
+    pub(crate) closed: bool,
+}
+
 /// Fixed limits used by the future worker and coordinator modules.
 #[derive(Clone, Debug)]
 pub(crate) struct RetirementConfig {
@@ -236,6 +274,10 @@ pub(crate) enum RetirementReservation {
 }
 
 impl RetirementState {
+    pub(crate) fn has_terminal_failure(&self) -> bool {
+        self.cleanup_failed_at.is_some()
+    }
+
     pub(crate) fn reserve(&mut self, now: Instant) -> RetirementReservation {
         if let Some(until) = self.cooldown_until {
             if now < until {

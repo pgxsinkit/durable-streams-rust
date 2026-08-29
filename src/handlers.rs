@@ -921,6 +921,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                 | ExplicitRetirementResult::Stale
                 | ExplicitRetirementResult::Rejected(_)
                 | ExplicitRetirementResult::Unavailable
+                | ExplicitRetirementResult::Renewed(_)
                 | ExplicitRetirementResult::Cancelled(_) => return retirement_retry_after("1"),
             }
         }
@@ -2798,6 +2799,7 @@ async fn handle_delete(store: Arc<Store>, path: String) -> Resp {
         ExplicitRetirementResult::Existing(_)
         | ExplicitRetirementResult::Rejected(_)
         | ExplicitRetirementResult::Unavailable
+        | ExplicitRetirementResult::Renewed(_)
         | ExplicitRetirementResult::Cancelled(_)
         | ExplicitRetirementResult::Stale => retirement_retry_after("1"),
     }

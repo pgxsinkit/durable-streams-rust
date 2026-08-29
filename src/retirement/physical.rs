@@ -10,6 +10,7 @@ use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 
@@ -36,27 +37,50 @@ pub(crate) enum PhysicalAttemptResult {
 }
 
 pub(crate) struct PhysicalAttempt {
-    result: oneshot::Receiver<PhysicalAttemptResult>,
+    result: oneshot::Receiver<PhysicalCompletion>,
+}
+
+pub(crate) struct PhysicalCompletion {
+    pub(crate) result: PhysicalAttemptResult,
+    pub(crate) duration: Duration,
 }
 
 impl PhysicalAttempt {
     pub(crate) async fn wait(self) -> PhysicalAttemptResult {
-        self.result
-            .await
-            .unwrap_or(PhysicalAttemptResult::Cancelled)
+        self.wait_completion().await.result
+    }
+
+    pub(crate) async fn wait_completion(self) -> PhysicalCompletion {
+        self.result.await.unwrap_or(PhysicalCompletion {
+            result: PhysicalAttemptResult::Cancelled,
+            duration: Duration::ZERO,
+        })
     }
 }
 
 struct PhysicalJob {
     stream: Arc<StreamState>,
     mode: LocalCleanupMode,
-    result: oneshot::Sender<PhysicalAttemptResult>,
+    result: oneshot::Sender<PhysicalCompletion>,
 }
 
 struct QueueState {
     interactive: VecDeque<PhysicalJob>,
     proactive: VecDeque<PhysicalJob>,
+    active_interactive: usize,
+    active_proactive: usize,
     closed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PhysicalSnapshot {
+    pub(crate) interactive_queued: usize,
+    pub(crate) proactive_queued: usize,
+    pub(crate) interactive_active: usize,
+    pub(crate) proactive_active: usize,
+    pub(crate) workers_live: usize,
+    pub(crate) workers_total: usize,
+    pub(crate) closed: bool,
 }
 
 struct Shared {
@@ -64,6 +88,7 @@ struct Shared {
     wake: Condvar,
     interactive_capacity: usize,
     proactive_capacity: usize,
+    workers_total: usize,
     workers_live: AtomicUsize,
     idle_announced: AtomicUsize,
     idle_observer: Option<Arc<dyn Fn(usize) + Send + Sync>>,
@@ -99,11 +124,14 @@ impl PhysicalExecutor {
             queues: Mutex::new(QueueState {
                 interactive: VecDeque::new(),
                 proactive: VecDeque::new(),
+                active_interactive: 0,
+                active_proactive: 0,
                 closed: false,
             }),
             wake: Condvar::new(),
             interactive_capacity: config.interactive_physical_capacity,
             proactive_capacity: config.proactive_physical_capacity,
+            workers_total: config.cleanup_workers,
             workers_live: AtomicUsize::new(config.cleanup_workers),
             idle_announced: AtomicUsize::new(0),
             idle_observer,
@@ -192,7 +220,10 @@ impl PhysicalExecutor {
         let interactive = std::mem::take(&mut queues.interactive);
         let proactive = std::mem::take(&mut queues.proactive);
         for job in interactive.into_iter().chain(proactive) {
-            let _ = job.result.send(PhysicalAttemptResult::Cancelled);
+            let _ = job.result.send(PhysicalCompletion {
+                result: PhysicalAttemptResult::Cancelled,
+                duration: Duration::ZERO,
+            });
         }
         self.shared.wake.notify_all();
     }
@@ -201,6 +232,19 @@ impl PhysicalExecutor {
     fn queue_counts(&self) -> (usize, usize) {
         let queues = lock_recover(&self.shared.queues);
         (queues.interactive.len(), queues.proactive.len())
+    }
+
+    pub(crate) fn snapshot(&self) -> PhysicalSnapshot {
+        let queues = lock_recover(&self.shared.queues);
+        PhysicalSnapshot {
+            interactive_queued: queues.interactive.len(),
+            proactive_queued: queues.proactive.len(),
+            interactive_active: queues.active_interactive,
+            proactive_active: queues.active_proactive,
+            workers_live: self.shared.workers_live.load(Ordering::Acquire),
+            workers_total: self.shared.workers_total,
+            closed: queues.closed,
+        }
     }
 
     #[cfg(test)]
@@ -224,14 +268,27 @@ fn worker_loop(index: usize, shared: Arc<Shared>, cleanup: CleanupCallback) {
             let mut queues = lock_recover(&shared.queues);
             loop {
                 let job = if index == 0 {
-                    queues.interactive.pop_front()
+                    queues
+                        .interactive
+                        .pop_front()
+                        .map(|job| (job, RetirementPriority::Interactive))
                 } else {
                     queues
                         .interactive
                         .pop_front()
-                        .or_else(|| queues.proactive.pop_front())
+                        .map(|job| (job, RetirementPriority::Interactive))
+                        .or_else(|| {
+                            queues
+                                .proactive
+                                .pop_front()
+                                .map(|job| (job, RetirementPriority::Proactive))
+                        })
                 };
                 if let Some(job) = job {
+                    match job.1 {
+                        RetirementPriority::Interactive => queues.active_interactive += 1,
+                        RetirementPriority::Proactive => queues.active_proactive += 1,
+                    }
                     break job;
                 }
                 if queues.closed {
@@ -250,6 +307,8 @@ fn worker_loop(index: usize, shared: Arc<Shared>, cleanup: CleanupCallback) {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
         };
+        let (job, priority) = job;
+        let started = std::time::Instant::now();
         let result = match catch_unwind(AssertUnwindSafe(|| cleanup(&job.stream, job.mode))) {
             Ok(Ok(outcome)) => PhysicalAttemptResult::Succeeded {
                 reclaimed_local_bytes: outcome.reclaimed_local_bytes,
@@ -257,7 +316,19 @@ fn worker_loop(index: usize, shared: Arc<Shared>, cleanup: CleanupCallback) {
             Ok(Err(_)) => PhysicalAttemptResult::Failed,
             Err(_) => PhysicalAttemptResult::Panicked,
         };
-        let _ = job.result.send(result);
+        let duration = started.elapsed();
+        {
+            let mut queues = lock_recover(&shared.queues);
+            match priority {
+                RetirementPriority::Interactive => {
+                    queues.active_interactive = queues.active_interactive.saturating_sub(1)
+                }
+                RetirementPriority::Proactive => {
+                    queues.active_proactive = queues.active_proactive.saturating_sub(1)
+                }
+            }
+        }
+        let _ = job.result.send(PhysicalCompletion { result, duration });
     }
 }
 

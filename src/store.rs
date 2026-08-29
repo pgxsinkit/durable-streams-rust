@@ -720,6 +720,8 @@ pub(crate) enum ExplicitRetirementResult {
     Stale,
     Rejected(crate::retirement::RetirementAdmission),
     Unavailable,
+    /// Only the appender-locked expiry recheck observed a renewed deadline.
+    Renewed(crate::retirement::RetirementTicket),
     Cancelled(crate::retirement::RetirementTicket),
 }
 
@@ -1318,6 +1320,7 @@ impl Store {
             stream,
             LocalCleanupMode::ExplicitDelete,
             crate::retirement::RetirementPriority::Interactive,
+            false,
         )
         .await
     }
@@ -1330,6 +1333,7 @@ impl Store {
             stream,
             LocalCleanupMode::Expiry,
             crate::retirement::RetirementPriority::Interactive,
+            false,
         )
         .await
     }
@@ -1345,6 +1349,7 @@ impl Store {
             stream,
             LocalCleanupMode::Expiry,
             crate::retirement::RetirementPriority::Proactive,
+            true,
         )
         .await
     }
@@ -1354,6 +1359,7 @@ impl Store {
         stream: Arc<StreamState>,
         mode: LocalCleanupMode,
         priority: crate::retirement::RetirementPriority,
+        report_scanner_renewal: bool,
     ) -> ExplicitRetirementResult {
         match self.streams.get(&stream.path) {
             None => return ExplicitRetirementResult::Missing,
@@ -1395,7 +1401,11 @@ impl Store {
                 && !stream.is_expired_at(SystemTime::now())
             {
                 drop(appender);
-                return self.cancel_retirement(&executor, &stream, ticket);
+                return if executor.cancel_prelogical(&stream, &ticket) && report_scanner_renewal {
+                    ExplicitRetirementResult::Renewed(ticket)
+                } else {
+                    ExplicitRetirementResult::Cancelled(ticket)
+                };
             }
             if !already_fenced {
                 stream.fence_while_holding_appender(&appender);
@@ -2952,7 +2962,7 @@ mod retirement_executor_lifecycle_tests {
         renewed.shared.write().unwrap().last_access = SystemTime::now();
         assert!(matches!(
             store.retire_proactive_expiry(Arc::clone(&renewed)).await,
-            ExplicitRetirementResult::Cancelled(_)
+            ExplicitRetirementResult::Renewed(_)
         ));
         assert!(store.is_exact_registered(&renewed));
         assert!(!renewed.fenced.load(Ordering::Acquire));

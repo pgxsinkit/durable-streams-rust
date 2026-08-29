@@ -651,6 +651,9 @@ impl ExpirationScannerStatus {
             | crate::store::ExplicitRetirementResult::Stale => {
                 safety.outcomes.stale = safety.outcomes.stale.saturating_add(1)
             }
+            crate::store::ExplicitRetirementResult::Renewed(_) => {
+                safety.outcomes.renewed = safety.outcomes.renewed.saturating_add(1)
+            }
             crate::store::ExplicitRetirementResult::Cancelled(_)
             | crate::store::ExplicitRetirementResult::Rejected(_)
             | crate::store::ExplicitRetirementResult::Unavailable => {
@@ -950,7 +953,7 @@ async fn admit_due_candidates(
         // Its ticket/physical phase remains executor-owned; the scanner waits
         // on neither completion.
         status.record_proactive_admission_attempt();
-        let result = store.retire_proactive_expiry(stream).await;
+        let result = store.retire_proactive_expiry(Arc::clone(&stream)).await;
         status.record_proactive_outcome(&result);
     }
     true
@@ -1981,6 +1984,40 @@ mod tests {
         assert_eq!(snapshot.outcomes.failed, 0);
         store.retirement_executor().unwrap().shutdown().await;
 
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn scanner_outcomes_keep_renewal_distinct_from_logical_admission_and_failure() {
+        let (directory, store) = store("scanner-renewed-outcome");
+        let stream = streams(&store, &["due"]).pop().unwrap();
+        let status = ExpirationScannerStatus::new_at(
+            &scanner_config(ExpirationReaperMode::Delete),
+            Instant::now(),
+        );
+        status.record_proactive_outcome(&crate::store::ExplicitRetirementResult::Renewed(
+            crate::retirement::RetirementTicket::new(),
+        ));
+        status.record_proactive_outcome(&crate::store::ExplicitRetirementResult::Owner(
+            crate::retirement::RetirementTicket::new(),
+        ));
+        status.record_proactive_outcome(&crate::store::ExplicitRetirementResult::Cancelled(
+            crate::retirement::RetirementTicket::new(),
+        ));
+        status.record_proactive_outcome(&crate::store::ExplicitRetirementResult::Stale);
+        let outcomes = status.snapshot_at(Instant::now()).outcomes;
+        assert_eq!(outcomes.renewed, 1);
+        assert_eq!(
+            outcomes.reaped, 0,
+            "logical ownership is not physical reaping"
+        );
+        assert_eq!(
+            outcomes.failed, 1,
+            "identity-loss cancellation is not renewal"
+        );
+        assert_eq!(outcomes.stale, 1, "replacement identity loss is distinct");
         drop(stream);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
