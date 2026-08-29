@@ -479,7 +479,7 @@ impl RetirementExecutor {
     }
 
     #[cfg(test)]
-    fn expiry_telemetry_state(&self) -> (u64, u64, Option<Duration>) {
+    pub(crate) fn expiry_telemetry_state_for_test(&self) -> (u64, u64, Option<Duration>) {
         let state = lock_recover(&self.inner.state);
         let oldest_age = state.oldest_expiry_fence.and_then(|id| {
             state
@@ -695,12 +695,16 @@ fn clear_expiry_fence_failure(state: &mut CoordinatorState, stream: &Arc<StreamS
     }
 }
 
-fn mark_expiry_fence_failure(state: &mut CoordinatorState, job: &Job) {
-    if job.mode != LocalCleanupMode::Expiry {
+fn mark_expiry_fence_failure(
+    state: &mut CoordinatorState,
+    mode: LocalCleanupMode,
+    stream: &Arc<StreamState>,
+) {
+    if mode != LocalCleanupMode::Expiry {
         return;
     }
-    let identity = Arc::downgrade(&job.stream);
-    if let Some(node) = state.expiry_fences.get_mut(&job.id()) {
+    let identity = Arc::downgrade(stream);
+    if let Some(node) = state.expiry_fences.get_mut(&stream.id) {
         if Weak::ptr_eq(&node.stream, &identity) && !node.terminal_failure {
             node.terminal_failure = true;
             state.expiry_terminal_cleanup_failed_current = state
@@ -958,26 +962,7 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
                 state.active_proactive = state.active_proactive.saturating_sub(1)
             }
         }
-        let cleanup_telemetry = (job.mode == LocalCleanupMode::Expiry).then_some({
-            crate::telemetry::ExpiryCleanupTelemetry {
-                duration_seconds: event.duration.as_secs_f64(),
-                disposition: match event.result {
-                    PhysicalAttemptResult::Succeeded {
-                        reclaimed_local_bytes,
-                        disposition: LocalCleanupDisposition::HardReaped,
-                    } => Some(crate::telemetry::ExpiryCleanupDisposition::Reaped(
-                        reclaimed_local_bytes,
-                    )),
-                    PhysicalAttemptResult::Succeeded {
-                        disposition: LocalCleanupDisposition::DurableSoftDeleted,
-                        ..
-                    } => Some(crate::telemetry::ExpiryCleanupDisposition::SoftDeleted),
-                    PhysicalAttemptResult::Failed
-                    | PhysicalAttemptResult::Panicked
-                    | PhysicalAttemptResult::Cancelled => None,
-                },
-            }
-        });
+        let cleanup_telemetry = expiry_cleanup_telemetry(job.mode, event.result, event.duration);
         let outcome = match event.result {
             PhysicalAttemptResult::Succeeded {
                 reclaimed_local_bytes,
@@ -1018,7 +1003,7 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
                 state.terminal_failures = state.terminal_failures.saturating_add(1);
                 state.terminal_cleanup_failed_current =
                     state.terminal_cleanup_failed_current.saturating_add(1);
-                mark_expiry_fence_failure(&mut state, &job);
+                mark_expiry_fence_failure(&mut state, job.mode, &job.stream);
                 AttemptOutcome::Failed(job)
             }
             PhysicalAttemptResult::Cancelled => {
@@ -1101,6 +1086,37 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
     }
     emit_expiry_telemetry(inner);
     inner.notify.notify_one();
+}
+
+/// Map only a matched physical Expiry attempt into the bounded cleanup metric
+/// event. Explicit deletion and cascade cleanup share the executor but are not
+/// expiry telemetry, so they return no event at all.
+fn expiry_cleanup_telemetry(
+    mode: LocalCleanupMode,
+    result: PhysicalAttemptResult,
+    duration: Duration,
+) -> Option<crate::telemetry::ExpiryCleanupTelemetry> {
+    if mode != LocalCleanupMode::Expiry {
+        return None;
+    }
+    Some(crate::telemetry::ExpiryCleanupTelemetry {
+        duration_seconds: duration.as_secs_f64(),
+        disposition: match result {
+            PhysicalAttemptResult::Succeeded {
+                reclaimed_local_bytes,
+                disposition: LocalCleanupDisposition::HardReaped,
+            } => Some(crate::telemetry::ExpiryCleanupDisposition::Reaped(
+                reclaimed_local_bytes,
+            )),
+            PhysicalAttemptResult::Succeeded {
+                disposition: LocalCleanupDisposition::DurableSoftDeleted,
+                ..
+            } => Some(crate::telemetry::ExpiryCleanupDisposition::SoftDeleted),
+            PhysicalAttemptResult::Failed
+            | PhysicalAttemptResult::Panicked
+            | PhysicalAttemptResult::Cancelled => None,
+        },
+    })
 }
 
 enum AttemptOutcome {
@@ -2007,21 +2023,21 @@ mod tests {
             RetirementPriority::Interactive,
             LocalCleanupMode::ExplicitDelete,
         ));
-        assert_eq!(executor.expiry_telemetry_state().0, 1);
-        assert!(executor.expiry_telemetry_state().2.is_some());
+        assert_eq!(executor.expiry_telemetry_state_for_test().0, 1);
+        assert!(executor.expiry_telemetry_state_for_test().2.is_some());
         assert!(executor.cancel_prelogical(&expiry, &expiry_ticket));
-        assert_eq!(executor.expiry_telemetry_state().0, 0);
+        assert_eq!(executor.expiry_telemetry_state_for_test().0, 0);
         assert!(
-            executor.expiry_telemetry_state().2.is_some(),
+            executor.expiry_telemetry_state_for_test().2.is_some(),
             "a WAL/prelogical cancellation keeps its expiry fence age"
         );
         assert!(executor.cancel_prelogical(&explicit, &explicit_ticket));
         executor.shutdown().await;
-        assert_eq!(executor.expiry_telemetry_state(), (0, 0, None));
+        assert_eq!(executor.expiry_telemetry_state_for_test(), (0, 0, None));
         // A Store appender can finish its exact fence recheck after shutdown;
         // that late mark must not repopulate the cleared telemetry projection.
         executor.mark_expiry_fence(&expiry);
-        assert_eq!(executor.expiry_telemetry_state(), (0, 0, None));
+        assert_eq!(executor.expiry_telemetry_state_for_test(), (0, 0, None));
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -2073,6 +2089,121 @@ mod tests {
         assert_eq!(state.oldest_expiry_fence, None);
         assert_eq!(state.newest_expiry_fence, None);
 
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expiry_fence_lease_drop_removes_the_exact_middle_failure_node() {
+        let (store, oldest, directory) = store_stream("expiry-fence-lease-drop");
+        let middle = stream(&store, "expiry-fence-middle");
+        let newest = stream(&store, "expiry-fence-newest");
+        let executor = RetirementExecutor::new(callback(), config(3, 8, 0)).unwrap();
+        executor.mark_expiry_fence(&oldest);
+        executor.mark_expiry_fence(&middle);
+        executor.mark_expiry_fence(&newest);
+        {
+            let mut state = lock_recover(&executor.inner.state);
+            state
+                .expiry_fences
+                .get_mut(&middle.id)
+                .expect("middle fence is retained")
+                .terminal_failure = true;
+            state.expiry_terminal_cleanup_failed_current = 1;
+        }
+
+        assert!(store.unregister_exact_for_test(&middle));
+        let middle_id = middle.id;
+        drop(middle);
+
+        {
+            let state = lock_recover(&executor.inner.state);
+            assert_eq!(state.oldest_expiry_fence, Some(oldest.id));
+            assert_eq!(state.newest_expiry_fence, Some(newest.id));
+            assert!(!state.expiry_fences.contains_key(&middle_id));
+            assert_eq!(state.expiry_terminal_cleanup_failed_current, 0);
+            assert_eq!(
+                state
+                    .expiry_fences
+                    .get(&oldest.id)
+                    .and_then(|node| node.next),
+                Some(newest.id)
+            );
+            assert_eq!(
+                state
+                    .expiry_fences
+                    .get(&newest.id)
+                    .and_then(|node| node.previous),
+                Some(oldest.id)
+            );
+        }
+
+        executor.shutdown().await;
+        drop(newest);
+        drop(oldest);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn expiry_cleanup_mapping_and_terminal_failure_state_are_mode_scoped() {
+        let duration = Duration::from_millis(250);
+        let hard_zero = PhysicalAttemptResult::Succeeded {
+            reclaimed_local_bytes: 0,
+            disposition: LocalCleanupDisposition::HardReaped,
+        };
+        let soft = PhysicalAttemptResult::Succeeded {
+            reclaimed_local_bytes: 0,
+            disposition: LocalCleanupDisposition::DurableSoftDeleted,
+        };
+        for mode in [
+            LocalCleanupMode::ExplicitDelete,
+            LocalCleanupMode::CascadeCollection,
+        ] {
+            assert_eq!(expiry_cleanup_telemetry(mode, hard_zero, duration), None);
+            assert_eq!(expiry_cleanup_telemetry(mode, soft, duration), None);
+            assert_eq!(
+                expiry_cleanup_telemetry(mode, PhysicalAttemptResult::Failed, duration),
+                None,
+                "non-expiry retries/failures never emit expiry cleanup duration"
+            );
+        }
+        assert_eq!(
+            expiry_cleanup_telemetry(LocalCleanupMode::Expiry, hard_zero, duration),
+            Some(crate::telemetry::ExpiryCleanupTelemetry {
+                duration_seconds: duration.as_secs_f64(),
+                disposition: Some(crate::telemetry::ExpiryCleanupDisposition::Reaped(0)),
+            })
+        );
+        assert_eq!(
+            expiry_cleanup_telemetry(LocalCleanupMode::Expiry, soft, duration),
+            Some(crate::telemetry::ExpiryCleanupTelemetry {
+                duration_seconds: duration.as_secs_f64(),
+                disposition: Some(crate::telemetry::ExpiryCleanupDisposition::SoftDeleted),
+            })
+        );
+        assert_eq!(
+            expiry_cleanup_telemetry(
+                LocalCleanupMode::Expiry,
+                PhysicalAttemptResult::Failed,
+                duration
+            ),
+            Some(crate::telemetry::ExpiryCleanupTelemetry {
+                duration_seconds: duration.as_secs_f64(),
+                disposition: None,
+            })
+        );
+
+        let (store, expiry, directory) = store_stream("expiry-mode-failure");
+        let mut state = CoordinatorState::default();
+        assert!(mark_expiry_fence(&mut state, &expiry));
+        mark_expiry_fence_failure(&mut state, LocalCleanupMode::ExplicitDelete, &expiry);
+        mark_expiry_fence_failure(&mut state, LocalCleanupMode::CascadeCollection, &expiry);
+        assert_eq!(state.expiry_terminal_cleanup_failed_current, 0);
+        mark_expiry_fence_failure(&mut state, LocalCleanupMode::Expiry, &expiry);
+        assert_eq!(state.expiry_terminal_cleanup_failed_current, 1);
+
+        drop(expiry);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }

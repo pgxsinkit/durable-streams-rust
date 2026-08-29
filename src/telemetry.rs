@@ -502,28 +502,14 @@ mod imp {
                     .record(attempt.duration_seconds, &[]);
             }
             if let Some(disposition) = attempt.disposition {
-                match disposition {
-                    super::ExpiryCleanupDisposition::Reaped(reclaimed_local_bytes) => {
-                        m.expiry_reclaimed_local_bytes
-                            .add(reclaimed_local_bytes, &[]);
-                        m.expiry_outcome.add(
-                            1,
-                            &[KeyValue::new(
-                                "outcome",
-                                super::ExpiryOutcome::Reaped.label(),
-                            )],
-                        );
-                    }
-                    super::ExpiryCleanupDisposition::SoftDeleted => {
-                        m.expiry_outcome.add(
-                            1,
-                            &[KeyValue::new(
-                                "outcome",
-                                super::ExpiryOutcome::SoftDeleted.label(),
-                            )],
-                        );
-                    }
+                if let Some(reclaimed_local_bytes) = disposition.reclaimed_local_bytes() {
+                    m.expiry_reclaimed_local_bytes
+                        .add(reclaimed_local_bytes, &[]);
                 }
+                m.expiry_outcome.add(
+                    1,
+                    &[KeyValue::new("outcome", disposition.outcome().label())],
+                );
             }
         }
     }
@@ -737,6 +723,23 @@ pub enum ExpiryCleanupDisposition {
     SoftDeleted,
 }
 
+#[cfg_attr(not(feature = "telemetry"), allow(dead_code))]
+impl ExpiryCleanupDisposition {
+    pub const fn outcome(self) -> ExpiryOutcome {
+        match self {
+            Self::Reaped(_) => ExpiryOutcome::Reaped,
+            Self::SoftDeleted => ExpiryOutcome::SoftDeleted,
+        }
+    }
+
+    pub const fn reclaimed_local_bytes(self) -> Option<u64> {
+        match self {
+            Self::Reaped(bytes) => Some(bytes),
+            Self::SoftDeleted => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,9 +852,28 @@ mod tests {
             Some(ExpiryCleanupDisposition::Reaped(42))
         );
         assert_eq!(
+            success.disposition.unwrap().outcome(),
+            ExpiryOutcome::Reaped
+        );
+        assert_eq!(
+            success.disposition.unwrap().reclaimed_local_bytes(),
+            Some(42)
+        );
+        assert_eq!(
             soft_deleted.disposition,
             Some(ExpiryCleanupDisposition::SoftDeleted)
         );
+        assert_eq!(
+            soft_deleted.disposition.unwrap().outcome(),
+            ExpiryOutcome::SoftDeleted
+        );
+        assert_eq!(
+            soft_deleted.disposition.unwrap().reclaimed_local_bytes(),
+            None
+        );
+        let hard_zero = ExpiryCleanupDisposition::Reaped(0);
+        assert_eq!(hard_zero.outcome(), ExpiryOutcome::Reaped);
+        assert_eq!(hard_zero.reclaimed_local_bytes(), Some(0));
         assert_eq!(failed.disposition, None);
     }
 

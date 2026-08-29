@@ -1506,6 +1506,14 @@ impl Store {
         let ticket = match executor.admit(stream.clone(), priority, mode) {
             crate::retirement::RetirementAdmissionResult::Admitted(ticket) => ticket,
             crate::retirement::RetirementAdmissionResult::Existing(ticket) => {
+                // A DELETE-first owner may already have fenced this exact
+                // identity. An expiry caller adopting that ticket still owns
+                // the expiry-origin fence projection; it must not wait for a
+                // second appender pass that can never become the owner.
+                #[cfg(feature = "telemetry")]
+                if mode == LocalCleanupMode::Expiry && stream.fenced.load(Ordering::Acquire) {
+                    executor.mark_expiry_fence(&stream);
+                }
                 return ExplicitRetirementResult::Existing(ticket);
             }
             crate::retirement::RetirementAdmissionResult::Rejected(reason) => {
@@ -1646,6 +1654,15 @@ impl Store {
         self.streams
             .get(&stream.path)
             .is_some_and(|current| current.id == stream.id && Arc::ptr_eq(current.value(), stream))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unregister_exact_for_test(&self, stream: &Arc<StreamState>) -> bool {
+        self.streams
+            .remove_if(&stream.path, |_, current| {
+                current.id == stream.id && Arc::ptr_eq(current, stream)
+            })
+            .is_some()
     }
 
     fn has_expiration_policy(stream: &StreamState) -> bool {
@@ -3049,6 +3066,52 @@ mod retirement_executor_lifecycle_tests {
         assert_eq!(executor.worker_count(), 0);
 
         drop(executor);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn expiry_adopts_an_exact_delete_first_fence_for_telemetry() {
+        let (directory, store) = temporary_store("expiry-adopts-delete-fence");
+        let executor = Arc::clone(store.init_retirement_executor().unwrap());
+        let stream = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected stream creation"),
+        };
+        let appender = stream.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&stream, &appender).unwrap();
+        drop(appender);
+
+        let owner_store = Arc::clone(&store);
+        let owner_stream = Arc::clone(&stream);
+        let owner = tokio::spawn(async move { owner_store.retire_explicit(owner_stream).await });
+        wait_until_fenced(&stream).await;
+        assert_eq!(executor.expiry_telemetry_state_for_test(), (0, 0, None));
+
+        let adopted = match store.retire_expiry(Arc::clone(&stream)).await {
+            ExplicitRetirementResult::Existing(ticket) => ticket,
+            _ => panic!("expiry must adopt the exact DELETE-first retirement ticket"),
+        };
+        assert!(
+            executor.expiry_telemetry_state_for_test().2.is_some(),
+            "the adopted exact fence is expiry-origin telemetry state"
+        );
+
+        drop(guard);
+        let owner = owner.await.expect("owner task should not panic");
+        let owner = match owner {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("DELETE-first task remains the logical owner"),
+        };
+        assert!(owner.same_identity(&adopted));
+        assert!(matches!(
+            owner.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        executor.shutdown().await;
+
+        drop(stream);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -6641,6 +6704,34 @@ mod meta_sweep_tests {
             .iter()
             .any(|entry| entry.path == "soft" && entry.deleted));
 
+        st.fenced.store(true, Ordering::Release);
+        let soft = store
+            .finalize_retirement_cleanup(&st, LocalCleanupMode::Expiry)
+            .unwrap();
+        assert_eq!(soft.reclaimed_local_bytes, 0);
+        assert_eq!(
+            soft.disposition,
+            LocalCleanupDisposition::DurableSoftDeleted
+        );
+
+        let hard = create(&store, "hard-zero");
+        hard.fenced.store(true, Ordering::Release);
+        assert!(store.unregister_exact_for_test(&hard));
+        std::fs::remove_file(&hard.file_path).unwrap();
+        std::fs::remove_file(meta_path(&hard.file_path)).unwrap();
+        let hard = store
+            .finalize_retirement_cleanup(&hard, LocalCleanupMode::Expiry)
+            .unwrap();
+        assert_eq!(hard.reclaimed_local_bytes, 0);
+        assert_eq!(hard.disposition, LocalCleanupDisposition::HardReaped);
+
+        let failed = create(&store, "soft-fail");
+        failed.shared.write().unwrap().ref_count = 1;
+        DELETE_FAULT.store(1, Ordering::Relaxed);
+        assert!(store.delete_or_soft_delete_expiry(&failed).is_err());
+        DELETE_FAULT.store(0, Ordering::Relaxed);
+        assert!(!failed.shared.read().unwrap().soft_deleted);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6697,6 +6788,20 @@ mod meta_sweep_tests {
         assert!(logger.contains("path_sha256"));
         assert!(!logger.contains("path={:?}"));
         assert!(!logger.contains("stream.path,"));
+        for forbidden in [
+            "path={}",
+            "file_path.display()",
+            "stream.file_path.display()",
+            "p.display()",
+            "detail={",
+            "error={",
+            "{error}",
+        ] {
+            assert!(
+                !logger.contains(forbidden),
+                "expiry failure logger must not format raw path/error detail: {forbidden}"
+            );
+        }
         let production = source
             .split("#[cfg(test)]\nmod meta_sweep_tests")
             .next()
