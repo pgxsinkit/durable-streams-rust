@@ -351,7 +351,7 @@ impl ExpirationScannerStatus {
     }
 
     fn new_at(config: &ExpirationScannerConfig, started_at: Instant) -> Self {
-        Self {
+        let status = Self {
             initial_observe_pass_complete: std::sync::atomic::AtomicBool::new(false),
             initial_observe_pass: tokio::sync::Notify::new(),
             started_at,
@@ -361,7 +361,21 @@ impl ExpirationScannerStatus {
             bulk_fraction: config.bulk_fraction,
             clock_jump_threshold_duration: config.clock_jump_threshold_duration(),
             safety: Mutex::new(DeleteSafetyState::default()),
-        }
+        };
+        // Publish explicit zeroes so a newly started/off scanner reports both
+        // current gauges as zero rather than retaining a prior process value.
+        crate::telemetry::record_expiry_page(crate::telemetry::ExpiryPageTelemetry {
+            index_entries: 0,
+            checked: 0,
+            due: 0,
+            observed: 0,
+            stale: 0,
+            latest_due_lag_seconds: None,
+            oldest_due_lag_seconds: None,
+            bulk_guard_paused: false,
+            completed_pass_duration_seconds: None,
+        });
+        status
     }
 
     fn mark_initial_observe_pass_complete(&self) {
@@ -442,7 +456,7 @@ impl ExpirationScannerStatus {
     }
 
     fn record_scanned_page(&self, page: ScannerPageAccounting) {
-        let initial_transition = {
+        let (initial_transition, telemetry) = {
             let mut safety = self.lock_safety();
             if safety.current_pass_started_monotonic.is_none() {
                 safety.current_pass_started_monotonic = Some(page.monotonic);
@@ -469,88 +483,112 @@ impl ExpirationScannerStatus {
             {
                 safety.bulk_paused = true;
             }
-            if page.pass_complete {
+            let (initial_transition, completed_pass_duration) = if page.pass_complete {
                 safety.completed_checked = safety.current_checked;
                 safety.completed_due = safety.current_due;
                 safety.completed_max_due_lag = safety.current_max_due_lag;
                 safety.last_completed_pass_wall_time = Some(page.wall);
-                safety.last_completed_pass_duration = safety
+                let duration = safety
                     .current_pass_started_monotonic
                     .map(|started| page.monotonic.saturating_duration_since(started));
+                safety.last_completed_pass_duration = duration;
                 safety.total_passes = safety.total_passes.saturating_add(1);
                 safety.current_checked = 0;
                 safety.current_due = 0;
                 safety.current_page_count = 0;
                 safety.current_max_due_lag = None;
                 safety.current_pass_started_monotonic = None;
-                if safety.initial_observe_pass_complete {
+                let transition = if safety.initial_observe_pass_complete {
                     false
                 } else {
                     safety.initial_observe_pass_complete = true;
                     true
-                }
+                };
+                (transition, duration)
             } else {
-                false
-            }
+                (false, None)
+            };
+            (
+                initial_transition,
+                crate::telemetry::ExpiryPageTelemetry {
+                    index_entries: u64::try_from(page.index_entry_count).unwrap_or(u64::MAX),
+                    checked: page.checked,
+                    due: page.due,
+                    observed: page.checked,
+                    stale: page.stale,
+                    latest_due_lag_seconds: page.latest_due_lag.map(|lag| lag.as_secs_f64()),
+                    oldest_due_lag_seconds: page.max_due_lag.map(|lag| lag.as_secs_f64()),
+                    bulk_guard_paused: safety.bulk_paused,
+                    completed_pass_duration_seconds: completed_pass_duration
+                        .map(|duration| duration.as_secs_f64()),
+                },
+            )
         };
         self.publish_initial_observe_pass(initial_transition);
+        crate::telemetry::record_expiry_page(telemetry);
     }
 
     /// Sample exactly at the boundary after observing a page and before the
     /// scanner sleeps. The first sample only establishes a baseline.
     fn sample_clock(&self, wall: SystemTime, monotonic: Instant) {
-        let mut safety = self.lock_safety();
-        if let Some(previous) = safety.last_clock_sample {
-            let wall_elapsed = wall.duration_since(previous.wall);
-            let monotonic_elapsed = monotonic.checked_duration_since(previous.monotonic);
-            match (wall_elapsed, monotonic_elapsed) {
-                (Ok(wall_elapsed), Some(monotonic_elapsed)) => {
-                    let divergence = if wall_elapsed >= monotonic_elapsed {
-                        wall_elapsed - monotonic_elapsed
-                    } else {
-                        monotonic_elapsed - wall_elapsed
-                    };
-                    safety.latest_clock_drift = Some(divergence);
-                    if divergence > self.clock_jump_threshold_duration {
+        let latest_clock_drift = {
+            let mut safety = self.lock_safety();
+            if let Some(previous) = safety.last_clock_sample {
+                let wall_elapsed = wall.duration_since(previous.wall);
+                let monotonic_elapsed = monotonic.checked_duration_since(previous.monotonic);
+                match (wall_elapsed, monotonic_elapsed) {
+                    (Ok(wall_elapsed), Some(monotonic_elapsed)) => {
+                        let divergence = if wall_elapsed >= monotonic_elapsed {
+                            wall_elapsed - monotonic_elapsed
+                        } else {
+                            monotonic_elapsed - wall_elapsed
+                        };
+                        safety.latest_clock_drift = Some(divergence);
+                        if divergence > self.clock_jump_threshold_duration {
+                            safety.clock_paused = true;
+                        }
+                    }
+                    // A backward wall clock or impossible monotonic ordering is
+                    // unsafe for deletion activation, but remains harmless to the
+                    // read-only observer and lazy request-time expiration.
+                    (Err(_), Some(monotonic_elapsed)) => {
+                        let wall_reversal =
+                            previous.wall.duration_since(wall).unwrap_or(Duration::ZERO);
+                        safety.latest_clock_drift =
+                            Some(wall_reversal.saturating_add(monotonic_elapsed));
+                        safety.clock_paused = true;
+                    }
+                    (Ok(wall_elapsed), None) => {
+                        let monotonic_reversal = previous
+                            .monotonic
+                            .checked_duration_since(monotonic)
+                            .unwrap_or(Duration::MAX);
+                        safety.latest_clock_drift =
+                            Some(wall_elapsed.saturating_add(monotonic_reversal));
+                        safety.clock_paused = true;
+                    }
+                    (Err(_), None) => {
+                        let wall_reversal =
+                            previous.wall.duration_since(wall).unwrap_or(Duration::ZERO);
+                        let monotonic_reversal = previous
+                            .monotonic
+                            .checked_duration_since(monotonic)
+                            .unwrap_or(Duration::MAX);
+                        safety.latest_clock_drift = Some(if wall_reversal >= monotonic_reversal {
+                            wall_reversal - monotonic_reversal
+                        } else {
+                            monotonic_reversal - wall_reversal
+                        });
                         safety.clock_paused = true;
                     }
                 }
-                // A backward wall clock or impossible monotonic ordering is
-                // unsafe for deletion activation, but remains harmless to the
-                // read-only observer and lazy request-time expiration.
-                (Err(_), Some(monotonic_elapsed)) => {
-                    let wall_reversal =
-                        previous.wall.duration_since(wall).unwrap_or(Duration::ZERO);
-                    safety.latest_clock_drift =
-                        Some(wall_reversal.saturating_add(monotonic_elapsed));
-                    safety.clock_paused = true;
-                }
-                (Ok(wall_elapsed), None) => {
-                    let monotonic_reversal = previous
-                        .monotonic
-                        .checked_duration_since(monotonic)
-                        .unwrap_or(Duration::MAX);
-                    safety.latest_clock_drift =
-                        Some(wall_elapsed.saturating_add(monotonic_reversal));
-                    safety.clock_paused = true;
-                }
-                (Err(_), None) => {
-                    let wall_reversal =
-                        previous.wall.duration_since(wall).unwrap_or(Duration::ZERO);
-                    let monotonic_reversal = previous
-                        .monotonic
-                        .checked_duration_since(monotonic)
-                        .unwrap_or(Duration::MAX);
-                    safety.latest_clock_drift = Some(if wall_reversal >= monotonic_reversal {
-                        wall_reversal - monotonic_reversal
-                    } else {
-                        monotonic_reversal - wall_reversal
-                    });
-                    safety.clock_paused = true;
-                }
             }
+            safety.last_clock_sample = Some(ClockSample { wall, monotonic });
+            safety.latest_clock_drift
+        };
+        if let Some(drift) = latest_clock_drift {
+            crate::telemetry::record_expiry_clock_drift(drift.as_secs_f64());
         }
-        safety.last_clock_sample = Some(ClockSample { wall, monotonic });
     }
 
     /// Read the safety projection used by the page-level Delete admission gate.
@@ -635,30 +673,43 @@ impl ExpirationScannerStatus {
     }
 
     fn record_proactive_outcome(&self, result: &crate::store::ExplicitRetirementResult) {
-        let mut safety = self.lock_safety();
-        match result {
-            // Owner means only that logical retirement admitted this stream.
-            // Physical completion is executor-owned and belongs to 0ln-b, so
-            // this snapshot deliberately leaves `reaped` at zero here.
-            crate::store::ExplicitRetirementResult::Owner(_) => {}
-            crate::store::ExplicitRetirementResult::Existing(_) => {
-                safety.outcomes.fenced = safety.outcomes.fenced.saturating_add(1)
+        let outcome = {
+            let mut safety = self.lock_safety();
+            match result {
+                // Owner means only that logical retirement admitted this stream.
+                // Physical completion is executor-owned and belongs to 0ln-b, so
+                // this snapshot deliberately leaves `reaped` at zero here.
+                crate::store::ExplicitRetirementResult::Owner(_) => None,
+                crate::store::ExplicitRetirementResult::Existing(_) => {
+                    safety.outcomes.fenced = safety.outcomes.fenced.saturating_add(1);
+                    Some(crate::telemetry::ExpiryOutcome::Fenced)
+                }
+                crate::store::ExplicitRetirementResult::Gone => {
+                    safety.outcomes.soft_deleted = safety.outcomes.soft_deleted.saturating_add(1);
+                    Some(crate::telemetry::ExpiryOutcome::SoftDeleted)
+                }
+                crate::store::ExplicitRetirementResult::Missing
+                | crate::store::ExplicitRetirementResult::Stale => {
+                    safety.outcomes.stale = safety.outcomes.stale.saturating_add(1);
+                    Some(crate::telemetry::ExpiryOutcome::Stale)
+                }
+                crate::store::ExplicitRetirementResult::Renewed(_) => {
+                    safety.outcomes.renewed = safety.outcomes.renewed.saturating_add(1);
+                    Some(crate::telemetry::ExpiryOutcome::Renewed)
+                }
+                crate::store::ExplicitRetirementResult::Cancelled(_)
+                | crate::store::ExplicitRetirementResult::Rejected(_)
+                | crate::store::ExplicitRetirementResult::Unavailable => {
+                    safety.outcomes.failed = safety.outcomes.failed.saturating_add(1);
+                    Some(crate::telemetry::ExpiryOutcome::Failed)
+                }
             }
-            crate::store::ExplicitRetirementResult::Gone => {
-                safety.outcomes.soft_deleted = safety.outcomes.soft_deleted.saturating_add(1)
-            }
-            crate::store::ExplicitRetirementResult::Missing
-            | crate::store::ExplicitRetirementResult::Stale => {
-                safety.outcomes.stale = safety.outcomes.stale.saturating_add(1)
-            }
-            crate::store::ExplicitRetirementResult::Renewed(_) => {
-                safety.outcomes.renewed = safety.outcomes.renewed.saturating_add(1)
-            }
-            crate::store::ExplicitRetirementResult::Cancelled(_)
-            | crate::store::ExplicitRetirementResult::Rejected(_)
-            | crate::store::ExplicitRetirementResult::Unavailable => {
-                safety.outcomes.failed = safety.outcomes.failed.saturating_add(1)
-            }
+        };
+        if let Some(outcome) = outcome {
+            crate::telemetry::record_expiry_outcome(crate::telemetry::ExpiryOutcomeDelta {
+                outcome,
+                count: 1,
+            });
         }
     }
 
@@ -2003,6 +2054,9 @@ mod tests {
         status.record_proactive_outcome(&crate::store::ExplicitRetirementResult::Owner(
             crate::retirement::RetirementTicket::new(),
         ));
+        status.record_proactive_outcome(&crate::store::ExplicitRetirementResult::Existing(
+            crate::retirement::RetirementTicket::new(),
+        ));
         status.record_proactive_outcome(&crate::store::ExplicitRetirementResult::Cancelled(
             crate::retirement::RetirementTicket::new(),
         ));
@@ -2013,6 +2067,7 @@ mod tests {
             outcomes.reaped, 0,
             "logical ownership is not physical reaping"
         );
+        assert_eq!(outcomes.fenced, 1, "only an existing ticket is fenced");
         assert_eq!(
             outcomes.failed, 1,
             "identity-loss cancellation is not renewal"

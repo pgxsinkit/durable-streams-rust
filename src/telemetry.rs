@@ -21,7 +21,7 @@
 mod imp {
     use std::sync::OnceLock;
 
-    use opentelemetry::metrics::{Counter, Histogram, Meter};
+    use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
     use opentelemetry::{global, KeyValue};
     use opentelemetry_otlp::{MetricExporter, SpanExporter};
     use opentelemetry_sdk::metrics::{
@@ -53,6 +53,14 @@ mod imp {
         // Recorded only from the Linux-only blocking-sendfile offload path.
         #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         read_offload_wait: Histogram<f64>,
+        expiry_index_entries: Gauge<u64>,
+        expiry_scan_checked: Counter<u64>,
+        expiry_scan_duration: Histogram<f64>,
+        expiry_due: Counter<u64>,
+        expiry_outcome: Counter<u64>,
+        expiry_lag: Histogram<f64>,
+        expiry_clock_drift: Histogram<f64>,
+        expiry_bulk_guard_paused: Gauge<u64>,
     }
 
     impl Metrics {
@@ -94,6 +102,41 @@ mod imp {
                     .f64_histogram("ds.read.offload.wait")
                     .with_unit("s")
                     .with_description("Blocking-pool queue wait before a cold offloaded read runs.")
+                    .build(),
+                expiry_index_entries: meter
+                    .u64_gauge("ds.expiry.index.entries")
+                    .with_description("Current number of entries in the expiry index.")
+                    .build(),
+                expiry_scan_checked: meter
+                    .u64_counter("ds.expiry.scan.checked")
+                    .with_description("Expiry candidates classified by scanner pages.")
+                    .build(),
+                expiry_scan_duration: meter
+                    .f64_histogram("ds.expiry.scan.duration")
+                    .with_unit("s")
+                    .with_description("Completed expiry scanner pass duration.")
+                    .build(),
+                expiry_due: meter
+                    .u64_counter("ds.expiry.due")
+                    .with_description("Due expiry candidates classified by scanner pages.")
+                    .build(),
+                expiry_outcome: meter
+                    .u64_counter("ds.expiry.outcome")
+                    .with_description("Bounded expiry scanner outcomes.")
+                    .build(),
+                expiry_lag: meter
+                    .f64_histogram("ds.expiry.lag")
+                    .with_unit("s")
+                    .with_description("Latest and oldest due-candidate lag per scanner page.")
+                    .build(),
+                expiry_clock_drift: meter
+                    .f64_histogram("ds.expiry.clock_drift")
+                    .with_unit("s")
+                    .with_description("Scanner wall-clock versus monotonic-clock drift.")
+                    .build(),
+                expiry_bulk_guard_paused: meter
+                    .u64_gauge("ds.expiry.bulk_guard.paused")
+                    .with_description("Whether the expiry bulk safety guard is currently paused.")
                     .build(),
             }
         }
@@ -226,6 +269,9 @@ mod imp {
                     .with_view(bucket_view("ds.append.duration", LATENCY_BUCKETS))
                     .with_view(bucket_view("ds.read.duration", LATENCY_BUCKETS))
                     .with_view(bucket_view("ds.read.offload.wait", LATENCY_BUCKETS))
+                    .with_view(bucket_view("ds.expiry.scan.duration", LATENCY_BUCKETS))
+                    .with_view(bucket_view("ds.expiry.lag", LATENCY_BUCKETS))
+                    .with_view(bucket_view("ds.expiry.clock_drift", LATENCY_BUCKETS))
                     .with_view(bucket_view("ds.append.fsync.batch_size", BATCH_BUCKETS))
                     .build();
                 Some(provider)
@@ -333,6 +379,65 @@ mod imp {
         }
     }
 
+    pub fn record_expiry_page(page: super::ExpiryPageTelemetry) {
+        if let Some(m) = metrics() {
+            m.expiry_index_entries.record(page.index_entries, &[]);
+            m.expiry_bulk_guard_paused
+                .record(u64::from(page.bulk_guard_paused), &[]);
+            if page.checked != 0 {
+                m.expiry_scan_checked.add(page.checked, &[]);
+            }
+            if page.due != 0 {
+                m.expiry_due.add(page.due, &[]);
+            }
+            for delta in page.outcome_deltas() {
+                if delta.count != 0 {
+                    m.expiry_outcome.add(
+                        delta.count,
+                        &[KeyValue::new("outcome", delta.outcome.label())],
+                    );
+                }
+            }
+            if let Some(seconds) = page
+                .latest_due_lag_seconds
+                .filter(|seconds| seconds.is_finite())
+            {
+                m.expiry_lag.record(seconds, &[]);
+            }
+            if let Some(seconds) = page
+                .oldest_due_lag_seconds
+                .filter(|seconds| seconds.is_finite())
+            {
+                m.expiry_lag.record(seconds, &[]);
+            }
+            if let Some(seconds) = page
+                .completed_pass_duration_seconds
+                .filter(|seconds| seconds.is_finite())
+            {
+                m.expiry_scan_duration.record(seconds, &[]);
+            }
+        }
+    }
+
+    pub fn record_expiry_clock_drift(seconds: f64) {
+        if seconds.is_finite() {
+            if let Some(m) = metrics() {
+                m.expiry_clock_drift.record(seconds, &[]);
+            }
+        }
+    }
+
+    pub fn record_expiry_outcome(delta: super::ExpiryOutcomeDelta) {
+        if delta.count != 0 {
+            if let Some(m) = metrics() {
+                m.expiry_outcome.add(
+                    delta.count,
+                    &[KeyValue::new("outcome", delta.outcome.label())],
+                );
+            }
+        }
+    }
+
     /// Hot-path timer. Reads the monotonic clock only because telemetry is
     /// compiled in; in a default build `Timer` is the ZST below and `start` /
     /// `elapsed_secs` optimize away entirely (no `Instant::now()` on hot paths).
@@ -386,6 +491,12 @@ mod imp {
     pub fn record_tail_cache(_hit: bool, _live: &'static str) {}
     #[inline(always)]
     pub fn record_offload_wait(_secs: f64) {}
+    #[inline(always)]
+    pub fn record_expiry_page(_page: super::ExpiryPageTelemetry) {}
+    #[inline(always)]
+    pub fn record_expiry_clock_drift(_seconds: f64) {}
+    #[inline(always)]
+    pub fn record_expiry_outcome(_delta: super::ExpiryOutcomeDelta) {}
 
     /// Zero-sized no-op timer: `start`/`elapsed_secs` compile to nothing, so a
     /// default build reads no clock on hot paths.
@@ -407,6 +518,220 @@ mod imp {
 // but are part of the stable public surface — keep the re-export complete.
 #[allow(unused_imports)]
 pub use imp::{
-    init, record_append, record_append_lock_wait, record_fsync, record_offload_wait, record_read,
-    record_request, record_tail_cache, Guard, Timer,
+    init, record_append, record_append_lock_wait, record_expiry_clock_drift, record_expiry_outcome,
+    record_expiry_page, record_fsync, record_offload_wait, record_read, record_request,
+    record_tail_cache, Guard, Timer,
 };
+
+/// The complete static label domain for `ds.expiry.outcome`. No caller accepts
+/// arbitrary strings, paths, or identities as telemetry dimensions.
+#[allow(dead_code)] // The feature-off shim deliberately erases all emissions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpiryOutcome {
+    Renewed,
+    Observe,
+    Fenced,
+    SoftDeleted,
+    Reaped,
+    Stale,
+    Failed,
+}
+
+#[allow(dead_code)]
+impl ExpiryOutcome {
+    pub const ALL: [Self; 7] = [
+        Self::Renewed,
+        Self::Observe,
+        Self::Fenced,
+        Self::SoftDeleted,
+        Self::Reaped,
+        Self::Stale,
+        Self::Failed,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Renewed => "renewed",
+            Self::Observe => "observe",
+            Self::Fenced => "fenced",
+            Self::SoftDeleted => "soft_deleted",
+            Self::Reaped => "reaped",
+            Self::Stale => "stale",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// A bounded counter increment with an outcome selected from the static domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpiryOutcomeDelta {
+    pub outcome: ExpiryOutcome,
+    pub count: u64,
+}
+
+/// O(1) telemetry emitted once after each scanner page has updated its safety
+/// state. Latest and oldest lag are the page's newest due candidate and its
+/// maximum due lag respectively, both recorded in seconds when present.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpiryPageTelemetry {
+    pub index_entries: u64,
+    pub checked: u64,
+    pub due: u64,
+    pub observed: u64,
+    pub stale: u64,
+    pub latest_due_lag_seconds: Option<f64>,
+    pub oldest_due_lag_seconds: Option<f64>,
+    pub bulk_guard_paused: bool,
+    /// Present only for a pass-completing page, so pass duration is emitted once.
+    pub completed_pass_duration_seconds: Option<f64>,
+}
+
+#[allow(dead_code)]
+impl ExpiryPageTelemetry {
+    pub const fn outcome_deltas(self) -> [ExpiryOutcomeDelta; 2] {
+        [
+            ExpiryOutcomeDelta {
+                outcome: ExpiryOutcome::Observe,
+                count: self.observed,
+            },
+            ExpiryOutcomeDelta {
+                outcome: ExpiryOutcome::Stale,
+                count: self.stale,
+            },
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_outcome_labels_are_an_exhaustive_static_allowlist() {
+        let labels = ExpiryOutcome::ALL.map(ExpiryOutcome::label);
+        assert_eq!(
+            labels,
+            [
+                "renewed",
+                "observe",
+                "fenced",
+                "soft_deleted",
+                "reaped",
+                "stale",
+                "failed",
+            ]
+        );
+        assert!(labels.iter().all(|label| {
+            !label.contains("path") && !label.contains("id") && !label.contains("reason")
+        }));
+    }
+
+    #[test]
+    fn expiry_page_aggregates_only_observe_and_stale_outcomes_once() {
+        let page = ExpiryPageTelemetry {
+            index_entries: 9,
+            checked: 8,
+            due: 3,
+            observed: 8,
+            stale: 2,
+            latest_due_lag_seconds: Some(0.1),
+            oldest_due_lag_seconds: Some(0.5),
+            bulk_guard_paused: false,
+            completed_pass_duration_seconds: Some(1.0),
+        };
+        assert_eq!(
+            page.outcome_deltas(),
+            [
+                ExpiryOutcomeDelta {
+                    outcome: ExpiryOutcome::Observe,
+                    count: 8,
+                },
+                ExpiryOutcomeDelta {
+                    outcome: ExpiryOutcome::Stale,
+                    count: 2,
+                },
+            ]
+        );
+        assert_eq!(page.index_entries, 9);
+        assert!(!page.bulk_guard_paused);
+        assert_eq!(page.completed_pass_duration_seconds, Some(1.0));
+
+        let next_page = ExpiryPageTelemetry {
+            completed_pass_duration_seconds: None,
+            ..page
+        };
+        let pass_durations = [page, next_page]
+            .into_iter()
+            .filter_map(|page| page.completed_pass_duration_seconds)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pass_durations,
+            vec![1.0],
+            "a completed pass emits one duration"
+        );
+    }
+
+    #[test]
+    fn expiry_current_gauge_values_are_not_cumulative() {
+        let initial = empty_expiry_page();
+        let paused = ExpiryPageTelemetry {
+            index_entries: 9,
+            bulk_guard_paused: true,
+            ..empty_expiry_page()
+        };
+        let falling = ExpiryPageTelemetry {
+            index_entries: 2,
+            bulk_guard_paused: true,
+            ..empty_expiry_page()
+        };
+        assert_eq!(initial.index_entries, 0);
+        assert!(
+            !initial.bulk_guard_paused,
+            "a new/off scanner starts unpaused"
+        );
+        assert!(
+            paused.bulk_guard_paused,
+            "the bulk guard records its current 1 state"
+        );
+        assert_eq!(falling.index_entries, 2, "the current index gauge can fall");
+        assert!(
+            falling.bulk_guard_paused,
+            "a tripped bulk guard remains sticky"
+        );
+        assert_eq!(falling.completed_pass_duration_seconds, None);
+    }
+
+    #[test]
+    fn expiry_instrumentation_has_only_the_static_outcome_label() {
+        let source = include_str!("telemetry.rs");
+        let start = source
+            .find("pub fn record_expiry_page")
+            .expect("expiry recorder exists");
+        let end = source[start..]
+            .find("    /// Hot-path timer")
+            .map(|offset| start + offset)
+            .expect("expiry recorder section ends before Timer");
+        let expiry_recorders = &source[start..end];
+        assert!(expiry_recorders.contains("KeyValue::new(\"outcome\""));
+        for forbidden in ["\"path\"", "\"id\"", "\"reason\"", "\"status\""] {
+            assert!(
+                !expiry_recorders.contains(forbidden),
+                "expiry telemetry must not label {forbidden}"
+            );
+        }
+    }
+
+    fn empty_expiry_page() -> ExpiryPageTelemetry {
+        ExpiryPageTelemetry {
+            index_entries: 0,
+            checked: 0,
+            due: 0,
+            observed: 0,
+            stale: 0,
+            latest_due_lag_seconds: None,
+            oldest_due_lag_seconds: None,
+            bulk_guard_paused: false,
+            completed_pass_duration_seconds: None,
+        }
+    }
+}
