@@ -11,6 +11,7 @@ mod srvstats;
 mod sse_reactor;
 mod store;
 mod store_manifest;
+mod subscription_auth;
 mod subscriptions;
 mod telemetry;
 mod tier;
@@ -476,13 +477,15 @@ fn main() {
         std::process::exit(2);
     }
 
-    // WAL owns persistent state and therefore needs lifetime-exclusive access.
-    // Memory mode intentionally retains its original shared/default-dir behavior.
-    let data_dir_lock = if handlers::durability() == handlers::DurabilityMode::Wal {
-        Some(data_dir_lock::DataDirLock::acquire(&data_dir).unwrap_or_else(|e| exit_usage(e)))
-    } else {
-        None
-    };
+    // Stream sidecars and subscription state/secrets exist in both durability
+    // modes, so every server needs lifetime-exclusive access to its data dir.
+    // Without this, two memory-mode processes can replace each other's token
+    // and signing keys even though neither opens a WAL.
+    // Declared before the runtime so reverse drop order shuts the runtime down
+    // (including joining `spawn_blocking` persistence work) before releasing
+    // the inter-process lock.
+    let _data_dir_lock =
+        data_dir_lock::DataDirLock::acquire(&data_dir).unwrap_or_else(|e| exit_usage(e));
 
     let manifest = if handlers::durability() == handlers::DurabilityMode::Wal {
         if minimum_free_bytes < DEFAULT_MINIMUM_FREE_BYTES
@@ -568,9 +571,6 @@ fn main() {
         .expect("failed to build runtime");
 
     rt.block_on(async move {
-        // Hold the advisory lock until all runtime-owned store and WAL state is
-        // drained.  Its drop at the end of this block is the release point.
-        let _data_dir_lock = data_dir_lock;
         // Telemetry is OFF by default (feature-gated); a no-op unless built with
         // `--features telemetry`. Held across the run and flushed on Ctrl-C —
         // `serve()` never returns on its own.
@@ -673,13 +673,26 @@ fn main() {
             // `--features telemetry`; off the hot commit/append path.
             wal::telemetry::spawn_emitter(Arc::clone(&walset));
             wal_for_shutdown = Some(walset);
-            if let Some(readiness) = &readiness {
-                readiness.ready();
-            }
         }
 
+        // Bind before resuming webhooks so callback connections can queue in
+        // the kernel backlog even though request acceptance starts only after
+        // recovery completes.
         let addr: SocketAddr = (host, port).into();
         let listener = TcpListener::bind(addr).await.expect("bind failed");
+
+        // Subscription cursors/retries are interpreted only after stream and
+        // WAL recovery establishes authoritative durable tails. Resume all
+        // persisted leases and deliveries before advertising readiness.
+        store
+            .subscriptions
+            .resume(Arc::clone(&store))
+            .await
+            .expect("subscription recovery failed");
+        if let Some(readiness) = &readiness {
+            readiness.ready();
+        }
+
         println!(
             "durable-streams-server listening on http://{addr} (data: {})",
             data_dir.display()

@@ -86,6 +86,9 @@ passed, 0 failed, 0 skipped**. See `docs/protocol-alignment.md`; the table above
 fork-point baseline. That pass also moved `reqwest` from a test-only dependency to a runtime
 dependency for outbound webhook delivery and added direct `ring` use for Ed25519 signatures and
 fenced callback tokens; these are intentional production dependency-surface changes.
+The production-hardening follow-up added `jsonwebtoken` 9.3.1 (the last line whose declared MSRV
+fits this crate) for asymmetric service-JWT verification. Subscription state and key material now
+live inside the selected data directory and are part of that store's backup/recovery boundary.
 
 ## Open decisions
 

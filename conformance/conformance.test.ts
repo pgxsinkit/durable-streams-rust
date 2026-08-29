@@ -126,6 +126,14 @@ beforeAll(async () => {
           // configuration, never from the request Host header.
           DS_PUBLIC_BASE_URL:
             process.env.DS_PUBLIC_BASE_URL ?? `http://localhost:${port}`,
+          // The published subscription fixture predates the protocol's
+          // service-JWT claim requirement and sends no Authorization header.
+          // Production servers fail closed unless a JWKS/issuer/audience is
+          // configured; this flag is deliberately confined to conformance.
+          DS_SUBSCRIPTION_INSECURE_ALLOW_UNAUTHENTICATED_CLAIMS: `1`,
+          // The upstream webhook fixture deliberately calls a loopback HTTP
+          // server. Production defaults require HTTPS and public addresses.
+          DS_WEBHOOK_ALLOW_LOCALHOST: `1`,
         },
       }
     )

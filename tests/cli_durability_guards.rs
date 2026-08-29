@@ -353,6 +353,51 @@ fn a_second_wal_server_is_refused_by_the_data_directory_lock() {
 }
 
 #[test]
+fn a_second_memory_server_is_refused_by_the_data_directory_lock() {
+    let dir = std::env::temp_dir().join("ds-rust-cli-memory-data-dir-lock");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut owner = server()
+        .args([
+            "--durability",
+            "memory",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--port",
+            "14982",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("owner server");
+    let ready = http_response(
+        14982,
+        "GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(ready.starts_with("HTTP/1.1 404"), "{ready}");
+
+    let second = server()
+        .args([
+            "--durability",
+            "memory",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--port",
+            "14983",
+        ])
+        .output()
+        .expect("second server");
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "second stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let _ = owner.kill();
+    let _ = owner.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn readiness_is_attested_and_admin_paths_are_reserved() {
     let dir = std::env::temp_dir().join("ds-rust-cli-readiness");
     let _ = std::fs::remove_dir_all(&dir);
@@ -397,9 +442,8 @@ fn readiness_is_attested_and_admin_paths_are_reserved() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The guard is wal-only. Memory mode makes no durability claim, so a defaulted temp data dir is
-/// coherent there and must keep working — this is the path every lane and the `memory`
-/// conformance configuration take.
+/// The explicit-data-dir guard is wal-only. Memory mode makes no WAL durability claim, so a
+/// defaulted temp data dir remains coherent; it is still lifetime-locked once selected.
 #[test]
 fn memory_without_an_explicit_data_dir_still_starts() {
     let child = server()

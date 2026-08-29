@@ -1,19 +1,19 @@
 //! Reserved Durable Streams subscription control plane (PROTOCOL.md §§6–7).
 //!
-//! This intentionally mirrors the protocol's reference server: subscription
-//! state is process-local for now, while stream data and pull-wake events use
-//! the normal durable stream path. See `docs/protocol-alignment.md` for the
-//! remaining persistence/auth hardening needed before treating this as a
-//! production-durable worker queue.
+//! Subscription definitions, cursors, wakes, leases, retries, callback-token
+//! secrets, and webhook signing keys are persisted below the store data
+//! directory. Delivery is therefore resumed (and fenced) across restarts.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::io::{self, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use reqwest::Url;
@@ -21,7 +21,7 @@ use ring::digest::{digest, SHA256};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 
 use crate::api::{base64_encode, Body, Method, Req, Resp};
 use crate::store::{format_offset, parse_offset, ParsedOffset, Store};
+use crate::subscription_auth::{ServiceJwtError, ServiceJwtVerifier};
 
 const SUBSCRIPTION_SUFFIX: &str = "/__ds/subscriptions/";
 const JWKS_SUFFIX: &str = "/__ds/jwks.json";
@@ -45,9 +46,18 @@ const MAX_STREAMS_PER_SUBSCRIPTION: usize = 10_000;
 const MAX_PATTERN_BYTES: usize = 1024;
 const MAX_PATTERN_SEGMENTS: usize = 64;
 const MAX_SUBSCRIPTION_ID_BYTES: usize = 256;
+const STATE_VERSION: u32 = 1;
+const SECRETS_VERSION: u32 = 1;
+const DEFAULT_SIGNING_KEY_ROTATION_SECS: u64 = 30 * 24 * 60 * 60;
+const DEFAULT_SIGNATURE_REPLAY_WINDOW_SECS: u64 = 5 * 60;
+const JWKS_CACHE_MAX_AGE_SECS: u64 = 5 * 60;
+const MAX_WEBHOOK_RESPONSE_BYTES: usize = 64 * 1024;
+const WEBHOOK_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const ALLOW_LOCAL_WEBHOOKS_ENV: &str = "DS_WEBHOOK_ALLOW_LOCALHOST";
+const MAX_PINNED_WEBHOOK_CLIENTS: usize = 256;
 const BASE64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum SubscriptionKind {
     Webhook,
     PullWake,
@@ -62,7 +72,7 @@ impl SubscriptionKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SubscriptionConfig {
     kind: SubscriptionKind,
     pattern: Option<String>,
@@ -73,14 +83,16 @@ struct SubscriptionConfig {
     description: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct StreamLink {
     explicit: bool,
     glob: bool,
     acked_offset: String,
+    #[serde(default)]
+    stream_id: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum SubscriptionStatus {
     Active,
     Failed,
@@ -95,6 +107,7 @@ impl SubscriptionStatus {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct Subscription {
     id: String,
     stream_root: String,
@@ -110,9 +123,57 @@ struct Subscription {
     holder: Option<String>,
     lease_nonce: u64,
     retry_count: u32,
+    #[serde(default)]
+    next_attempt_at_ms: Option<u64>,
+    #[serde(default)]
+    lease_expires_at_ms: Option<u64>,
+    #[serde(default)]
+    wake_trigger: Option<String>,
+    #[serde(default)]
+    wake_delivery_pending: bool,
 }
 
-#[derive(Default)]
+#[derive(Serialize, Deserialize)]
+struct PersistedState {
+    version: u32,
+    subscriptions: Vec<Subscription>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSecrets {
+    version: u32,
+    token_secret: String,
+    active_kid: String,
+    signing_keys: Vec<PersistedSigningKey>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedSigningKey {
+    pkcs8: String,
+    kid: String,
+    x: String,
+    created_at_ms: u64,
+    retire_after_ms: Option<u64>,
+    #[serde(default)]
+    activate_after_ms: Option<u64>,
+}
+
+#[derive(Clone)]
+struct SigningKeyEntry {
+    pair: Arc<Ed25519KeyPair>,
+    persisted: PersistedSigningKey,
+    /// A monotonic lower bound paired with the persisted wall-clock deadline.
+    /// Both deadlines must pass before a pre-published key becomes active.
+    activate_not_before: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct SigningKeyRing {
+    active_kid: String,
+    keys: Vec<SigningKeyEntry>,
+}
+
+#[derive(Clone, Default)]
 struct ManagerState {
     subscriptions: HashMap<String, Subscription>,
     /// Absolute paths used as pull-wake channels. Counts allow several
@@ -123,14 +184,52 @@ struct ManagerState {
 
 pub struct SubscriptionManager {
     state: Mutex<ManagerState>,
+    /// Committed subscriptions plus creates that may have sampled stream tails.
+    /// Keeping both phases in one atomic makes the append fast-path decision a
+    /// coherent single read.
     subscription_count: AtomicUsize,
     rng: SystemRandom,
-    signing_key: Ed25519KeyPair,
-    signing_kid: String,
-    signing_x: String,
+    state_path: PathBuf,
+    dirty_revision: AtomicU64,
+    persistence_scheduled: AtomicBool,
+    persistence_sequence: AtomicU64,
+    persisted_sequence: Arc<AtomicU64>,
+    persistence_file_lock: Arc<StdMutex<()>>,
+    secrets_path: PathBuf,
+    signing_keys: StdMutex<SigningKeyRing>,
+    signing_rotation_ms: u64,
+    signing_replay_window_ms: u64,
+    token_secret: [u8; 32],
     token_key: hmac::Key,
-    http: reqwest::Client,
+    service_jwt: ServiceJwtVerifier,
     public_base_url: Option<String>,
+}
+
+struct SubscriptionCreateGuard<'a> {
+    counter: &'a AtomicUsize,
+    committed: bool,
+}
+
+impl<'a> SubscriptionCreateGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Release);
+        Self {
+            counter,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SubscriptionCreateGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.counter.fetch_sub(1, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -196,6 +295,7 @@ enum Delivery {
         key: String,
         generation: u64,
         wake_id: String,
+        nonce: u64,
     },
     PullWake {
         key: String,
@@ -205,29 +305,54 @@ enum Delivery {
         stream: String,
         generation: u64,
         wake_id: String,
+        nonce: u64,
     },
 }
 
 impl SubscriptionManager {
-    pub fn new() -> io::Result<Self> {
+    pub fn new(data_dir: &Path) -> io::Result<Self> {
         let rng = SystemRandom::new();
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
-            .map_err(|_| io::Error::other("failed to generate webhook signing key"))?;
-        let signing_key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
-            .map_err(|_| io::Error::other("failed to parse webhook signing key"))?;
-        let signing_x = base64_encode(signing_key.public_key().as_ref(), BASE64_URL, false);
-        let thumbprint = format!("{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"{signing_x}\"}}");
-        let signing_kid = format!(
-            "ds_{}",
-            base64_encode(
-                digest(&SHA256, thumbprint.as_bytes()).as_ref(),
-                BASE64_URL,
-                false
-            )
-        );
-        let mut token_secret = [0u8; 32];
-        rng.fill(&mut token_secret)
-            .map_err(|_| io::Error::other("failed to generate callback token key"))?;
+        let subscription_dir = data_dir.join("subscriptions");
+        create_secure_dir(&subscription_dir)?;
+        let state_path = subscription_dir.join("state.json");
+        let secrets_path = subscription_dir.join("secrets.json");
+        let mut state = load_persisted_state(&state_path)?;
+        if !state.subscriptions.is_empty() && !secrets_path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "persisted subscriptions exist but {} is missing; refusing to replace the store's token and webhook identity",
+                    secrets_path.display()
+                ),
+            ));
+        }
+        let (mut signing_keys, token_secret) = load_or_create_secrets(&secrets_path, &rng)?;
+        let signing_rotation_ms = env_seconds(
+            "DS_WEBHOOK_SIGNING_KEY_ROTATION_SECS",
+            DEFAULT_SIGNING_KEY_ROTATION_SECS,
+        )?
+        .saturating_mul(1_000);
+        let signing_replay_window_ms = env_seconds(
+            "DS_WEBHOOK_SIGNATURE_REPLAY_WINDOW_SECS",
+            DEFAULT_SIGNATURE_REPLAY_WINDOW_SECS,
+        )?
+        .saturating_mul(1_000);
+        if signing_replay_window_ms < JWKS_CACHE_MAX_AGE_SECS.saturating_mul(1_000) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "DS_WEBHOOK_SIGNATURE_REPLAY_WINDOW_SECS must be at least {JWKS_CACHE_MAX_AGE_SECS}"
+                ),
+            ));
+        }
+        if rotate_signing_keys_if_due(
+            &mut signing_keys,
+            &rng,
+            signing_rotation_ms,
+            signing_replay_window_ms,
+        )? {
+            persist_secrets(&secrets_path, &signing_keys, &token_secret)?;
+        }
         let public_base_url = match std::env::var("DS_PUBLIC_BASE_URL") {
             Ok(configured) if !configured.is_empty() => Some(
                 validate_public_base_url(&configured)
@@ -235,24 +360,227 @@ impl SubscriptionManager {
             ),
             _ => None,
         };
+        if state
+            .subscriptions
+            .values()
+            .any(|subscription| subscription.config.kind == SubscriptionKind::Webhook)
+            && public_base_url.is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DS_PUBLIC_BASE_URL is required to resume persisted webhook subscriptions",
+            ));
+        }
+        let mut wake_streams = HashMap::new();
+        for subscription in state.subscriptions.values_mut() {
+            if subscription.config.kind == SubscriptionKind::Webhook {
+                subscription.callback_base_url = public_base_url.clone().unwrap_or_default();
+            }
+            if let Some(wake_stream) = subscription.config.wake_stream.as_deref() {
+                *wake_streams
+                    .entry(absolute_stream_path(&subscription.stream_root, wake_stream))
+                    .or_default() += 1;
+            }
+        }
+        state.wake_streams = wake_streams;
+        let subscription_count = state.subscriptions.len();
+        let token_key = hmac::Key::new(hmac::HMAC_SHA256, &token_secret);
+        #[cfg(not(test))]
+        let service_jwt = ServiceJwtVerifier::from_env()?;
+        #[cfg(test)]
+        let service_jwt = ServiceJwtVerifier::insecure_for_tests();
         Ok(Self {
-            state: Mutex::new(ManagerState::default()),
-            subscription_count: AtomicUsize::new(0),
+            state: Mutex::new(state),
+            subscription_count: AtomicUsize::new(subscription_count),
             rng,
-            signing_key,
-            signing_kid,
-            signing_x,
-            token_key: hmac::Key::new(hmac::HMAC_SHA256, &token_secret),
+            state_path,
+            dirty_revision: AtomicU64::new(0),
+            persistence_scheduled: AtomicBool::new(false),
+            persistence_sequence: AtomicU64::new(0),
+            persisted_sequence: Arc::new(AtomicU64::new(0)),
+            persistence_file_lock: Arc::new(StdMutex::new(())),
+            secrets_path,
+            signing_keys: StdMutex::new(signing_keys),
+            signing_rotation_ms,
+            signing_replay_window_ms,
+            token_secret,
+            token_key,
+            service_jwt,
             public_base_url,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                // A validated public URL must not redirect delivery into a
-                // private address. DNS resolution still needs production
-                // hardening; see docs/protocol-alignment.md.
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(io::Error::other)?,
         })
+    }
+
+    fn persist_state(&self, state: &ManagerState) -> io::Result<()> {
+        let persisted = PersistedState {
+            version: STATE_VERSION,
+            subscriptions: state.subscriptions.values().cloned().collect(),
+        };
+        let sequence = self
+            .persistence_sequence
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        persist_ordered_snapshot(
+            &self.state_path,
+            &self.persistence_file_lock,
+            &self.persisted_sequence,
+            sequence,
+            &persisted,
+        )
+    }
+
+    fn persist_state_for_request(&self, state: &ManagerState) -> bool {
+        match self.persist_state(state) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(%error, "failed to persist subscription control state");
+                false
+            }
+        }
+    }
+
+    fn persist_background_or_abort(&self, state: &ManagerState, transition: &str) {
+        if let Err(error) = self.persist_state(state) {
+            // There is no HTTP request to fail and rolling back may duplicate
+            // an already-issued webhook or durable wake append. Fail-stop so
+            // restart recovery replays the last durable fenced generation.
+            eprintln!(
+                "fatal: failed to persist subscription {transition}; refusing to continue with split durable and in-memory state: {error}"
+            );
+            std::process::abort();
+        }
+    }
+
+    fn schedule_state_persistence(self: &Arc<Self>) {
+        self.dirty_revision.fetch_add(1, Ordering::AcqRel);
+        if self.persistence_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut delay_ms = 0u64;
+            loop {
+                if delay_ms != 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                let target_revision = manager.dirty_revision.load(Ordering::Acquire);
+                // Clone the latest state under the manager lock, then release
+                // it before serialization/fsync. Ordered sequence fencing in
+                // persist_ordered_snapshot prevents this snapshot from
+                // overwriting a newer request-committed state if writes race.
+                let state = manager.state.lock().await;
+                let persisted = PersistedState {
+                    version: STATE_VERSION,
+                    subscriptions: state.subscriptions.values().cloned().collect(),
+                };
+                let sequence = manager
+                    .persistence_sequence
+                    .fetch_add(1, Ordering::AcqRel)
+                    .wrapping_add(1);
+                drop(state);
+                let path = manager.state_path.clone();
+                let file_lock = Arc::clone(&manager.persistence_file_lock);
+                let persisted_sequence = Arc::clone(&manager.persisted_sequence);
+                let result = tokio::task::spawn_blocking(move || {
+                    persist_ordered_snapshot(
+                        &path,
+                        &file_lock,
+                        &persisted_sequence,
+                        sequence,
+                        &persisted,
+                    )
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {
+                        delay_ms = 0;
+                        manager
+                            .persistence_scheduled
+                            .store(false, Ordering::Release);
+                        if manager.dirty_revision.load(Ordering::Acquire) == target_revision {
+                            break;
+                        }
+                        // A mutation raced the write. Either its caller has
+                        // already installed a successor writer, or this task
+                        // reacquires responsibility and persists the latest
+                        // coalesced snapshot.
+                        if manager.persistence_scheduled.swap(true, Ordering::AcqRel) {
+                            break;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, "retrying subscription state persistence");
+                        delay_ms = if delay_ms == 0 {
+                            100
+                        } else {
+                            delay_ms.saturating_mul(2).min(10_000)
+                        };
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "subscription state writer task failed");
+                        delay_ms = 100;
+                    }
+                }
+            }
+        });
+    }
+
+    fn refresh_signing_keys(&self) -> io::Result<()> {
+        let mut keys = self.signing_keys.lock().unwrap();
+        let mut candidate = clone_signing_key_ring(&keys);
+        if rotate_signing_keys_if_due(
+            &mut candidate,
+            &self.rng,
+            self.signing_rotation_ms,
+            self.signing_replay_window_ms,
+        )? {
+            // Publish or activate a key only after the complete candidate
+            // keyring is durable. A failed write leaves the live ring exactly
+            // as it was, so JWKS and signatures cannot expose an ephemeral key.
+            persist_secrets(&self.secrets_path, &candidate, &self.token_secret)?;
+            *keys = candidate;
+        }
+        Ok(())
+    }
+
+    fn active_signing_metadata(&self) -> (String, String) {
+        let keys = self.signing_keys.lock().unwrap();
+        let active = keys
+            .keys
+            .iter()
+            .find(|key| key.persisted.kid == keys.active_kid)
+            .expect("validated keyring always has its active key");
+        (active.persisted.kid.clone(), active.persisted.x.clone())
+    }
+
+    fn jwks(&self) -> io::Result<Value> {
+        self.refresh_signing_keys()?;
+        let keys = self.signing_keys.lock().unwrap();
+        Ok(json!({
+            "keys": keys.keys.iter().map(|key| json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": key.persisted.x,
+                "kid": key.persisted.kid,
+                "use": "sig",
+                "alg": "EdDSA"
+            })).collect::<Vec<_>>()
+        }))
+    }
+
+    fn sign_webhook(&self, message: &[u8]) -> io::Result<(String, String)> {
+        self.refresh_signing_keys()?;
+        let keys = self.signing_keys.lock().unwrap();
+        let active = keys
+            .keys
+            .iter()
+            .find(|key| key.persisted.kid == keys.active_kid)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "active signing key missing")
+            })?;
+        Ok((
+            active.persisted.kid.clone(),
+            base64_encode(active.pair.sign(message).as_ref(), BASE64_URL, false),
+        ))
     }
 
     pub async fn handle(self: &Arc<Self>, store: Arc<Store>, req: Req) -> Resp {
@@ -269,16 +597,13 @@ impl SubscriptionManager {
                 if req.method != Method::Get {
                     return method_not_allowed();
                 }
-                let body = json!({
-                    "keys": [{
-                        "kty": "OKP",
-                        "crv": "Ed25519",
-                        "x": self.signing_x,
-                        "kid": self.signing_kid,
-                        "use": "sig",
-                        "alg": "EdDSA"
-                    }]
-                });
+                let body = match self.jwks() {
+                    Ok(body) => body,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to rotate webhook signing keys");
+                        return internal_subscription_error();
+                    }
+                };
                 json_response_with_type(200, body, "application/jwk-set+json", true)
             }
             Route::Base(root, id) => match req.method {
@@ -301,11 +626,15 @@ impl SubscriptionManager {
                 }
                 Method::Delete => {
                     let mut state = self.state.lock().await;
-                    let removed = state.subscriptions.remove(&subscription_key(&root, &id));
-                    if let Some(subscription) = &removed {
-                        unregister_wake_stream(&mut state, subscription);
-                    }
-                    if removed.is_some() {
+                    let key = subscription_key(&root, &id);
+                    let removed = state.subscriptions.remove(&key);
+                    if let Some(subscription) = removed {
+                        unregister_wake_stream(&mut state, &subscription);
+                        if !self.persist_state_for_request(&state) {
+                            register_wake_stream(&mut state, &subscription, &store);
+                            state.subscriptions.insert(key, subscription);
+                            return internal_subscription_error();
+                        }
                         self.subscription_count.fetch_sub(1, Ordering::Release);
                     }
                     Resp::new(204)
@@ -387,14 +716,26 @@ impl SubscriptionManager {
                         "Subscription stream limit exceeded",
                     );
                 }
+                let before = subscription.clone();
                 for stream in normalized {
-                    let tail = tail_offset(&store, &root, &stream);
+                    let metadata = live_stream_metadata(&store, &root, &stream);
+                    let tail = metadata
+                        .as_ref()
+                        .map(|(_, tail)| tail.clone())
+                        .unwrap_or_else(|| format_offset(0));
                     let link = subscription.streams.entry(stream).or_insert(StreamLink {
                         explicit: false,
                         glob: false,
                         acked_offset: tail,
+                        stream_id: metadata.map(|(id, _)| id),
                     });
                     link.explicit = true;
+                }
+                if !self.persist_state_for_request(&state) {
+                    state
+                        .subscriptions
+                        .insert(subscription_key(&root, &id), before);
+                    return internal_subscription_error();
                 }
                 Resp::new(204)
             }
@@ -403,20 +744,25 @@ impl SubscriptionManager {
                     return method_not_allowed();
                 }
                 let mut state = self.state.lock().await;
-                let Some(subscription) = state.subscriptions.get_mut(&subscription_key(&root, &id))
-                else {
+                let key = subscription_key(&root, &id);
+                let Some(subscription) = state.subscriptions.get_mut(&key) else {
                     return subscription_error(
                         404,
                         "SUBSCRIPTION_NOT_FOUND",
                         "Subscription not found",
                     );
                 };
+                let before = subscription.clone();
                 let stream_path = normalize_relative_path(&stream_path);
                 if let Some(link) = subscription.streams.get_mut(&stream_path) {
                     link.explicit = false;
                     if !link.glob {
                         subscription.streams.remove(&stream_path);
                     }
+                }
+                if !self.persist_state_for_request(&state) {
+                    state.subscriptions.insert(key, before);
+                    return internal_subscription_error();
                 }
                 Resp::new(204)
             }
@@ -464,6 +810,183 @@ impl SubscriptionManager {
         }
     }
 
+    /// Resume persisted retries and leases after stream/WAL recovery has made
+    /// the durable stream tails authoritative. This runs once before the
+    /// listener accepts requests.
+    pub async fn resume(self: &Arc<Self>, store: Arc<Store>) -> io::Result<()> {
+        let now = unix_millis();
+        let (scheduled, leases) = {
+            let mut state = self.state.lock().await;
+            let mut scheduled = Vec::new();
+            let mut leases = Vec::new();
+            let wake_paths = state.wake_streams.keys().cloned().collect::<HashSet<_>>();
+            let roots = state
+                .subscriptions
+                .values()
+                .map(|subscription| subscription.stream_root.clone())
+                .collect::<HashSet<_>>();
+            let streams_by_root = roots
+                .into_iter()
+                .map(|root| {
+                    let streams = list_streams(&store, &root);
+                    (root, streams)
+                })
+                .collect::<HashMap<_, _>>();
+            // A stream append becomes durable before its derived subscription
+            // snapshot is fsynced. Reconcile recovered inventory against every
+            // pattern so a crash in that narrow window replays at least once
+            // instead of losing the stream forever.
+            for subscription in state.subscriptions.values_mut() {
+                let Some(streams) = streams_by_root.get(&subscription.stream_root) else {
+                    continue;
+                };
+                let pattern = subscription.config.pattern.clone();
+                let mut incarnation_changed = false;
+                for (path, link) in &mut subscription.streams {
+                    match live_stream_metadata(&store, &subscription.stream_root, path) {
+                        Some((current_id, _)) => {
+                            link.glob = pattern
+                                .as_deref()
+                                .is_some_and(|pattern| glob_match(pattern, path));
+                            // `None` is a state-v1 migration: learn the identity
+                            // without replaying. A known mismatch is a new stream
+                            // incarnation and must restart at the beginning.
+                            if link.stream_id.is_some_and(|old_id| old_id != current_id) {
+                                link.acked_offset = BEFORE_FIRST_OFFSET.to_string();
+                                incarnation_changed = true;
+                            }
+                            link.stream_id = Some(current_id);
+                        }
+                        None => {
+                            link.glob = false;
+                            if link.explicit {
+                                // Explicit membership survives deletion, but a
+                                // later recreation has a fresh offset space.
+                                link.acked_offset = BEFORE_FIRST_OFFSET.to_string();
+                            }
+                            if link.stream_id.take().is_some() {
+                                incarnation_changed = true;
+                            }
+                        }
+                    }
+                }
+                subscription
+                    .streams
+                    .retain(|_, link| link.explicit || link.glob);
+                if incarnation_changed {
+                    // Fence any recovered holder/callback whose snapshot named
+                    // a deleted or replaced stream incarnation. The pending scan
+                    // below will mint a fresh generation when work remains.
+                    clear_wake(subscription);
+                }
+                let Some(pattern) = pattern.as_deref() else {
+                    continue;
+                };
+                for stream in streams {
+                    if wake_paths.contains(&absolute_stream_path(&subscription.stream_root, stream))
+                        || subscription.config.wake_stream.as_deref() == Some(stream.as_str())
+                        || !glob_match(pattern, stream)
+                        || subscription.streams.contains_key(stream)
+                    {
+                        continue;
+                    }
+                    if subscription.streams.len() >= MAX_STREAMS_PER_SUBSCRIPTION {
+                        tracing::warn!(
+                            subscription_id = subscription.id,
+                            stream,
+                            "subscription stream limit reached during restart reconciliation"
+                        );
+                        continue;
+                    }
+                    subscription.streams.insert(
+                        stream.clone(),
+                        StreamLink {
+                            explicit: false,
+                            glob: true,
+                            acked_offset: BEFORE_FIRST_OFFSET.to_string(),
+                            stream_id: live_stream_metadata(
+                                &store,
+                                &subscription.stream_root,
+                                stream,
+                            )
+                            .map(|(id, _)| id),
+                        },
+                    );
+                }
+            }
+            for (key, subscription) in state.subscriptions.iter_mut() {
+                if let Some(wake_id) = subscription.wake_id.clone() {
+                    if let Some(expires_at_ms) = subscription.lease_expires_at_ms {
+                        if expires_at_ms > now {
+                            leases.push((
+                                key.clone(),
+                                subscription.generation,
+                                wake_id,
+                                subscription.lease_nonce,
+                                expires_at_ms,
+                            ));
+                            if subscription.config.kind == SubscriptionKind::Webhook
+                                && subscription.wake_delivery_pending
+                            {
+                                if let Some(delivery) = current_delivery(subscription, &store) {
+                                    scheduled.push((
+                                        delivery,
+                                        subscription.next_attempt_at_ms.unwrap_or(now),
+                                    ));
+                                }
+                            }
+                            continue;
+                        }
+                        clear_wake(subscription);
+                        if has_pending_work(subscription, &store) {
+                            let triggered = first_pending(subscription, &store);
+                            let delivery = self.create_wake(subscription, &store, triggered);
+                            scheduled.push((delivery, now));
+                        }
+                        continue;
+                    }
+                    if subscription.wake_delivery_pending {
+                        if let Some(delivery) = current_delivery(subscription, &store) {
+                            scheduled
+                                .push((delivery, subscription.next_attempt_at_ms.unwrap_or(now)));
+                        }
+                    } else if subscription.config.kind == SubscriptionKind::Webhook {
+                        // A delivered webhook that is awaiting async callback
+                        // always has a lease. Recover conservatively from an
+                        // incomplete/corrupt transition by replaying the same
+                        // fenced wake rather than dropping it.
+                        subscription.wake_delivery_pending = true;
+                        if let Some(delivery) = current_delivery(subscription, &store) {
+                            scheduled.push((delivery, now));
+                        }
+                    }
+                } else if has_pending_work(subscription, &store) {
+                    let triggered = first_pending(subscription, &store);
+                    let delivery = self.create_wake(subscription, &store, triggered);
+                    scheduled.push((delivery, now));
+                }
+            }
+            self.persist_state(&state)?;
+            (scheduled, leases)
+        };
+        for lease in leases {
+            self.spawn_lease_expiry(store.clone(), lease);
+        }
+        for (delivery, attempt_at_ms) in scheduled {
+            if attempt_at_ms <= unix_millis() {
+                self.execute_delivery(store.clone(), delivery).await;
+                continue;
+            }
+            let manager = Arc::clone(self);
+            let store = store.clone();
+            tokio::spawn(async move {
+                sleep_until_unix_ms(attempt_at_ms).await;
+                manager.execute_delivery(store, delivery).await;
+            });
+        }
+        Ok(())
+    }
+
     async fn handle_create(
         &self,
         store: Arc<Store>,
@@ -471,6 +994,10 @@ impl SubscriptionManager {
         stream_root: String,
         id: String,
     ) -> Resp {
+        // Reserve the append fast-path counter before any source-tail sample.
+        // Early returns and cancellation release it; a successful new create
+        // converts this reservation into the committed subscription count.
+        let mut create_guard = SubscriptionCreateGuard::new(&self.subscription_count);
         let raw: RawCreateRequest = match serde_json::from_slice(&req.body) {
             Ok(value) => value,
             Err(_) => {
@@ -559,6 +1086,10 @@ impl SubscriptionManager {
             holder: None,
             lease_nonce: 0,
             retry_count: 0,
+            next_attempt_at_ms: None,
+            lease_expires_at_ms: None,
+            wake_trigger: None,
+            wake_delivery_pending: false,
         };
         for stream in &subscription.config.streams {
             if state
@@ -577,6 +1108,8 @@ impl SubscriptionManager {
                     explicit: true,
                     glob: false,
                     acked_offset: tail_offset(&store, &subscription.stream_root, stream),
+                    stream_id: live_stream_metadata(&store, &subscription.stream_root, stream)
+                        .map(|(id, _)| id),
                 },
             );
         }
@@ -598,19 +1131,55 @@ impl SubscriptionManager {
                         );
                     }
                     let tail = tail_offset(&store, &subscription.stream_root, &stream);
+                    let stream_id =
+                        live_stream_metadata(&store, &subscription.stream_root, &stream)
+                            .map(|(id, _)| id);
                     let link = subscription.streams.entry(stream).or_insert(StreamLink {
                         explicit: false,
                         glob: false,
                         acked_offset: tail,
+                        stream_id,
                     });
                     link.glob = true;
                 }
             }
         }
         let body = self.serialize(&subscription, &store);
+        let rollback_subscriptions = subscription
+            .config
+            .wake_stream
+            .as_deref()
+            .map(|wake_stream| {
+                let absolute = absolute_stream_path(&subscription.stream_root, wake_stream);
+                state
+                    .subscriptions
+                    .iter()
+                    .filter_map(|(key, existing)| {
+                        let relative = relative_stream_path(&existing.stream_root, &absolute)?;
+                        existing
+                            .streams
+                            .contains_key(&relative)
+                            .then(|| (key.clone(), existing.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         register_wake_stream(&mut state, &subscription, &store);
-        state.subscriptions.insert(subscription_key, subscription);
-        self.subscription_count.fetch_add(1, Ordering::Release);
+        state
+            .subscriptions
+            .insert(subscription_key.clone(), subscription);
+        if !self.persist_state_for_request(&state) {
+            let subscription = state
+                .subscriptions
+                .remove(&subscription_key)
+                .expect("new subscription inserted");
+            unregister_wake_stream(&mut state, &subscription);
+            for (key, existing) in rollback_subscriptions {
+                state.subscriptions.insert(key, existing);
+            }
+            return internal_subscription_error();
+        }
+        create_guard.commit();
         json_response(201, body)
     }
 
@@ -621,6 +1190,33 @@ impl SubscriptionManager {
         stream_root: String,
         id: String,
     ) -> Resp {
+        match self.service_jwt.verify(bearer_token(&req)).await {
+            Ok(()) => {}
+            Err(ServiceJwtError::Unavailable) => {
+                return subscription_error(
+                    503,
+                    "SERVICE_JWT_NOT_CONFIGURED",
+                    "Pull-wake claims require service-JWT verification",
+                )
+            }
+            Err(ServiceJwtError::Missing) => {
+                return subscription_error(
+                    401,
+                    "SERVICE_JWT_REQUIRED",
+                    "Missing service JWT Authorization header",
+                )
+            }
+            Err(ServiceJwtError::Invalid) => {
+                return subscription_error(401, "SERVICE_JWT_INVALID", "Service JWT is invalid")
+            }
+            Err(ServiceJwtError::Forbidden) => {
+                return subscription_error(
+                    403,
+                    "SERVICE_JWT_FORBIDDEN",
+                    "Service JWT does not grant the required scope",
+                )
+            }
+        }
         #[derive(Deserialize)]
         struct ClaimRequest {
             worker: String,
@@ -635,16 +1231,23 @@ impl SubscriptionManager {
                 )
             }
         };
-        let (response, lease, delivery) = {
+        let (response, lease) = {
             let mut state = self.state.lock().await;
-            let Some(subscription) = state
-                .subscriptions
-                .get_mut(&subscription_key(&stream_root, &id))
-            else {
+            let key = subscription_key(&stream_root, &id);
+            let Some(subscription) = state.subscriptions.get_mut(&key) else {
                 return subscription_error(404, "SUBSCRIPTION_NOT_FOUND", "Subscription not found");
             };
             if subscription.config.kind != SubscriptionKind::PullWake {
                 return subscription_error(400, "INVALID_REQUEST", "Subscription is not pull-wake");
+            }
+            if subscription.holder.is_some()
+                && subscription
+                    .lease_expires_at_ms
+                    .is_some_and(|deadline| deadline <= unix_millis())
+            {
+                // Do not depend on a delayed timer task to make an expired
+                // durable lease reclaimable.
+                clear_wake(subscription);
             }
             if let Some(holder) = &subscription.holder {
                 return json_response(
@@ -663,13 +1266,11 @@ impl SubscriptionManager {
                     "Subscription has no pending work",
                 );
             }
-            let mut delivery = None;
+            let before = subscription.clone();
             if subscription.wake_id.is_none() {
-                delivery = Some(self.create_wake(
-                    subscription,
-                    &store,
-                    first_pending(subscription, &store),
-                ));
+                // The claimant already has direct evidence of this generation,
+                // so no wake-stream notification is needed for this transition.
+                let _ = self.create_wake(subscription, &store, first_pending(subscription, &store));
             }
             subscription.holder = Some(claim.worker);
             let token = self.generate_token(
@@ -678,15 +1279,22 @@ impl SubscriptionManager {
             );
             subscription.token = Some(token.clone());
             subscription.lease_nonce = subscription.lease_nonce.wrapping_add(1);
+            subscription.wake_delivery_pending = false;
+            subscription.next_attempt_at_ms = None;
+            subscription.status = SubscriptionStatus::Active;
+            subscription.retry_count = 0;
+            let lease_expires_at_ms =
+                unix_millis().saturating_add(subscription.config.lease_ttl_ms);
+            subscription.lease_expires_at_ms = Some(lease_expires_at_ms);
             let lease = (
                 subscription_key(&subscription.stream_root, &subscription.id),
                 subscription.generation,
                 subscription.wake_id.clone().unwrap_or_default(),
                 subscription.lease_nonce,
-                subscription.config.lease_ttl_ms,
+                lease_expires_at_ms,
             );
             let streams = stream_infos_json(subscription, &store, true);
-            (
+            let result = (
                 json!({
                     "wake_id": subscription.wake_id,
                     "generation": subscription.generation,
@@ -695,12 +1303,13 @@ impl SubscriptionManager {
                     "lease_ttl_ms": subscription.config.lease_ttl_ms
                 }),
                 lease,
-                delivery,
-            )
+            );
+            if !self.persist_state_for_request(&state) {
+                state.subscriptions.insert(key, before);
+                return internal_subscription_error();
+            }
+            result
         };
-        if let Some(delivery) = delivery {
-            self.execute_delivery(store.clone(), delivery).await;
-        }
         self.spawn_lease_expiry(store, lease);
         json_response(200, response)
     }
@@ -747,6 +1356,7 @@ impl SubscriptionManager {
             {
                 return subscription_error(409, "FENCED", "Wake generation is stale");
             }
+            let before = subscription.clone();
             if let Err(message) = apply_acks(subscription, &request, &store) {
                 return subscription_error(409, "INVALID_OFFSET", message);
             }
@@ -755,6 +1365,8 @@ impl SubscriptionManager {
             let mut lease = None;
             let mut next_wake = false;
             if request.done == Some(true) {
+                // Pull/callback completion applies only explicit `acks`.
+                // Omitted snapshot streams remain pending for the next wake.
                 clear_wake(subscription);
                 if has_pending_work(subscription, &store) {
                     let triggered = first_pending(subscription, &store);
@@ -763,15 +1375,27 @@ impl SubscriptionManager {
                 }
             } else {
                 subscription.lease_nonce = subscription.lease_nonce.wrapping_add(1);
+                subscription.wake_delivery_pending = false;
+                subscription.next_attempt_at_ms = None;
+                subscription.status = SubscriptionStatus::Active;
+                subscription.retry_count = 0;
+                let lease_expires_at_ms =
+                    unix_millis().saturating_add(subscription.config.lease_ttl_ms);
+                subscription.lease_expires_at_ms = Some(lease_expires_at_ms);
                 lease = Some((
                     key.clone(),
                     subscription.generation,
                     subscription.wake_id.clone().unwrap_or_default(),
                     subscription.lease_nonce,
-                    subscription.config.lease_ttl_ms,
+                    lease_expires_at_ms,
                 ));
             }
-            (json!({"ok": true, "next_wake": next_wake}), delivery, lease)
+            let result = (json!({"ok": true, "next_wake": next_wake}), delivery, lease);
+            if !self.persist_state_for_request(&state) {
+                state.subscriptions.insert(key.clone(), before);
+                return internal_subscription_error();
+            }
+            result
         };
         if let Some(lease) = lease {
             self.spawn_lease_expiry(store.clone(), lease);
@@ -821,13 +1445,19 @@ impl SubscriptionManager {
             {
                 return subscription_error(409, "FENCED", "Wake generation is stale");
             }
+            let before = subscription.clone();
             clear_wake(subscription);
-            if has_pending_work(subscription, &store) {
+            let delivery = if has_pending_work(subscription, &store) {
                 let triggered = first_pending(subscription, &store);
                 Some(self.create_wake(subscription, &store, triggered))
             } else {
                 None
+            };
+            if !self.persist_state_for_request(&state) {
+                state.subscriptions.insert(key.clone(), before);
+                return internal_subscription_error();
             }
+            delivery
         };
         if let Some(delivery) = delivery {
             self.execute_delivery(store, delivery).await;
@@ -845,11 +1475,30 @@ impl SubscriptionManager {
                 return;
             }
             let mut deliveries = Vec::new();
+            let mut changed = false;
             for subscription in state.subscriptions.values_mut() {
                 let Some(relative) = relative_stream_path(&subscription.stream_root, absolute_path)
                 else {
                     continue;
                 };
+                let current_id = live_stream_metadata(&store, &subscription.stream_root, &relative)
+                    .map(|(id, _)| id);
+                let replaced = subscription.streams.get_mut(&relative).is_some_and(|link| {
+                    let replaced = link.stream_id.is_some() && link.stream_id != current_id;
+                    if replaced {
+                        link.acked_offset = BEFORE_FIRST_OFFSET.to_string();
+                    }
+                    link.stream_id = current_id;
+                    replaced
+                });
+                if replaced {
+                    // Explicit and glob links share incarnation fencing. Lazy
+                    // TTL expiry bypasses `on_stream_deleted`, so the first
+                    // append to a recreated path must invalidate the old wake.
+                    subscription.wake_snapshot.remove(&relative);
+                    clear_wake(subscription);
+                    changed = true;
+                }
                 if subscription
                     .config
                     .pattern
@@ -859,12 +1508,15 @@ impl SubscriptionManager {
                     if !subscription.streams.contains_key(&relative)
                         && subscription.streams.len() >= MAX_STREAMS_PER_SUBSCRIPTION
                     {
-                        tracing::warn!(
-                            subscription_id = subscription.id,
-                            stream = relative,
-                            "subscription stream limit reached; glob match not linked"
-                        );
-                        continue;
+                        changed |= prune_stale_glob_links(subscription, &store);
+                        if subscription.streams.len() >= MAX_STREAMS_PER_SUBSCRIPTION {
+                            tracing::warn!(
+                                subscription_id = subscription.id,
+                                stream = relative,
+                                "subscription stream limit reached; glob match not linked"
+                            );
+                            continue;
+                        }
                     }
                     let link = subscription
                         .streams
@@ -873,7 +1525,10 @@ impl SubscriptionManager {
                             explicit: false,
                             glob: false,
                             acked_offset: BEFORE_FIRST_OFFSET.to_string(),
+                            stream_id: current_id,
                         });
+                    link.stream_id = current_id;
+                    changed |= !link.glob;
                     link.glob = true;
                 }
                 if subscription.streams.contains_key(&relative)
@@ -882,7 +1537,16 @@ impl SubscriptionManager {
                     && has_pending_work(subscription, &store)
                 {
                     deliveries.push(self.create_wake(subscription, &store, relative.clone()));
+                    changed = true;
                 }
+            }
+            if changed {
+                // Source durability is authoritative. Persist this derived
+                // wake/link transition on the coalescing writer so an append
+                // never deep-serializes and fsyncs all subscriptions while
+                // holding the global mutex. Restart reconciliation rebuilds a
+                // wake if the process exits before this snapshot lands.
+                self.schedule_state_persistence();
             }
             deliveries
         };
@@ -898,6 +1562,7 @@ impl SubscriptionManager {
         let deliveries = {
             let mut state = self.state.lock().await;
             let mut deliveries = Vec::new();
+            let mut changed = false;
             for subscription in state.subscriptions.values_mut() {
                 let Some(relative) = relative_stream_path(&subscription.stream_root, absolute_path)
                 else {
@@ -909,24 +1574,27 @@ impl SubscriptionManager {
                 if !was_linked && !was_wake_stream {
                     continue;
                 }
+                changed = true;
                 let mut remove_link = false;
                 if let Some(link) = subscription.streams.get_mut(&relative) {
                     if link.explicit {
                         // Explicit membership survives deletion/recreation, but
                         // the recreated stream starts a new offset lifetime.
                         link.glob = false;
-                        link.acked_offset = format_offset(0);
+                        link.acked_offset = BEFORE_FIRST_OFFSET.to_string();
+                        link.stream_id = None;
                     } else {
                         remove_link = true;
                     }
                 }
+                let was_in_snapshot = subscription.wake_snapshot.contains_key(&relative);
                 if remove_link {
                     subscription.streams.remove(&relative);
                 }
-                if was_wake_stream
-                    && subscription.wake_id.is_some()
-                    && subscription.holder.is_none()
-                {
+                if (was_wake_stream || was_in_snapshot) && subscription.wake_id.is_some() {
+                    // Any worker/callback for the old snapshot could otherwise
+                    // acknowledge offsets against a replacement stream at the
+                    // same path. Fence it regardless of whether it is claimed.
                     clear_wake(subscription);
                     if has_pending_work(subscription, &store) {
                         let triggered = first_pending(subscription, &store);
@@ -938,6 +1606,9 @@ impl SubscriptionManager {
                 {
                     clear_wake(subscription);
                 }
+            }
+            if changed {
+                self.persist_background_or_abort(&state, "delete transition");
             }
             deliveries
         };
@@ -959,15 +1630,27 @@ impl SubscriptionManager {
             .into_iter()
             .map(|info| (info.path, info.tail_offset))
             .collect();
+        subscription.status = SubscriptionStatus::Active;
+        subscription.retry_count = 0;
+        subscription.next_attempt_at_ms = None;
+        subscription.lease_expires_at_ms = None;
+        subscription.wake_trigger = Some(triggered_by.clone());
+        subscription.wake_delivery_pending = true;
+        subscription.lease_nonce = subscription.lease_nonce.wrapping_add(1);
+        let nonce = subscription.lease_nonce;
         match subscription.config.kind {
             SubscriptionKind::Webhook => {
                 let key = subscription_key(&subscription.stream_root, &subscription.id);
                 subscription.token = Some(self.generate_token(&key, subscription.generation));
-                subscription.lease_nonce = subscription.lease_nonce.wrapping_add(1);
+                // PROTOCOL §7.3: webhook leases begin when the wake is issued,
+                // not when the endpoint accepts delivery.
+                subscription.lease_expires_at_ms =
+                    Some(unix_millis().saturating_add(subscription.config.lease_ttl_ms));
                 Delivery::Webhook {
                     key,
                     generation: subscription.generation,
                     wake_id,
+                    nonce,
                 }
             }
             SubscriptionKind::PullWake => {
@@ -980,6 +1663,7 @@ impl SubscriptionManager {
                     stream: triggered_by,
                     generation: subscription.generation,
                     wake_id,
+                    nonce,
                 }
             }
         }
@@ -1000,7 +1684,20 @@ impl SubscriptionManager {
                     stream,
                     generation,
                     wake_id,
+                    nonce,
                 } => {
+                    let current = {
+                        let state = self.state.lock().await;
+                        state.subscriptions.get(&key).is_some_and(|subscription| {
+                            subscription.generation == generation
+                                && subscription.wake_id.as_deref() == Some(wake_id.as_str())
+                                && subscription.wake_delivery_pending
+                                && subscription.lease_nonce == nonce
+                        })
+                    };
+                    if !current {
+                        return;
+                    }
                     let event = json!({
                         "type": "wake",
                         "subscription_id": id,
@@ -1016,11 +1713,16 @@ impl SubscriptionManager {
                         if let Some(subscription) = state.subscriptions.get_mut(&key) {
                             if subscription.generation == generation
                                 && subscription.wake_id.as_deref() == Some(wake_id.as_str())
+                                && subscription.lease_nonce == nonce
+                                && subscription.wake_delivery_pending
                             {
                                 subscription.status = SubscriptionStatus::Active;
                                 subscription.retry_count = 0;
+                                subscription.next_attempt_at_ms = None;
+                                subscription.wake_delivery_pending = false;
                             }
                         }
+                        self.persist_background_or_abort(&state, "delivered pull wake");
                     } else {
                         tracing::warn!("subscription pull-wake stream append failed");
                         self.schedule_pull_wake_retry(
@@ -1033,6 +1735,7 @@ impl SubscriptionManager {
                                 stream,
                                 generation,
                                 wake_id,
+                                nonce,
                             },
                         )
                         .await;
@@ -1042,11 +1745,37 @@ impl SubscriptionManager {
                     key,
                     generation,
                     wake_id,
+                    nonce,
                 } => {
+                    let lease = {
+                        let state = self.state.lock().await;
+                        let Some(subscription) = state.subscriptions.get(&key) else {
+                            return;
+                        };
+                        if subscription.generation != generation
+                            || subscription.wake_id.as_deref() != Some(wake_id.as_str())
+                            || subscription.lease_nonce != nonce
+                            || !subscription.wake_delivery_pending
+                        {
+                            return;
+                        }
+                        subscription.lease_expires_at_ms.map(|expires_at_ms| {
+                            (
+                                key.clone(),
+                                generation,
+                                wake_id.clone(),
+                                nonce,
+                                expires_at_ms,
+                            )
+                        })
+                    };
+                    if let Some(lease) = lease {
+                        self.spawn_lease_expiry(store.clone(), lease);
+                    }
                     let manager = Arc::clone(self);
                     tokio::spawn(async move {
                         manager
-                            .deliver_webhook(store, key, generation, wake_id)
+                            .deliver_webhook(store, key, generation, wake_id, nonce)
                             .await;
                     });
                 }
@@ -1060,6 +1789,7 @@ impl SubscriptionManager {
         key: String,
         generation: u64,
         wake_id: String,
+        nonce: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
             let (url, body) = {
@@ -1069,6 +1799,8 @@ impl SubscriptionManager {
                 };
                 if subscription.generation != generation
                     || subscription.wake_id.as_deref() != Some(wake_id.as_str())
+                    || subscription.lease_nonce != nonce
+                    || !subscription.wake_delivery_pending
                 {
                     return;
                 }
@@ -1093,84 +1825,76 @@ impl SubscriptionManager {
                 (url, body)
             };
             let timestamp = unix_seconds();
-            let signature = self
-                .signing_key
-                .sign(format!("{timestamp}.{body}").as_bytes());
-            let signature = format!(
-                "t={timestamp},kid={},ed25519={}",
-                self.signing_kid,
-                base64_encode(signature.as_ref(), BASE64_URL, false)
-            );
-            let response = self
-                .http
-                .post(url)
-                .header("content-type", "application/json")
-                .header("webhook-signature", signature)
-                .body(body)
-                .send()
-                .await;
+            let (kid, signature) = match self.sign_webhook(format!("{timestamp}.{body}").as_bytes())
+            {
+                Ok(signature) => signature,
+                Err(error) => {
+                    tracing::error!(%error, "failed to sign subscription webhook");
+                    self.schedule_webhook_retry(store, key, generation, wake_id, nonce)
+                        .await;
+                    return;
+                }
+            };
+            let signature = format!("t={timestamp},kid={},ed25519={}", kid, signature);
+            let response = send_pinned_webhook(&url, signature, body).await;
 
             let done = match response {
                 Ok(response) if response.status().is_success() => {
-                    response
-                        .json::<Value>()
-                        .await
-                        .ok()
-                        .and_then(|value| value.get("done").and_then(Value::as_bool))
-                        == Some(true)
+                    match bounded_webhook_done(response).await {
+                        Ok(done) => done,
+                        Err(error) => {
+                            tracing::warn!(%error, "subscription webhook response rejected");
+                            self.schedule_webhook_retry(store, key, generation, wake_id, nonce)
+                                .await;
+                            return;
+                        }
+                    }
                 }
-                _ => {
-                    self.schedule_webhook_retry(store, key, generation, wake_id)
+                Ok(response) => {
+                    tracing::warn!(status = %response.status(), "subscription webhook rejected delivery");
+                    self.schedule_webhook_retry(store, key, generation, wake_id, nonce)
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "subscription webhook delivery failed");
+                    self.schedule_webhook_retry(store, key, generation, wake_id, nonce)
                         .await;
                     return;
                 }
             };
 
-            let (delivery, lease) = {
+            let delivery = {
                 let mut state = self.state.lock().await;
                 let Some(subscription) = state.subscriptions.get_mut(&key) else {
                     return;
                 };
                 if subscription.generation != generation
                     || subscription.wake_id.as_deref() != Some(wake_id.as_str())
+                    || subscription.lease_nonce != nonce
+                    || !subscription.wake_delivery_pending
                 {
                     return;
                 }
                 subscription.status = SubscriptionStatus::Active;
                 subscription.retry_count = 0;
-                if !done {
-                    subscription.lease_nonce = subscription.lease_nonce.wrapping_add(1);
-                    (
-                        None,
-                        Some((
-                            key,
-                            generation,
-                            wake_id,
-                            subscription.lease_nonce,
-                            subscription.config.lease_ttl_ms,
-                        )),
-                    )
+                subscription.next_attempt_at_ms = None;
+                subscription.wake_delivery_pending = false;
+                let result = if !done {
+                    None
                 } else {
-                    for (path, tail) in subscription.wake_snapshot.clone() {
-                        if let Some(link) = subscription.streams.get_mut(&path) {
-                            link.acked_offset = tail;
-                        }
-                    }
+                    acknowledge_wake_snapshot(subscription);
                     clear_wake(subscription);
                     if has_pending_work(subscription, &store) {
                         let triggered = first_pending(subscription, &store);
-                        (
-                            Some(self.create_wake(subscription, &store, triggered)),
-                            None,
-                        )
+                        Some(self.create_wake(subscription, &store, triggered))
                     } else {
-                        (None, None)
+                        None
                     }
-                }
+                };
+                self.persist_background_or_abort(&state, "webhook delivery result");
+                result
             };
-            if let Some(lease) = lease {
-                self.spawn_lease_expiry(store.clone(), lease);
-            }
             if let Some(delivery) = delivery {
                 self.execute_delivery(store, delivery).await;
             }
@@ -1183,14 +1907,17 @@ impl SubscriptionManager {
         key: String,
         generation: u64,
         wake_id: String,
+        nonce: u64,
     ) {
-        let delay = {
+        let attempt_at_ms = {
             let mut state = self.state.lock().await;
             let Some(subscription) = state.subscriptions.get_mut(&key) else {
                 return;
             };
             if subscription.generation != generation
                 || subscription.wake_id.as_deref() != Some(wake_id.as_str())
+                || subscription.lease_nonce != nonce
+                || !subscription.wake_delivery_pending
             {
                 return;
             }
@@ -1201,13 +1928,18 @@ impl SubscriptionManager {
                 .saturating_mul(1u64 << exponent)
                 .min(MAX_RETRY_DELAY_MS);
             let jitter = 80 + (self.random_u16() as u64 % 41);
-            base.saturating_mul(jitter) / 100
+            let delay = base.saturating_mul(jitter) / 100;
+            let attempt_at_ms = unix_millis().saturating_add(delay);
+            subscription.next_attempt_at_ms = Some(attempt_at_ms);
+            subscription.wake_delivery_pending = true;
+            self.persist_background_or_abort(&state, "webhook retry schedule");
+            attempt_at_ms
         };
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            sleep_until_unix_ms(attempt_at_ms).await;
             manager
-                .deliver_webhook(store, key, generation, wake_id)
+                .deliver_webhook(store, key, generation, wake_id, nonce)
                 .await;
         });
     }
@@ -1217,6 +1949,7 @@ impl SubscriptionManager {
             key,
             generation,
             wake_id,
+            nonce,
             ..
         } = &delivery
         else {
@@ -1225,13 +1958,16 @@ impl SubscriptionManager {
         let key = key.clone();
         let generation = *generation;
         let wake_id = wake_id.clone();
-        let delay = {
+        let nonce = *nonce;
+        let attempt_at_ms = {
             let mut state = self.state.lock().await;
             let Some(subscription) = state.subscriptions.get_mut(&key) else {
                 return;
             };
             if subscription.generation != generation
                 || subscription.wake_id.as_deref() != Some(wake_id.as_str())
+                || subscription.lease_nonce != nonce
+                || !subscription.wake_delivery_pending
             {
                 return;
             }
@@ -1242,16 +1978,23 @@ impl SubscriptionManager {
                 .saturating_mul(1u64 << exponent)
                 .min(MAX_RETRY_DELAY_MS);
             let jitter = 80 + (self.random_u16() as u64 % 41);
-            base.saturating_mul(jitter) / 100
+            let delay = base.saturating_mul(jitter) / 100;
+            let attempt_at_ms = unix_millis().saturating_add(delay);
+            subscription.next_attempt_at_ms = Some(attempt_at_ms);
+            subscription.wake_delivery_pending = true;
+            self.persist_background_or_abort(&state, "pull-wake retry schedule");
+            attempt_at_ms
         };
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            sleep_until_unix_ms(attempt_at_ms).await;
             let current = {
                 let state = manager.state.lock().await;
                 state.subscriptions.get(&key).is_some_and(|subscription| {
                     subscription.generation == generation
                         && subscription.wake_id.as_deref() == Some(wake_id.as_str())
+                        && subscription.lease_nonce == nonce
+                        && subscription.wake_delivery_pending
                 })
             };
             if current {
@@ -1267,8 +2010,8 @@ impl SubscriptionManager {
     ) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            let (id, generation, wake_id, nonce, ttl_ms) = lease;
-            tokio::time::sleep(Duration::from_millis(ttl_ms)).await;
+            let (id, generation, wake_id, nonce, expires_at_ms) = lease;
+            sleep_until_unix_ms(expires_at_ms).await;
             let delivery = {
                 let mut state = manager.state.lock().await;
                 let Some(subscription) = state.subscriptions.get_mut(&id) else {
@@ -1277,16 +2020,19 @@ impl SubscriptionManager {
                 if subscription.generation != generation
                     || subscription.wake_id.as_deref() != Some(wake_id.as_str())
                     || subscription.lease_nonce != nonce
+                    || subscription.lease_expires_at_ms != Some(expires_at_ms)
                 {
                     return;
                 }
                 clear_wake(subscription);
-                if has_pending_work(subscription, &store) {
+                let delivery = if has_pending_work(subscription, &store) {
                     let triggered = first_pending(subscription, &store);
                     Some(manager.create_wake(subscription, &store, triggered))
                 } else {
                     None
-                }
+                };
+                manager.persist_background_or_abort(&state, "lease expiry");
+                delivery
             };
             if let Some(delivery) = delivery {
                 manager.execute_delivery(store, delivery).await;
@@ -1307,6 +2053,7 @@ impl SubscriptionManager {
             Value::Array(stream_infos_json(subscription, store, false)),
         );
         if subscription.config.kind == SubscriptionKind::Webhook {
+            let (signing_kid, _) = self.active_signing_metadata();
             let url = subscription
                 .config
                 .webhook_url
@@ -1318,7 +2065,7 @@ impl SubscriptionManager {
                     "url": url,
                     "signing": {
                         "alg": "ed25519",
-                        "kid": self.signing_kid,
+                        "kid": signing_kid,
                         "jwks_url": format!(
                             "{}{}{}",
                             subscription.callback_base_url.trim_end_matches('/'),
@@ -1386,6 +2133,409 @@ impl SubscriptionManager {
         let mut value = [0u8; 2];
         self.rng.fill(&mut value).expect("system RNG failed");
         u16::from_be_bytes(value)
+    }
+}
+
+fn current_delivery(subscription: &Subscription, store: &Store) -> Option<Delivery> {
+    let wake_id = subscription.wake_id.clone()?;
+    let key = subscription_key(&subscription.stream_root, &subscription.id);
+    match subscription.config.kind {
+        SubscriptionKind::Webhook => Some(Delivery::Webhook {
+            key,
+            generation: subscription.generation,
+            wake_id,
+            nonce: subscription.lease_nonce,
+        }),
+        SubscriptionKind::PullWake => Some(Delivery::PullWake {
+            key,
+            id: subscription.id.clone(),
+            stream_root: subscription.stream_root.clone(),
+            wake_stream: subscription.config.wake_stream.clone()?,
+            stream: subscription
+                .wake_trigger
+                .clone()
+                .unwrap_or_else(|| first_pending(subscription, store)),
+            generation: subscription.generation,
+            wake_id,
+            nonce: subscription.lease_nonce,
+        }),
+    }
+}
+
+fn acknowledge_wake_snapshot(subscription: &mut Subscription) {
+    for (path, tail) in subscription.wake_snapshot.clone() {
+        if let Some(link) = subscription.streams.get_mut(&path) {
+            if tail.as_str() > link.acked_offset.as_str() {
+                link.acked_offset = tail;
+            }
+        }
+    }
+}
+
+fn create_secure_dir(path: &Path) -> io::Result<()> {
+    let existed = path.exists();
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    if !existed {
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+fn persist_ordered_snapshot(
+    path: &Path,
+    file_lock: &StdMutex<()>,
+    persisted_sequence: &AtomicU64,
+    sequence: u64,
+    snapshot: &PersistedState,
+) -> io::Result<()> {
+    let _writer = file_lock.lock().unwrap_or_else(|error| error.into_inner());
+    if sequence <= persisted_sequence.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    atomic_write_json(path, snapshot)?;
+    persisted_sequence.store(sequence, Ordering::Release);
+    Ok(())
+}
+
+fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent"))?;
+    create_secure_dir(parent)?;
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("state"),
+        std::process::id()
+    ));
+    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    // Once rename succeeds, the new snapshot is visible and it is no longer
+    // safe for callers to roll memory back to the old snapshot. A directory
+    // fsync failure makes crash outcome indeterminate, so fail-stop exactly as
+    // the WAL durability barriers do rather than continue with split truth.
+    if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+        eprintln!(
+            "fatal: subscription snapshot rename succeeded but parent fsync failed for {}: {error}",
+            path.display()
+        );
+        std::process::abort();
+    }
+    Ok(())
+}
+
+fn load_persisted_state(path: &Path) -> io::Result<ManagerState> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ManagerState::default()),
+        Err(error) => return Err(error),
+    };
+    let persisted: PersistedState = serde_json::from_slice(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("corrupt subscription state {}: {error}", path.display()),
+        )
+    })?;
+    if persisted.version != STATE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported subscription state version {} in {}",
+                persisted.version,
+                path.display()
+            ),
+        ));
+    }
+    if persisted.subscriptions.len() > MAX_SUBSCRIPTIONS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted subscription count exceeds the configured safety limit",
+        ));
+    }
+    let mut subscriptions = HashMap::with_capacity(persisted.subscriptions.len());
+    for mut subscription in persisted.subscriptions {
+        if !valid_subscription_id(&subscription.id)
+            || subscription.streams.len() > MAX_STREAMS_PER_SUBSCRIPTION
+            || subscription
+                .streams
+                .keys()
+                .any(|path| !valid_relative_stream_path(path))
+            || subscription
+                .config
+                .webhook_url
+                .as_deref()
+                .is_some_and(|url| validate_webhook_url(url).is_err())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted subscription state failed validation",
+            ));
+        }
+        if subscription.wake_id.is_none() {
+            clear_wake(&mut subscription);
+        }
+        let key = subscription_key(&subscription.stream_root, &subscription.id);
+        if subscriptions.insert(key, subscription).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted subscription state contains duplicate identities",
+            ));
+        }
+    }
+    Ok(ManagerState {
+        subscriptions,
+        wake_streams: HashMap::new(),
+    })
+}
+
+fn load_or_create_secrets(
+    path: &Path,
+    rng: &SystemRandom,
+) -> io::Result<(SigningKeyRing, [u8; 32])> {
+    if let Some(loaded) = load_secrets(path)? {
+        return Ok(loaded);
+    }
+
+    let mut token_secret = [0u8; 32];
+    rng.fill(&mut token_secret)
+        .map_err(|_| io::Error::other("failed to generate callback token key"))?;
+    let key = generate_signing_key(rng, unix_millis())?;
+    let active_kid = key.persisted.kid.clone();
+    let keyring = SigningKeyRing {
+        active_kid,
+        keys: vec![key],
+    };
+    persist_secrets(path, &keyring, &token_secret)?;
+    Ok((keyring, token_secret))
+}
+
+/// Read an existing secret bundle without ever creating or replacing it.
+fn load_secrets(path: &Path) -> io::Result<Option<(SigningKeyRing, [u8; 32])>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    {
+        let persisted: PersistedSecrets = serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("corrupt subscription secrets {}: {error}", path.display()),
+            )
+        })?;
+        if persisted.version != SECRETS_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported subscription secrets version {}",
+                    persisted.version
+                ),
+            ));
+        }
+        let token_bytes = hex_decode(&persisted.token_secret).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid callback token secret")
+        })?;
+        let token_secret: [u8; 32] = token_bytes.try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "callback token secret must contain exactly 32 bytes",
+            )
+        })?;
+        let mut keys = Vec::with_capacity(persisted.signing_keys.len());
+        for persisted_key in persisted.signing_keys {
+            let pkcs8 = hex_decode(&persisted_key.pkcs8).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid webhook signing key")
+            })?;
+            let pair = Arc::new(Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid webhook signing key")
+            })?);
+            let (kid, x) = signing_identity(&pair);
+            if kid != persisted_key.kid || x != persisted_key.x {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "webhook signing key identity does not match its private key",
+                ));
+            }
+            keys.push(SigningKeyEntry {
+                pair,
+                // After restart, conservatively wait a complete advertised
+                // JWKS cache interval again before activating a pending key.
+                activate_not_before: persisted_key
+                    .activate_after_ms
+                    .map(|_| Instant::now() + Duration::from_secs(JWKS_CACHE_MAX_AGE_SECS)),
+                persisted: persisted_key,
+            });
+        }
+        if keys.is_empty()
+            || !keys
+                .iter()
+                .any(|key| key.persisted.kid == persisted.active_kid)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "webhook signing keyring has no active key",
+            ));
+        }
+        Ok(Some((
+            SigningKeyRing {
+                active_kid: persisted.active_kid,
+                keys,
+            },
+            token_secret,
+        )))
+    }
+}
+
+fn clone_signing_key_ring(keys: &SigningKeyRing) -> SigningKeyRing {
+    keys.clone()
+}
+
+fn persist_secrets(path: &Path, keys: &SigningKeyRing, token_secret: &[u8; 32]) -> io::Result<()> {
+    atomic_write_json(
+        path,
+        &PersistedSecrets {
+            version: SECRETS_VERSION,
+            token_secret: hex_encode(token_secret),
+            active_kid: keys.active_kid.clone(),
+            signing_keys: keys.keys.iter().map(|key| key.persisted.clone()).collect(),
+        },
+    )
+}
+
+fn generate_signing_key(rng: &SystemRandom, created_at_ms: u64) -> io::Result<SigningKeyEntry> {
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(rng)
+        .map_err(|_| io::Error::other("failed to generate webhook signing key"))?;
+    let pair = Arc::new(
+        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+            .map_err(|_| io::Error::other("failed to parse webhook signing key"))?,
+    );
+    let (kid, x) = signing_identity(&pair);
+    Ok(SigningKeyEntry {
+        pair,
+        activate_not_before: None,
+        persisted: PersistedSigningKey {
+            pkcs8: hex_encode(pkcs8.as_ref()),
+            kid,
+            x,
+            created_at_ms,
+            retire_after_ms: None,
+            activate_after_ms: None,
+        },
+    })
+}
+
+fn signing_identity(pair: &Ed25519KeyPair) -> (String, String) {
+    let x = base64_encode(pair.public_key().as_ref(), BASE64_URL, false);
+    let thumbprint = format!("{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"{x}\"}}");
+    let kid = format!(
+        "ds_{}",
+        base64_encode(
+            digest(&SHA256, thumbprint.as_bytes()).as_ref(),
+            BASE64_URL,
+            false
+        )
+    );
+    (kid, x)
+}
+
+fn rotate_signing_keys_if_due(
+    keys: &mut SigningKeyRing,
+    rng: &SystemRandom,
+    rotation_ms: u64,
+    replay_window_ms: u64,
+) -> io::Result<bool> {
+    let now = unix_millis();
+    let original_len = keys.keys.len();
+    let active_kid = keys.active_kid.clone();
+    keys.keys.retain(|key| {
+        key.persisted.kid == active_kid
+            || key.persisted.activate_after_ms.is_some()
+            || key
+                .persisted
+                .retire_after_ms
+                .is_some_and(|retire_after| retire_after > now)
+    });
+    let mut changed = keys.keys.len() != original_len;
+    if let Some(pending_index) = keys.keys.iter().position(|key| {
+        key.persisted
+            .activate_after_ms
+            .is_some_and(|activate_after| activate_after <= now)
+            && key
+                .activate_not_before
+                .map_or(true, |activate_after| Instant::now() >= activate_after)
+    }) {
+        let active_kid = keys.active_kid.clone();
+        if let Some(active) = keys
+            .keys
+            .iter_mut()
+            .find(|key| key.persisted.kid == active_kid)
+        {
+            active.persisted.retire_after_ms = Some(now.saturating_add(replay_window_ms));
+        }
+        keys.keys[pending_index].persisted.activate_after_ms = None;
+        keys.keys[pending_index].activate_not_before = None;
+        keys.active_kid = keys.keys[pending_index].persisted.kid.clone();
+        changed = true;
+    }
+    let active_created_at = keys
+        .keys
+        .iter()
+        .find(|key| key.persisted.kid == keys.active_kid)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "active signing key missing"))?
+        .persisted
+        .created_at_ms;
+    let has_pending = keys
+        .keys
+        .iter()
+        .any(|key| key.persisted.activate_after_ms.is_some());
+    if rotation_ms != 0 && !has_pending && now.saturating_sub(active_created_at) >= rotation_ms {
+        let mut new_key = generate_signing_key(rng, now)?;
+        new_key.persisted.activate_after_ms =
+            Some(now.saturating_add(JWKS_CACHE_MAX_AGE_SECS.saturating_mul(1_000)));
+        new_key.activate_not_before =
+            Some(Instant::now() + Duration::from_secs(JWKS_CACHE_MAX_AGE_SECS));
+        keys.keys.push(new_key);
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn env_seconds(name: &str, default: u64) -> io::Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => value.parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be an unsigned number of seconds"),
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
     }
 }
 
@@ -1531,7 +2681,17 @@ fn valid_subscription_id(id: &str) -> bool {
 }
 
 fn validate_webhook_url(raw: &str) -> Result<(), &'static str> {
+    validate_webhook_url_with_local_policy(raw, local_webhooks_allowed())
+}
+
+fn validate_webhook_url_with_local_policy(
+    raw: &str,
+    allow_local: bool,
+) -> Result<(), &'static str> {
     let url = Url::parse(raw).map_err(|_| "webhook.url must be a valid URL")?;
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err("webhook.url must not include credentials or a fragment");
+    }
     let host = url
         .host_str()
         .ok_or("webhook.url must include a hostname")?
@@ -1545,13 +2705,19 @@ fn validate_webhook_url(raw: &str) -> Result<(), &'static str> {
         .unwrap_or(&host);
     let ip = ip_host.parse::<IpAddr>().ok();
     match url.scheme() {
-        "http" if host == "localhost" => Ok(()),
-        "http" if matches!(ip, Some(IpAddr::V4(ip)) if ip.octets()[0] == 127) => Ok(()),
-        "http" => Err("http webhook URLs are only allowed for localhost or 127.0.0.x"),
+        "http" if allow_local && host == "localhost" => Ok(()),
+        "http" if allow_local && matches!(ip, Some(IpAddr::V4(ip)) if ip.octets()[0] == 127) => {
+            Ok(())
+        }
+        "http" => {
+            Err("http webhook URLs require DS_WEBHOOK_ALLOW_LOCALHOST=1 and a localhost target")
+        }
         "https" if host == "localhost" => {
             Err("localhost webhook URLs must use http for development")
         }
-        "https" if matches!(ip, Some(IpAddr::V6(_))) => Err("IPv6 webhook hosts are not accepted"),
+        "https" if matches!(ip, Some(IpAddr::V6(ip)) if !public_ipv6(ip)) => {
+            Err("webhook.url must not target private or link-local hosts")
+        }
         "https" if matches!(ip, Some(IpAddr::V4(ip)) if private_ipv4(ip)) => {
             Err("webhook.url must not target private or link-local hosts")
         }
@@ -1560,9 +2726,146 @@ fn validate_webhook_url(raw: &str) -> Result<(), &'static str> {
     }
 }
 
+fn local_webhooks_allowed() -> bool {
+    cfg!(test) || std::env::var(ALLOW_LOCAL_WEBHOOKS_ENV).ok().as_deref() == Some("1")
+}
+
+async fn send_pinned_webhook(
+    raw_url: &str,
+    signature: String,
+    body: String,
+) -> Result<reqwest::Response, String> {
+    validate_webhook_url(raw_url).map_err(str::to_string)?;
+    let url = Url::parse(raw_url).map_err(|error| error.to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "webhook URL has no host".to_string())?
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "webhook URL has no usable port".to_string())?;
+    let local_development = url.scheme() == "http"
+        && (host == "localhost"
+            || host
+                .parse::<Ipv4Addr>()
+                .is_ok_and(|ip| ip.octets()[0] == 127));
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        // A proxy would perform its own DNS resolution and defeat the pinned
+        // public address selected below.
+        .no_proxy();
+    let mut pinned_addresses = Vec::new();
+    if host.parse::<IpAddr>().is_err() {
+        let mut addresses = tokio::time::timeout(
+            WEBHOOK_DNS_TIMEOUT,
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
+        .await
+        .map_err(|_| "webhook DNS resolution timed out".to_string())?
+        .map_err(|error| format!("webhook DNS resolution failed: {error}"))?
+        .collect::<Vec<_>>();
+        addresses.sort_unstable();
+        addresses.dedup();
+        if addresses.is_empty() {
+            return Err("webhook DNS resolution returned no addresses".to_string());
+        }
+        if addresses.iter().any(|address| {
+            if local_development {
+                !address.ip().is_loopback()
+            } else {
+                !public_webhook_ip(address.ip())
+            }
+        }) {
+            return Err("webhook DNS resolved to a private or local address".to_string());
+        }
+        // reqwest retains the URL hostname for Host and TLS SNI while routing
+        // the socket to this already-validated address, closing the DNS
+        // rebinding window between validation and connect.
+        builder = builder.resolve_to_addrs(&host, &addresses);
+        pinned_addresses = addresses;
+    }
+    let cache_key = format!("{}|{host}|{port}|{pinned_addresses:?}", url.scheme());
+    static CLIENTS: OnceLock<StdMutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+    let clients = CLIENTS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let cached = {
+        let clients = clients.lock().unwrap();
+        clients.get(&cache_key).cloned()
+    };
+    let client = if let Some(client) = cached {
+        client
+    } else {
+        let client = builder
+            .build()
+            .map_err(|error| format!("failed to build pinned webhook client: {error}"))?;
+        let mut clients = clients.lock().unwrap();
+        if clients.len() >= MAX_PINNED_WEBHOOK_CLIENTS {
+            clients.clear();
+        }
+        clients.insert(cache_key, client.clone());
+        client
+    };
+    client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("webhook-signature", signature)
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn bounded_webhook_done(mut response: reqwest::Response) -> Result<bool, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_WEBHOOK_RESPONSE_BYTES as u64)
+    {
+        return Err("webhook response exceeds 64 KiB".to_string());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("failed to read webhook response: {error}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_WEBHOOK_RESPONSE_BYTES {
+            return Err("webhook response exceeds 64 KiB".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|value| value.get("done").and_then(Value::as_bool))
+        == Some(true))
+}
+
+fn public_webhook_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !private_ipv4(ip),
+        IpAddr::V6(ip) => public_ipv6(ip),
+    }
+}
+
+fn public_ipv6(ip: Ipv6Addr) -> bool {
+    let octets = ip.octets();
+    // Public unicast is currently allocated from 2000::/3. Keep this policy
+    // conservative and explicitly exclude documentation and benchmarking
+    // prefixes that are not valid Internet delivery targets.
+    octets[0] & 0xe0 == 0x20
+        && !(octets[0] == 0x20 && octets[1] == 0x02)
+        && !(octets[0] == 0x20
+            && octets[1] == 0x01
+            && ((octets[2] == 0x00 && octets[3] == 0x00)
+                || (octets[2] == 0x0d && octets[3] == 0xb8)
+                || (octets[2] == 0x00 && octets[3] == 0x02)))
+}
+
 fn private_ipv4(ip: Ipv4Addr) -> bool {
     let [a, b, _, _] = ip.octets();
-    ip.is_private()
+    a == 0
+        || ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
         || ip.is_unspecified()
@@ -1627,6 +2930,9 @@ fn list_streams(store: &Store, stream_root: &str) -> Vec<String> {
     store
         .streams
         .iter()
+        .filter(|entry| {
+            !entry.value().is_expired() && !entry.value().shared.read().unwrap().soft_deleted
+        })
         .filter_map(|entry| relative_stream_path(stream_root, entry.key()))
         .collect()
 }
@@ -1643,11 +2949,31 @@ fn tail_offset(store: &Store, stream_root: &str, relative: &str) -> String {
     live_tail_offset(store, stream_root, relative).unwrap_or_else(|| format_offset(0))
 }
 
+fn live_stream_metadata(store: &Store, stream_root: &str, relative: &str) -> Option<(u64, String)> {
+    let stream = store
+        .streams
+        .get(&absolute_stream_path(stream_root, relative))?
+        .clone();
+    if stream.is_expired() || stream.shared.read().unwrap().soft_deleted {
+        return None;
+    }
+    Some((stream.id, format_offset(stream.tail().bytes)))
+}
+
 fn live_tail_offset(store: &Store, stream_root: &str, relative: &str) -> Option<String> {
-    store
-        .get(&absolute_stream_path(stream_root, relative))
-        .filter(|stream| !stream.shared.read().unwrap().soft_deleted)
-        .map(|stream| format_offset(stream.tail().bytes))
+    // Subscription scans run under the manager mutex. Do not call Store::get:
+    // its lazy TTL path can unlink files and fsync synchronously. Treat an
+    // expired stream as absent and leave deletion to the store's normal sweep.
+    live_stream_metadata(store, stream_root, relative).map(|(_, tail)| tail)
+}
+
+fn prune_stale_glob_links(subscription: &mut Subscription, store: &Store) -> bool {
+    let before = subscription.streams.len();
+    let root = subscription.stream_root.clone();
+    subscription
+        .streams
+        .retain(|path, link| link.explicit || live_stream_metadata(store, &root, path).is_some());
+    before != subscription.streams.len()
 }
 
 fn stream_infos(subscription: &Subscription, store: &Store) -> Vec<StreamInfo> {
@@ -1718,6 +3044,7 @@ fn apply_acks(
     let Some(acks) = &request.acks else {
         return Ok(());
     };
+    let mut updates = BTreeMap::<String, String>::new();
     for ack in acks {
         let stream = normalize_relative_path(
             ack.stream
@@ -1725,29 +3052,36 @@ fn apply_acks(
                 .or(ack.path.as_deref())
                 .unwrap_or_default(),
         );
-        let Some(link) = subscription.streams.get(&stream) else {
-            return Err("Ack references an unknown subscription stream");
-        };
         if ack.offset == BEFORE_FIRST_OFFSET
             || !matches!(parse_offset(Some(&ack.offset)), Ok(ParsedOffset::At(_)))
-            || ack.offset < link.acked_offset
-            || ack.offset > tail_offset(store, &subscription.stream_root, &stream)
+        {
+            return Err("Ack offset is invalid for the subscription stream");
+        }
+        updates
+            .entry(stream)
+            .and_modify(|offset| {
+                if ack.offset > *offset {
+                    *offset = ack.offset.clone();
+                }
+            })
+            .or_insert_with(|| ack.offset.clone());
+    }
+    for (stream, offset) in &updates {
+        let Some(link) = subscription.streams.get(stream) else {
+            return Err("Ack references an unknown subscription stream");
+        };
+        if offset < &link.acked_offset
+            || offset > &tail_offset(store, &subscription.stream_root, stream)
         {
             return Err("Ack offset is invalid for the subscription stream");
         }
     }
-    for ack in acks {
-        let stream = normalize_relative_path(
-            ack.stream
-                .as_deref()
-                .or(ack.path.as_deref())
-                .unwrap_or_default(),
-        );
+    for (stream, offset) in updates {
         subscription
             .streams
             .get_mut(&stream)
             .expect("ack validated")
-            .acked_offset = ack.offset.clone();
+            .acked_offset = offset;
     }
     Ok(())
 }
@@ -1760,6 +3094,10 @@ fn clear_wake(subscription: &mut Subscription) {
     subscription.lease_nonce = subscription.lease_nonce.wrapping_add(1);
     subscription.status = SubscriptionStatus::Active;
     subscription.retry_count = 0;
+    subscription.next_attempt_at_ms = None;
+    subscription.lease_expires_at_ms = None;
+    subscription.wake_trigger = None;
+    subscription.wake_delivery_pending = false;
 }
 
 fn subscription_key(stream_root: &str, id: &str) -> String {
@@ -1908,9 +3246,10 @@ fn json_response_with_type(
         .headers
         .push(("content-type", content_type.to_string()));
     if cache_jwks {
-        response
-            .headers
-            .push(("cache-control", "public, max-age=300".to_string()));
+        response.headers.push((
+            "cache-control",
+            "public, max-age=300, must-revalidate".to_string(),
+        ));
     }
     response.body = Body::Full(Bytes::from(body.to_string()));
     response
@@ -1918,6 +3257,14 @@ fn json_response_with_type(
 
 fn subscription_error(status: u16, code: &'static str, message: &'static str) -> Resp {
     json_response(status, json!({"error": {"code": code, "message": message}}))
+}
+
+fn internal_subscription_error() -> Resp {
+    subscription_error(
+        500,
+        "SUBSCRIPTION_STATE_ERROR",
+        "Subscription state could not be persisted",
+    )
 }
 
 fn method_not_allowed() -> Resp {
@@ -1936,11 +3283,24 @@ fn unix_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-fn unix_millis() -> u128 {
+fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+async fn sleep_until_unix_ms(deadline_ms: u64) {
+    loop {
+        let now = unix_millis();
+        if now >= deadline_ms {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis((deadline_ms - now).min(1_000))).await;
+        // Re-read the wall clock at least once per second. A backward NTP step
+        // re-arms instead of expiring early; a forward step is observed within
+        // one second instead of waiting out the old monotonic duration.
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -2028,6 +3388,9 @@ mod tests {
 
     #[test]
     fn webhook_url_policy_allows_only_explicit_local_http() {
+        assert!(
+            validate_webhook_url_with_local_policy("http://127.0.0.1:1234/hook", false).is_err()
+        );
         assert!(validate_webhook_url("http://127.0.0.1:1234/hook").is_ok());
         assert!(validate_webhook_url("http://localhost:1234/hook").is_ok());
         assert!(validate_webhook_url("http://10.0.0.1/hook").is_err());
@@ -2037,6 +3400,7 @@ mod tests {
         assert!(validate_webhook_url("https://198.18.0.1/hook").is_err());
         assert!(validate_webhook_url("https://224.0.0.1/hook").is_err());
         assert!(validate_webhook_url("https://240.0.0.1/hook").is_err());
+        assert!(validate_webhook_url("https://0.0.0.1/hook").is_err());
         assert!(validate_webhook_url("https://[::1]/hook").is_err());
         assert!(validate_webhook_url("https://[fd00::1]/hook").is_err());
         assert!(validate_webhook_url("https://[::ffff:10.0.0.1]/hook").is_err());
@@ -2056,6 +3420,107 @@ mod tests {
         assert!(validate_public_base_url("http://evil.example").is_err());
         assert!(validate_public_base_url("https://user@streams.example").is_err());
         assert!(validate_public_base_url("https://streams.example/prefix").is_err());
+    }
+
+    #[test]
+    fn signing_rotation_persists_the_new_key_and_retains_the_old_replay_key() {
+        let rng = SystemRandom::new();
+        let old = generate_signing_key(&rng, unix_millis().saturating_sub(10_000)).unwrap();
+        let old_kid = old.persisted.kid.clone();
+        let mut keys = SigningKeyRing {
+            active_kid: old_kid.clone(),
+            keys: vec![old],
+        };
+        assert!(rotate_signing_keys_if_due(&mut keys, &rng, 1_000, 300_000).unwrap());
+        assert_eq!(keys.active_kid, old_kid, "new key must be prepublished");
+        assert_eq!(keys.keys.len(), 2);
+        let pending = keys
+            .keys
+            .iter_mut()
+            .find(|key| key.persisted.kid != old_kid)
+            .unwrap();
+        pending.persisted.activate_after_ms = Some(0);
+        pending.activate_not_before = Some(Instant::now());
+        assert!(rotate_signing_keys_if_due(&mut keys, &rng, 1_000, 300_000).unwrap());
+        assert_ne!(keys.active_kid, old_kid);
+        assert_eq!(keys.keys.len(), 2);
+        assert!(keys
+            .keys
+            .iter()
+            .find(|key| key.persisted.kid == old_kid)
+            .unwrap()
+            .persisted
+            .retire_after_ms
+            .is_some_and(|retire_after| retire_after > unix_millis()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let token_secret = [7u8; 32];
+        persist_secrets(&path, &keys, &token_secret).unwrap();
+        let (reloaded, reloaded_token_secret) = load_or_create_secrets(&path, &rng).unwrap();
+        assert_eq!(reloaded.active_kid, keys.active_kid);
+        assert_eq!(reloaded.keys.len(), 2);
+        assert_eq!(reloaded_token_secret, token_secret);
+    }
+
+    #[test]
+    fn failed_signing_key_persistence_never_changes_the_live_keyring() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = SubscriptionManager::new(dir.path()).unwrap();
+        manager.signing_rotation_ms = 1;
+        {
+            let mut keys = manager.signing_keys.lock().unwrap();
+            let active_kid = keys.active_kid.clone();
+            keys.keys
+                .iter_mut()
+                .find(|key| key.persisted.kid == active_kid)
+                .unwrap()
+                .persisted
+                .created_at_ms = 0;
+        }
+        let before = manager.active_signing_metadata();
+        let before_len = manager.signing_keys.lock().unwrap().keys.len();
+        // Renaming a regular temp file over this directory must fail before
+        // the candidate ring can be installed in memory.
+        manager.secrets_path = dir.path().join("subscriptions");
+        assert!(manager.refresh_signing_keys().is_err());
+        assert_eq!(manager.active_signing_metadata(), before);
+        assert_eq!(manager.signing_keys.lock().unwrap().keys.len(), before_len);
+    }
+
+    #[test]
+    fn an_older_background_snapshot_cannot_overwrite_a_newer_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let file_lock = StdMutex::new(());
+        let persisted_sequence = AtomicU64::new(0);
+        let newer = PersistedState {
+            version: STATE_VERSION,
+            subscriptions: Vec::new(),
+        };
+        let stale = PersistedState {
+            version: 999,
+            subscriptions: Vec::new(),
+        };
+        persist_ordered_snapshot(&path, &file_lock, &persisted_sequence, 2, &newer).unwrap();
+        persist_ordered_snapshot(&path, &file_lock, &persisted_sequence, 1, &stale).unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["version"], STATE_VERSION);
+    }
+
+    #[test]
+    fn dns_target_policy_accepts_public_ipv6_and_rejects_local_ranges() {
+        assert!(public_webhook_ip("2606:4700:4700::1111".parse().unwrap()));
+        for ip in [
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "2001::1",
+            "2001:db8::1",
+            "2002:7f00:1::",
+        ] {
+            assert!(!public_webhook_ip(ip.parse().unwrap()), "{ip}");
+        }
     }
 
     #[test]
@@ -2521,7 +3986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dynamic_glob_membership_stops_at_the_stream_limit() {
+    async fn expired_glob_membership_is_pruned_at_the_stream_limit() {
         let _guard = DurabilityGuard::memory();
         let (store, dir) = test_store("glob-limit");
         let streams = (0..MAX_STREAMS_PER_SUBSCRIPTION)
@@ -2532,6 +3997,7 @@ mod tests {
                         explicit: false,
                         glob: true,
                         acked_offset: format_offset(0),
+                        stream_id: None,
                     },
                 )
             })
@@ -2559,6 +4025,10 @@ mod tests {
             holder: None,
             lease_nonce: 0,
             retry_count: 0,
+            next_attempt_at_ms: None,
+            lease_expires_at_ms: None,
+            wake_trigger: None,
+            wake_delivery_pending: false,
         };
         store
             .subscriptions
@@ -2581,8 +4051,9 @@ mod tests {
             .subscriptions
             .get(&subscription_key("/root", "sub-1"))
             .unwrap();
-        assert_eq!(subscription.streams.len(), MAX_STREAMS_PER_SUBSCRIPTION);
-        assert!(!subscription.streams.contains_key("overflow"));
+        assert_eq!(subscription.streams.len(), 1);
+        assert!(subscription.streams.contains_key("overflow"));
+        assert!(!subscription.streams.contains_key("existing/0"));
         drop(state);
 
         drop(store);
@@ -2590,7 +4061,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_an_unrelated_link_does_not_fence_a_claimed_worker() {
+    async fn deleting_and_recreating_a_snapshotted_stream_fences_the_old_worker() {
         let _guard = DurabilityGuard::memory();
         let (store, dir) = test_store("delete-while-claimed");
         create_json_stream(&store, "/root/wake/pool").await;
@@ -2623,6 +4094,15 @@ mod tests {
             .status,
             204
         );
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(Method::Post, "/root/events/c", json!({"value": 1})),
+            )
+            .await
+            .status,
+            204
+        );
         let claim = handle(
             store.clone(),
             json_request(
@@ -2638,7 +4118,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|stream| stream["path"] == "events/b")
+            .find(|stream| stream["path"] == "events/c")
             .unwrap();
         assert_eq!(
             handle(
@@ -2655,13 +4135,23 @@ mod tests {
             .status,
             204
         );
+        create_json_stream(&store, "/root/events/c").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(Method::Post, "/root/events/c", json!({"value": 2})),
+            )
+            .await
+            .status,
+            204
+        );
         let mut ack = json_request(
             Method::Post,
             "/root/__ds/subscriptions/sub-1/ack",
             json!({
                 "wake_id": claim["wake_id"],
                 "generation": claim["generation"],
-                "acks": [{"stream": "events/b", "offset": source["tail_offset"]}],
+                "acks": [{"stream": "events/c", "offset": source["tail_offset"]}],
                 "done": true
             }),
         );
@@ -2669,7 +4159,7 @@ mod tests {
             "authorization".into(),
             format!("Bearer {}", claim["token"].as_str().unwrap()),
         ));
-        assert_eq!(handle(store.clone(), ack).await.status, 200);
+        assert_eq!(handle(store.clone(), ack).await.status, 409);
 
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
@@ -2741,7 +4231,375 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_webhook_backoff_is_not_preempted_by_the_lease_timer() {
+    async fn subscriptions_leases_tokens_and_signing_keys_survive_restart() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("durable-control-state");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "pattern": "events/*",
+                        "wake_stream": "wake/pool",
+                        "lease_ttl_ms": 600000
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(Method::Post, "/root/events/a", json!({"value": 1})),
+            )
+            .await
+            .status,
+            204
+        );
+        let claim = response_json(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Post,
+                    "/root/__ds/subscriptions/sub-1/claim",
+                    json!({"worker": "worker-a"}),
+                ),
+            )
+            .await,
+        );
+        let original_jwks = response_json(
+            handle(
+                store.clone(),
+                json_request(Method::Get, "/root/__ds/jwks.json", json!(null)),
+            )
+            .await,
+        );
+
+        let restarted = Arc::new(
+            Store::new_with_tier(dir.clone(), TierConfig::default())
+                .expect("persisted subscription state must reload"),
+        );
+        restarted
+            .subscriptions
+            .resume(restarted.clone())
+            .await
+            .unwrap();
+        let restarted_jwks = response_json(
+            handle(
+                restarted.clone(),
+                json_request(Method::Get, "/root/__ds/jwks.json", json!(null)),
+            )
+            .await,
+        );
+        assert_eq!(restarted_jwks, original_jwks, "signing key must be stable");
+
+        let mut ack = json_request(
+            Method::Post,
+            "/root/__ds/subscriptions/sub-1/ack",
+            json!({
+                "wake_id": claim["wake_id"],
+                "generation": claim["generation"],
+                "acks": [{
+                    "stream": "events/a",
+                    "offset": claim["streams"].as_array().unwrap().iter()
+                        .find(|stream| stream["path"] == "events/a").unwrap()["tail_offset"]
+                }],
+                "done": true
+            }),
+        );
+        ack.headers.push((
+            "authorization".into(),
+            format!("Bearer {}", claim["token"].as_str().unwrap()),
+        ));
+        assert_eq!(
+            handle(restarted.clone(), ack).await.status,
+            200,
+            "the persisted callback-token key and active lease must validate after restart"
+        );
+        {
+            let state = restarted.subscriptions.state.lock().await;
+            let subscription = state
+                .subscriptions
+                .get(&subscription_key("/root", "sub-1"))
+                .unwrap();
+            assert!(subscription.wake_id.is_none());
+            assert!(!has_pending_work(subscription, &restarted));
+        }
+        assert!(dir.join("subscriptions/state.json").is_file());
+        assert!(dir.join("subscriptions/secrets.json").is_file());
+
+        drop(restarted);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn restart_reconciles_a_glob_append_missing_from_the_last_snapshot() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("glob-crash-window");
+        create_json_stream(&store, "/root/wake/pool").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "pattern": "events/*",
+                        "wake_stream": "wake/pool"
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+        let before_append = {
+            let state = store.subscriptions.state.lock().await;
+            PersistedState {
+                version: STATE_VERSION,
+                subscriptions: state.subscriptions.values().cloned().collect(),
+            }
+        };
+        create_json_stream(&store, "/root/events/a").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(Method::Post, "/root/events/a", json!({"value": 1})),
+            )
+            .await
+            .status,
+            204
+        );
+        // Model a crash after the source append became durable but before its
+        // derived subscription snapshot replacement reached disk.
+        atomic_write_json(&dir.join("subscriptions/state.json"), &before_append).unwrap();
+        store.subscriptions.state.lock().await.subscriptions.clear();
+
+        let restarted = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        restarted
+            .subscriptions
+            .resume(restarted.clone())
+            .await
+            .unwrap();
+        let state = restarted.subscriptions.state.lock().await;
+        let subscription = state
+            .subscriptions
+            .get(&subscription_key("/root", "sub-1"))
+            .unwrap();
+        assert_eq!(
+            subscription.streams.get("events/a").unwrap().acked_offset,
+            BEFORE_FIRST_OFFSET
+        );
+        assert!(subscription.wake_id.is_some());
+        drop(state);
+
+        drop(restarted);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn persisted_subscriptions_refuse_startup_without_their_secrets() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("missing-secrets");
+        create_json_stream(&store, "/root/wake/pool").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "streams": ["events/a"],
+                        "wake_stream": "wake/pool"
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+        std::fs::remove_file(dir.join("subscriptions/secrets.json")).unwrap();
+        let error = match Store::new_with_tier(dir.clone(), TierConfig::default()) {
+            Ok(_) => panic!("startup must not mint replacement subscription secrets"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("refusing to replace"));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn persisted_retry_deadline_resumes_after_restart() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("durable-retry");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "pattern": "events/*",
+                        "wake_stream": "wake/pool"
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            handle(
+                store.clone(),
+                Req {
+                    method: Method::Delete,
+                    path: "/root/wake/pool".into(),
+                    query: None,
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+            )
+            .await
+            .status,
+            204
+        );
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(Method::Post, "/root/events/a", json!({"value": 1})),
+            )
+            .await
+            .status,
+            204
+        );
+        {
+            let state = store.subscriptions.state.lock().await;
+            let subscription = state
+                .subscriptions
+                .get(&subscription_key("/root", "sub-1"))
+                .unwrap();
+            assert_eq!(subscription.status, SubscriptionStatus::Failed);
+            assert!(subscription.next_attempt_at_ms.is_some());
+        }
+        create_json_stream(&store, "/root/wake/pool").await;
+        // Prevent the old manager's already-spawned retry from competing with
+        // the fresh manager. This intentionally does not touch the durable
+        // snapshot that the restarted manager loads.
+        store.subscriptions.state.lock().await.subscriptions.clear();
+
+        let restarted = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        restarted
+            .subscriptions
+            .resume(restarted.clone())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if restarted.get("/root/wake/pool").unwrap().tail().bytes > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the persisted retry must run without another source append"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        drop(restarted);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn stale_pull_delivery_retry_cannot_erase_a_new_worker_lease() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("retry-claim-race");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "pattern": "events/*",
+                        "wake_stream": "wake/pool",
+                        "lease_ttl_ms": 600000
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            handle(
+                store.clone(),
+                Req {
+                    method: Method::Delete,
+                    path: "/root/wake/pool".into(),
+                    query: None,
+                    headers: vec![],
+                    body: Bytes::new(),
+                },
+            )
+            .await
+            .status,
+            204
+        );
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(Method::Post, "/root/events/a", json!({"value": 1})),
+            )
+            .await
+            .status,
+            204
+        );
+        let claim = handle(
+            store.clone(),
+            json_request(
+                Method::Post,
+                "/root/__ds/subscriptions/sub-1/claim",
+                json!({"worker": "worker-a"}),
+            ),
+        )
+        .await;
+        assert_eq!(claim.status, 200);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let state = store.subscriptions.state.lock().await;
+        let subscription = state
+            .subscriptions
+            .get(&subscription_key("/root", "sub-1"))
+            .unwrap();
+        assert_eq!(subscription.holder.as_deref(), Some("worker-a"));
+        assert!(subscription.lease_expires_at_ms.is_some());
+        assert!(!subscription.wake_delivery_pending);
+        drop(state);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn failed_webhook_delivery_is_fenced_by_the_issued_wake_lease() {
         let _guard = DurabilityGuard::memory();
         let (store, dir) = test_store("webhook-backoff");
         create_json_stream(&store, "/root/events/a").await;
@@ -2766,6 +4624,7 @@ mod tests {
                     explicit: false,
                     glob: true,
                     acked_offset: tail_offset(&store, "/root", "events/a"),
+                    stream_id: live_stream_metadata(&store, "/root", "events/a").map(|(id, _)| id),
                 },
             )]),
             generation: 0,
@@ -2775,6 +4634,10 @@ mod tests {
             holder: None,
             lease_nonce: 0,
             retry_count: 0,
+            next_attempt_at_ms: None,
+            lease_expires_at_ms: None,
+            wake_trigger: None,
+            wake_delivery_pending: false,
         };
         store
             .subscriptions
@@ -2818,13 +4681,494 @@ mod tests {
             .subscriptions
             .get(&subscription_key("/root", "sub-1"))
             .unwrap();
-        assert_eq!(
-            subscription.generation, 1,
-            "delivery failure must retry the same wake instead of generating one wake per lease TTL"
+        assert!(
+            subscription.generation > 1,
+            "the webhook lease must fence a failed delivery after its TTL"
         );
-        assert_eq!(subscription.status, SubscriptionStatus::Failed);
+        assert!(subscription.lease_expires_at_ms.is_some());
+        assert!(subscription.holder.is_none());
         drop(state);
         store.subscriptions.state.lock().await.subscriptions.clear();
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn pull_done_only_acknowledges_explicitly_listed_streams() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("partial-done");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        create_json_stream(&store, "/root/events/b").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "pattern": "events/*",
+                        "wake_stream": "wake/pool"
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+        for path in ["/root/events/a", "/root/events/b"] {
+            assert_eq!(
+                handle(
+                    store.clone(),
+                    json_request(Method::Post, path, json!({"value": path})),
+                )
+                .await
+                .status,
+                204
+            );
+        }
+        let claim = response_json(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Post,
+                    "/root/__ds/subscriptions/sub-1/claim",
+                    json!({"worker": "worker-1"}),
+                ),
+            )
+            .await,
+        );
+        let a_tail = claim["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stream| stream["path"] == "events/a")
+            .unwrap()["tail_offset"]
+            .clone();
+        let mut ack = json_request(
+            Method::Post,
+            "/root/__ds/subscriptions/sub-1/ack",
+            json!({
+                "wake_id": claim["wake_id"],
+                "generation": claim["generation"],
+                "acks": [{"stream": "events/a", "offset": a_tail}],
+                "done": true
+            }),
+        );
+        ack.headers.push((
+            "authorization".into(),
+            format!("Bearer {}", claim["token"].as_str().unwrap()),
+        ));
+        let response = response_json(handle(store.clone(), ack).await);
+        assert_eq!(response["next_wake"], true);
+        let state = store.subscriptions.state.lock().await;
+        let subscription = state
+            .subscriptions
+            .get(&subscription_key("/root", "sub-1"))
+            .unwrap();
+        assert_eq!(subscription.streams["events/a"].acked_offset, a_tail);
+        assert_eq!(subscription.streams["events/b"].acked_offset, ZERO_OFFSET);
+        assert!(has_pending_work(subscription, &store));
+        assert!(subscription.wake_id.is_some());
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn duplicate_acks_in_one_request_cannot_regress_a_cursor() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("duplicate-acks");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "streams": ["events/a"],
+                        "wake_stream": "wake/pool"
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(Method::Post, "/root/events/a", json!({"value": 1})),
+            )
+            .await
+            .status,
+            204
+        );
+        let claim = response_json(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Post,
+                    "/root/__ds/subscriptions/sub-1/claim",
+                    json!({"worker": "worker-1"}),
+                ),
+            )
+            .await,
+        );
+        let tail = claim["streams"][0]["tail_offset"].clone();
+        let mut ack = json_request(
+            Method::Post,
+            "/root/__ds/subscriptions/sub-1/ack",
+            json!({
+                "wake_id": claim["wake_id"],
+                "generation": claim["generation"],
+                "acks": [
+                    {"stream": "events/a", "offset": tail},
+                    {"stream": "events/a", "offset": ZERO_OFFSET}
+                ],
+                "done": false
+            }),
+        );
+        ack.headers.push((
+            "authorization".into(),
+            format!("Bearer {}", claim["token"].as_str().unwrap()),
+        ));
+        assert_eq!(handle(store.clone(), ack).await.status, 200);
+        let state = store.subscriptions.state.lock().await;
+        assert_eq!(
+            state.subscriptions[&subscription_key("/root", "sub-1")].streams["events/a"]
+                .acked_offset,
+            tail
+        );
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn claim_reclaims_a_persisted_lease_that_is_already_expired() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("expired-claim");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "streams": ["events/a"],
+                        "wake_stream": "wake/pool",
+                        "lease_ttl_ms": 600000
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(Method::Post, "/root/events/a", json!({"value": 1})),
+            )
+            .await
+            .status,
+            204
+        );
+        let first = response_json(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Post,
+                    "/root/__ds/subscriptions/sub-1/claim",
+                    json!({"worker": "worker-1"}),
+                ),
+            )
+            .await,
+        );
+        store
+            .subscriptions
+            .state
+            .lock()
+            .await
+            .subscriptions
+            .get_mut(&subscription_key("/root", "sub-1"))
+            .unwrap()
+            .lease_expires_at_ms = Some(0);
+        let second = handle(
+            store.clone(),
+            json_request(
+                Method::Post,
+                "/root/__ds/subscriptions/sub-1/claim",
+                json!({"worker": "worker-2"}),
+            ),
+        )
+        .await;
+        assert_eq!(second.status, 200);
+        let second = response_json(second);
+        assert!(second["generation"].as_u64() > first["generation"].as_u64());
+        assert_ne!(second["token"], first["token"]);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn restart_fences_a_replaced_stream_incarnation() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("restart-incarnation");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(Method::Post, "/root/events/a", json!({"value": 1})),
+            )
+            .await
+            .status,
+            204
+        );
+        let current_id = live_stream_metadata(&store, "/root", "events/a").unwrap().0;
+        let subscription = Subscription {
+            id: "sub-1".into(),
+            stream_root: "/root".into(),
+            config: SubscriptionConfig {
+                kind: SubscriptionKind::PullWake,
+                pattern: None,
+                streams: vec!["events/a".into()],
+                webhook_url: None,
+                wake_stream: Some("wake/pool".into()),
+                lease_ttl_ms: 600_000,
+                description: None,
+            },
+            callback_base_url: "http://localhost:4562".into(),
+            created_at: "2026-08-28T00:00:00Z".into(),
+            status: SubscriptionStatus::Active,
+            streams: BTreeMap::from([(
+                "events/a".into(),
+                StreamLink {
+                    explicit: true,
+                    glob: false,
+                    acked_offset: format_offset(u64::MAX),
+                    stream_id: Some(current_id.wrapping_add(1)),
+                },
+            )]),
+            generation: 7,
+            wake_id: Some("old-wake".into()),
+            wake_snapshot: BTreeMap::from([("events/a".into(), format_offset(u64::MAX))]),
+            token: Some("old-token".into()),
+            holder: Some("old-worker".into()),
+            lease_nonce: 4,
+            retry_count: 0,
+            next_attempt_at_ms: None,
+            lease_expires_at_ms: Some(unix_millis().saturating_add(600_000)),
+            wake_trigger: Some("events/a".into()),
+            wake_delivery_pending: false,
+        };
+        {
+            let mut state = store.subscriptions.state.lock().await;
+            register_wake_stream(&mut state, &subscription, &store);
+            state
+                .subscriptions
+                .insert(subscription_key("/root", "sub-1"), subscription);
+        }
+        store
+            .subscriptions
+            .subscription_count
+            .fetch_add(1, Ordering::Release);
+        store.subscriptions.resume(store.clone()).await.unwrap();
+        let state = store.subscriptions.state.lock().await;
+        let subscription = &state.subscriptions[&subscription_key("/root", "sub-1")];
+        assert_eq!(subscription.streams["events/a"].stream_id, Some(current_id));
+        assert_eq!(
+            subscription.streams["events/a"].acked_offset,
+            BEFORE_FIRST_OFFSET
+        );
+        assert_eq!(subscription.generation, 8);
+        assert_ne!(subscription.wake_id.as_deref(), Some("old-wake"));
+        assert!(subscription.holder.is_none());
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_link_fences_a_lazy_expiry_replacement_without_delete_notification() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("explicit-expiry-incarnation");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Put,
+                    "/root/__ds/subscriptions/sub-1",
+                    json!({
+                        "type": "pull-wake",
+                        "streams": ["events/a"],
+                        "wake_stream": "wake/pool"
+                    }),
+                ),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(Method::Post, "/root/events/a", json!({"value": 1})),
+            )
+            .await
+            .status,
+            204
+        );
+        let claim = response_json(
+            handle(
+                store.clone(),
+                json_request(
+                    Method::Post,
+                    "/root/__ds/subscriptions/sub-1/claim",
+                    json!({"worker": "worker-1"}),
+                ),
+            )
+            .await,
+        );
+        let old_tail = claim["streams"][0]["tail_offset"].clone();
+        let old_id = live_stream_metadata(&store, "/root", "events/a").unwrap().0;
+        let mut ack = json_request(
+            Method::Post,
+            "/root/__ds/subscriptions/sub-1/ack",
+            json!({
+                "wake_id": claim["wake_id"],
+                "generation": claim["generation"],
+                "acks": [{"stream": "events/a", "offset": old_tail}],
+                "done": true
+            }),
+        );
+        ack.headers.push((
+            "authorization".into(),
+            format!("Bearer {}", claim["token"].as_str().unwrap()),
+        ));
+        assert_eq!(handle(store.clone(), ack).await.status, 200);
+
+        // Model Store::get's lazy TTL unlink directly: unlike the HTTP DELETE
+        // path it intentionally does not call `on_stream_deleted`.
+        let expired = store.get("/root/events/a").unwrap();
+        store.delete_or_soft_delete_durable(&expired).unwrap();
+        create_json_stream(&store, "/root/events/a").await;
+        assert_eq!(
+            handle(
+                store.clone(),
+                json_request(Method::Post, "/root/events/a", json!({"value": 2})),
+            )
+            .await
+            .status,
+            204
+        );
+
+        let new_id = live_stream_metadata(&store, "/root", "events/a").unwrap().0;
+        assert_ne!(new_id, old_id);
+        let state = store.subscriptions.state.lock().await;
+        let subscription = &state.subscriptions[&subscription_key("/root", "sub-1")];
+        assert_eq!(subscription.streams["events/a"].stream_id, Some(new_id));
+        assert_eq!(
+            subscription.streams["events/a"].acked_offset,
+            BEFORE_FIRST_OFFSET
+        );
+        assert!(subscription.wake_id.is_some());
+        assert!(has_pending_work(subscription, &store));
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn append_waits_for_a_first_subscription_create_after_its_tail_sample() {
+        let _guard = DurabilityGuard::memory();
+        let (store, dir) = test_store("first-create-append-race");
+        create_json_stream(&store, "/root/wake/pool").await;
+        create_json_stream(&store, "/root/events/a").await;
+        let stream_id = live_stream_metadata(&store, "/root", "events/a").unwrap().0;
+        let subscription = Subscription {
+            id: "sub-1".into(),
+            stream_root: "/root".into(),
+            config: SubscriptionConfig {
+                kind: SubscriptionKind::PullWake,
+                pattern: None,
+                streams: vec!["events/a".into()],
+                webhook_url: None,
+                wake_stream: Some("wake/pool".into()),
+                lease_ttl_ms: 30_000,
+                description: None,
+            },
+            callback_base_url: String::new(),
+            created_at: "2026-08-28T00:00:00Z".into(),
+            status: SubscriptionStatus::Active,
+            streams: BTreeMap::from([(
+                "events/a".into(),
+                StreamLink {
+                    explicit: true,
+                    glob: false,
+                    acked_offset: ZERO_OFFSET.into(),
+                    stream_id: Some(stream_id),
+                },
+            )]),
+            generation: 0,
+            wake_id: None,
+            wake_snapshot: BTreeMap::new(),
+            token: None,
+            holder: None,
+            lease_nonce: 0,
+            retry_count: 0,
+            next_attempt_at_ms: None,
+            lease_expires_at_ms: None,
+            wake_trigger: None,
+            wake_delivery_pending: false,
+        };
+
+        // Hold the manager lock to pause a modeled first create after it has
+        // sampled the source tail but before insertion. The append must see the
+        // in-progress counter and wait instead of taking the zero-count return.
+        let manager = store.subscriptions.clone();
+        let mut state = manager.state.lock().await;
+        // This reservation is the modeled create guard; after insertion it
+        // becomes the committed subscription count without an atomic handoff.
+        manager.subscription_count.fetch_add(1, Ordering::Release);
+        let append_store = store.clone();
+        let append = tokio::spawn(async move {
+            handle(
+                append_store,
+                json_request(Method::Post, "/root/events/a", json!({"value": 1})),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live_tail_offset(&store, "/root", "events/a").as_deref() == Some(ZERO_OFFSET) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("append should publish its durable tail before waiting on subscription state");
+        register_wake_stream(&mut state, &subscription, &store);
+        state
+            .subscriptions
+            .insert(subscription_key("/root", "sub-1"), subscription);
+        drop(state);
+
+        assert_eq!(append.await.unwrap().status, 204);
+        let state = manager.state.lock().await;
+        let subscription = &state.subscriptions[&subscription_key("/root", "sub-1")];
+        assert!(subscription.wake_id.is_some());
+        assert!(has_pending_work(subscription, &store));
+        drop(state);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

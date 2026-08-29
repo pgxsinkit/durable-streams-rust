@@ -36,40 +36,59 @@ bun run test:conformance
 The harness resolves Cargo's configured target directory, bootstraps the WAL
 store identity when needed, and enables the subscription suite.
 
-## Important limits of that coverage
+## Production behavior beyond the published fixture
 
-Passing the six subscription tests is not the same as completing every
-production requirement in protocol sections 6–7. The current implementation
-matches the upstream reference server's process-lifetime behavior, with these
-known gaps:
+The six upstream subscription cases do not exercise restart and deployment
+security behavior. This implementation additionally provides:
 
-- Subscription definitions, acked offsets, generations, leases, retry
-  schedules, and signing/token keys are process-local. The protocol requires
-  durable cursor state and persisted retry metadata. A restart currently loses
-  subscriptions rather than resuming pending work.
-- Pull-wake events themselves are durable: they are appended through the normal
-  JSON stream/WAL path. The metadata deciding whether another wake is needed is
-  not yet durable.
-- The protocol specifies service-JWT authorization for `claim`; the upstream
-  conformance test sends no authorization and this implementation does not yet
-  validate one. Deployments must keep the control prefix behind the existing
-  access boundary until this is implemented. The mTLS access policy requires a
-  separate rule with `"control": true`; ordinary data-prefix rules never match
-  `__ds`, and the example policy grants no subscription control access by
-  default.
-- Webhook validation rejects literal private/link-local IPs, permits only the
-  documented localhost HTTP exception, rejects IPv6 literals, and disables
-  redirects. It does not yet pin DNS resolution to public addresses, so
-  production-grade SSRF protection remains incomplete.
-- Webhook signing keys are generated at process start. Protocol-compliant key
-  persistence and rotation (including retaining old JWKS entries through the
-  replay window) remain to be implemented.
-- `DS_PUBLIC_BASE_URL` is mandatory for webhook subscriptions. It must be a
-  trusted origin URL (HTTPS except for `localhost`/`127.0.0.x` development), so
-  callback and JWKS URLs never derive from attacker-controlled `Host` or
-  forwarding headers.
+- Crash-safe atomic snapshots under `<data-dir>/subscriptions/state.json` for
+  subscription definitions, acked offsets, generations, wake snapshots,
+  leases, retry counts, and absolute `next_attempt_at` deadlines. Files and
+  directories are owner-only and each replacement is file-fsynced, renamed,
+  and parent-directory-fsynced before a state-changing HTTP response returns.
+  Append-derived wake/link snapshots are coalesced onto a blocking writer and
+  are reconstructed from recovered stream inventory if a crash wins that
+  small window. A background transition that cannot be persisted fails the
+  process instead of continuing with split memory/disk truth.
+- Startup resume after stream/WAL recovery. Unexpired leases retain their
+  holder and fencing token, expired leases produce a later generation, and
+  failed deliveries honor the remaining persisted backoff. A crash between an
+  external delivery and its local state commit can replay the same fenced
+  `wake_id`, giving at-least-once delivery without cursor loss.
+- Persistent callback-token and Ed25519 private keys under
+  `<data-dir>/subscriptions/secrets.json`. Rotation first durably prepublishes
+  a new public key for the five-minute JWKS cache lifetime, activates it only
+  afterward, and retains the prior key through the configured signature replay
+  window. The server refuses to replace missing secrets when state exists.
+- Fail-closed service-JWT validation for pull-wake `claim`: a mounted JWKS file,
+  exact issuer, and exact audience are required, with an optional required
+  scope and subject. A validated JWKS is cached for at most one second, so
+  atomic replacement rotates trust without making attacker-controlled claims
+  force disk reads. Only asymmetric signing keys whose `alg`, `use`,
+  `key_ops`, family, and curve authorize the token algorithm are accepted.
+- DNS-rebinding-resistant webhook delivery. Every attempt resolves the target,
+  rejects mixed or exclusively private/local answers, disables redirects and
+  proxies, and pins a validated address into the HTTP client while retaining
+  the original hostname for TLS verification.
+  DNS and total-request timeouts, a 64 KiB response limit, bounded pinned-client
+  reuse, and explicit rejection of transition/embedded-address IP ranges keep
+  retrying endpoints resource-bounded.
 
-Pull-wake creation also requires its ordinary JSON `wake_stream` to exist and
+The published conformance claim request does not yet carry its specified
+service JWT, so the repository harness alone sets
+`DS_SUBSCRIPTION_INSECURE_ALLOW_UNAUTHENTICATED_CLAIMS=1`. It also sets
+`DS_WEBHOOK_ALLOW_LOCALHOST=1` for its loopback fixture. Normal server startup
+does not enable that bypass: an unconfigured claim endpoint returns `503`, and
+missing, invalid, or insufficient credentials return `401`/`403`.
+
+`DS_PUBLIC_BASE_URL` remains mandatory for webhook subscriptions. It must be a
+trusted origin URL (HTTPS except when the explicit localhost development flag
+permits `localhost`/`127.0.0.0/8`), so
+callback and JWKS URLs never derive from attacker-controlled `Host` or
+forwarding headers.
+
+Pull-wake events are appended through the normal JSON stream/WAL path. Creation
+requires that ordinary JSON `wake_stream` to exist and
 remain open. A subscription never links its own wake stream, even when a glob
 such as `**` would otherwise match it. Failed wake writes retry with bounded
 exponential backoff rather than permanently wedging the generation.

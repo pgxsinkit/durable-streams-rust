@@ -723,6 +723,7 @@ impl Store {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let blobstore = build_blobstore(&tier_config, &data_dir)?;
+        let subscriptions = Arc::new(crate::subscriptions::SubscriptionManager::new(&data_dir)?);
         let store = Store {
             streams: DashMap::new(),
             data_dir,
@@ -731,7 +732,7 @@ impl Store {
             blobstore,
             wal: std::sync::OnceLock::new(),
             meta_sweep: StdMutex::new(Vec::new()),
-            subscriptions: Arc::new(crate::subscriptions::SubscriptionManager::new()?),
+            subscriptions,
             inventory: RwLock::new(InventoryProjection {
                 generation: 0,
                 entries: BTreeMap::new(),

@@ -174,7 +174,7 @@ conformance suite once per configuration (the `conformance` matrix in
 
 Core protocol: create / append / read (catch-up, long-poll, SSE), HEAD, DELETE, JSON mode, idempotent producers (`Producer-Id` / `Producer-Epoch` / `Stream-Seq`), close, TTL / expiry, cursors, ETags / 304, security headers, and stream forks.
 
-Reserved subscription APIs: webhook and pull-wake subscriptions, glob/explicit membership, Ed25519/JWKS webhook signing, callback fencing, and claim/ack/release leases. Pull-wake lets a worker tail one wake stream and fetch only source streams with pending work; it does not multiplex the source payloads themselves onto that connection. The current subscription metadata is process-local, so this surface is conformance-complete but not yet production-durable across restarts. See [protocol alignment and remaining gaps](docs/protocol-alignment.md).
+Reserved subscription APIs: webhook and pull-wake subscriptions, glob/explicit membership, Ed25519/JWKS webhook signing, callback fencing, and claim/ack/release leases. Pull-wake lets a worker tail one wake stream and fetch only source streams with pending work; it does not multiplex the source payloads themselves onto that connection. Subscription definitions, cursors, generations, leases, retry deadlines, callback-token secrets, and webhook signing keys are crash-safe and resume across restarts. See [protocol alignment and production behavior](docs/protocol-alignment.md).
 
 Webhook subscriptions require `DS_PUBLIC_BASE_URL` to be set to the trusted
 external origin, for example `https://streams.internal.example`. Pull-wake
@@ -191,8 +191,32 @@ rules and require an explicit rule such as:
 }
 ```
 
-Do not grant that rule until the identity is intended to manage subscriptions;
-service-JWT validation on `claim` remains an explicitly documented gap.
+Do not grant that rule until the identity is intended to manage subscriptions.
+Pull-wake `claim` also fails closed unless service-JWT verification is
+configured:
+
+| Environment variable | Required | Purpose |
+| --- | ---: | --- |
+| `DS_SUBSCRIPTION_SERVICE_JWT_JWKS_FILE` | yes | Mounted asymmetric JWK Set; atomically replacing the file rotates trusted service keys without restarting. |
+| `DS_SUBSCRIPTION_SERVICE_JWT_ISSUER` | yes | Exact required `iss` claim. |
+| `DS_SUBSCRIPTION_SERVICE_JWT_AUDIENCE` | yes | Exact required `aud` claim. |
+| `DS_SUBSCRIPTION_SERVICE_JWT_REQUIRED_SCOPE` | no | Required member of a space-delimited or array-valued `scope` claim. |
+| `DS_SUBSCRIPTION_SERVICE_JWT_REQUIRED_SUBJECT` | no | Exact required `sub` claim, for binding claims to one service identity. |
+| `DS_WEBHOOK_SIGNING_KEY_ROTATION_SECS` | no | Webhook signing-key lifetime; default 30 days, `0` disables automatic rotation. |
+| `DS_WEBHOOK_SIGNATURE_REPLAY_WINDOW_SECS` | no | How long rotated public keys remain in JWKS; default 5 minutes. |
+| `DS_WEBHOOK_ALLOW_LOCALHOST` | no | Set to `1` only in development to permit HTTP callbacks to `localhost`/`127.0.0.0/8`. |
+
+JWT verification accepts asymmetric RS256/384/512, PS256/384/512,
+ES256/384, and EdDSA keys, and requires a valid signature, `exp`, issuer, and
+audience. `DS_SUBSCRIPTION_INSECURE_ALLOW_UNAUTHENTICATED_CLAIMS=1` is an
+explicit development/conformance escape hatch and must not be set in
+production.
+
+Webhook delivery resolves DNS itself, rejects the request if any answer is
+private/local, and pins the selected public address into a no-proxy,
+no-redirect HTTP client while retaining the hostname for TLS SNI and `Host`.
+Plain HTTP and loopback targets are rejected unless the explicit localhost
+development flag is set.
 
 Durable: in `wal` mode (the default), an append returns only after its record is durable in the sharded write-ahead log (WAL). The WAL acks on a group-commit `fdatasync` and recovers cleanly on restart: every WAL record carries both a header CRC32C (torn-header detector — a partially-written header fails immediately) and a payload CRC32C verified on recovery, so no torn or zeroed record is ever replayed. State survives restarts — on boot the store rebuilds every stream from its data file plus a `.meta` sidecar, re-links fork chains, and replays the WAL to reconcile any un-checkpointed tail. (Crash window per [PROTOCOL.md](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md): producer dedup state may lag the data file, so producers should bump their epoch on restart.)
 
