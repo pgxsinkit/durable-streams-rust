@@ -467,6 +467,10 @@ impl StreamState {
         _appender: &tokio::sync::MutexGuard<'_, Appender>,
     ) {
         self.fenced.store(true, Ordering::Release);
+        // An accepted append can have queued a lagging sidecar flush before it
+        // drops its full-ack guard. Clearing here makes the common case inert;
+        // retirement clears once more after the guards drain below.
+        self.meta_dirty.store(false, Ordering::Release);
     }
 
     /// Waits for in-flight append guards to drain after the stream was fenced
@@ -1182,6 +1186,11 @@ impl Store {
             stream.fence_while_holding_appender(&appender);
         }
         stream.wait_for_inflight_appends_zero().await;
+        // A pre-fence accepted append may have dirtied metadata after the
+        // first clear and before its full-ack guard drained. Fenced streams
+        // never need a lagging Store sweep (soft retirement has its own
+        // authoritative durable sidecar write in the physical finalizer).
+        stream.meta_dirty.store(false, Ordering::Release);
 
         if !self.is_exact_live(&stream) {
             return self.cancel_retirement(&executor, &stream, ticket);
@@ -2878,6 +2887,15 @@ pub fn write_meta_sync(st: &StreamState, durable: bool) -> std::io::Result<()> {
     // Serialize per stream so concurrent writers don't race on the temp file or
     // reorder renames (a stale flush must not clobber a durable manifest flip).
     let _g = st.meta_lock.lock().unwrap_or_else(|e| e.into_inner());
+    write_meta_sync_while_holding_meta_lock(st, durable)
+}
+
+/// Writes a sidecar while the caller owns `st.meta_lock`.
+///
+/// This intentionally does not inspect `fenced`: the physical soft-retirement
+/// finalizer must persist a fenced tombstone. Store's lagging sweep performs
+/// its narrower live-and-unfenced eligibility check before calling this.
+fn write_meta_sync_while_holding_meta_lock(st: &StreamState, durable: bool) -> std::io::Result<()> {
     let meta = Meta::capture(st);
     let bytes = serde_json::to_vec(&meta).expect("meta serializes");
     let tmp = meta_path(&st.file_path).with_extension("meta.tmp");
@@ -2928,11 +2946,22 @@ impl Store {
     /// the checkpoint owns the flush and the CAS failing here avoids a
     /// duplicate write.
     pub fn mark_meta_dirty(&self, st: &Arc<StreamState>) {
+        if st.fenced.load(Ordering::Acquire) {
+            return;
+        }
         if st
             .meta_dirty
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            // Retirement may have fenced between the first check and this
+            // successful CAS. Avoid enqueuing in that usual race; if fencing
+            // wins immediately after this check, its post-drain clear leaves
+            // this one bounded pending Arc inert.
+            if st.fenced.load(Ordering::Acquire) {
+                st.meta_dirty.store(false, Ordering::Release);
+                return;
+            }
             self.meta_sweep.lock().unwrap().push(Arc::clone(st));
         }
     }
@@ -2946,19 +2975,137 @@ impl Store {
         let mut n = 0;
         for st in drained {
             // A hard-deleted stream's files are already unlinked — flushing
-            // would resurrect its sidecar. Same `Arc` identity check as
-            // delete's `remove_if`. (Soft-deleted streams stay in the map and
-            // must flush: the sidecar records the `soft_deleted` flag.)
-            let live = self
-                .streams
-                .get(&st.path)
-                .is_some_and(|cur| Arc::ptr_eq(cur.value(), &st));
-            if live && st.meta_dirty.swap(false, Ordering::AcqRel) {
-                let _ = write_meta_sync(&st, false);
+            // would resurrect its sidecar. The preliminary exact-Arc check
+            // avoids taking a retired stream's lock; the second check below
+            // closes the check/write race against retirement and cleanup.
+            if !self.is_exact_registered(&st) {
+                continue;
+            }
+            #[cfg(test)]
+            sweep_meta_test_support::wait_after_eligibility(&st);
+
+            // Physical cleanup takes this same lock before unlinking. If
+            // sweep wins it, cleanup removes the just-written sidecar. If
+            // cleanup/fencing wins it, this recheck skips stale output.
+            let _meta_lock = st.meta_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if self.is_exact_registered(&st)
+                && !st.fenced.load(Ordering::Acquire)
+                && st.meta_dirty.swap(false, Ordering::AcqRel)
+            {
+                let _ = write_meta_sync_while_holding_meta_lock(&st, false);
                 n += 1;
             }
         }
         n
+    }
+}
+
+#[cfg(test)]
+mod sweep_meta_test_support {
+    use super::*;
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    struct PauseState {
+        stream: std::sync::Weak<StreamState>,
+        reached: Sender<()>,
+        release: Option<Receiver<()>>,
+    }
+
+    static PAUSES: std::sync::LazyLock<StdMutex<HashMap<String, PauseState>>> =
+        std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+    pub(crate) struct EligibilityPause {
+        path: String,
+        stream: Arc<StreamState>,
+        reached: StdMutex<Option<Receiver<()>>>,
+        release: Sender<()>,
+    }
+
+    pub(crate) fn pause_after_eligibility(stream: &Arc<StreamState>) -> EligibilityPause {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut pauses = PAUSES.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(
+            !pauses.contains_key(&stream.path),
+            "a sweep eligibility pause is already installed for {}",
+            stream.path
+        );
+        pauses.insert(
+            stream.path.clone(),
+            PauseState {
+                stream: Arc::downgrade(stream),
+                reached: reached_tx,
+                release: Some(release_rx),
+            },
+        );
+        EligibilityPause {
+            path: stream.path.clone(),
+            stream: Arc::clone(stream),
+            reached: StdMutex::new(Some(reached_rx)),
+            release: release_tx,
+        }
+    }
+
+    impl EligibilityPause {
+        pub(crate) async fn wait_until_eligible(&self) {
+            let reached = self
+                .reached
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+                .expect("wait_until_eligible may be called only once");
+            tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(5)))
+                .await
+                .expect("sweep eligibility waiter should not panic")
+                .expect("sweep should reach the eligibility pause within five seconds");
+        }
+
+        pub(crate) fn release(&self) {
+            self.release
+                .send(())
+                .expect("paused sweep should still be waiting for release");
+        }
+    }
+
+    impl Drop for EligibilityPause {
+        fn drop(&mut self) {
+            let _ = self.release.send(());
+            let mut pauses = PAUSES.lock().unwrap_or_else(|error| error.into_inner());
+            if pauses.get(&self.path).is_some_and(|state| {
+                state
+                    .stream
+                    .upgrade()
+                    .is_some_and(|current| Arc::ptr_eq(&current, &self.stream))
+            }) {
+                pauses.remove(&self.path);
+            }
+        }
+    }
+
+    pub(crate) fn wait_after_eligibility(stream: &Arc<StreamState>) {
+        let (reached, release) = {
+            let mut pauses = PAUSES.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(state) = pauses.get_mut(&stream.path) else {
+                return;
+            };
+            if !state
+                .stream
+                .upgrade()
+                .is_some_and(|current| Arc::ptr_eq(&current, stream))
+            {
+                return;
+            }
+            let Some(release) = state.release.take() else {
+                return;
+            };
+            (state.reached.clone(), release)
+        };
+        reached
+            .send(())
+            .expect("test must still be waiting for sweep eligibility");
+        release
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test must release sweep eligibility within five seconds");
     }
 }
 
@@ -4013,6 +4160,7 @@ mod tier_tests {
 #[cfg(test)]
 mod meta_sweep_tests {
     use super::*;
+    use crate::retirement::TerminalCleanupCompletion;
     use crate::tier::TierConfig;
 
     fn tmp_dir(tag: &str) -> PathBuf {
@@ -4050,6 +4198,31 @@ mod meta_sweep_tests {
 
     fn disk_meta(st: &StreamState) -> Meta {
         serde_json::from_slice(&std::fs::read(meta_path(&st.file_path)).unwrap()).unwrap()
+    }
+
+    fn retirement_store(dir: PathBuf) -> Arc<Store> {
+        Arc::new(Store::new_with_tier(dir, TierConfig::default()).unwrap())
+    }
+
+    async fn retire_owner_and_wait(store: &Arc<Store>, stream: Arc<StreamState>) {
+        let ticket = match store.retire_explicit(stream).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("expected retirement ownership"),
+        };
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+    }
+
+    async fn wait_until_fenced(stream: &StreamState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !stream.fenced.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement should fence the stream");
     }
 
     /// Marking is idempotent while a flush is pending (one sweep entry per
@@ -4113,6 +4286,152 @@ mod meta_sweep_tests {
             "sweep must not resurrect a deleted stream's sidecar"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn retirement_clears_pending_dirty_and_sweep_cannot_resurrect_hard_sidecar() {
+        let dir = tmp_dir("retire-pending-dirty");
+        let store = retirement_store(dir.clone());
+        store.init_retirement_executor().unwrap();
+        let stream = create(&store, "s");
+        store.mark_meta_dirty(&stream);
+        assert!(stream.meta_dirty.load(Ordering::Acquire));
+
+        retire_owner_and_wait(&store, stream.clone()).await;
+
+        assert!(stream.fenced.load(Ordering::Acquire));
+        assert!(!stream.meta_dirty.load(Ordering::Acquire));
+        assert!(!meta_path(&stream.file_path).exists());
+        assert_eq!(store.sweep_meta_once(), 0);
+        assert!(!meta_path(&stream.file_path).exists());
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn retirement_post_drain_clear_wins_over_an_accepted_inflight_dirty_mark() {
+        let dir = tmp_dir("retire-inflight-dirty");
+        let store = retirement_store(dir.clone());
+        store.init_retirement_executor().unwrap();
+        let stream = create(&store, "s");
+        let appender = stream.appender.lock().await;
+        let guard = InflightAppendGuard::begin(&stream, &appender).unwrap();
+        drop(appender);
+
+        let owner_store = Arc::clone(&store);
+        let owner_stream = Arc::clone(&stream);
+        let owner = tokio::spawn(async move { owner_store.retire_explicit(owner_stream).await });
+        wait_until_fenced(&stream).await;
+        // This represents a write accepted before the fence whose full-ack
+        // path marks metadata after retirement's first clear.
+        stream.meta_dirty.store(true, Ordering::Release);
+        drop(guard);
+        let ticket = match tokio::time::timeout(Duration::from_secs(5), owner)
+            .await
+            .expect("retirement should resume after the accepted write drains")
+            .expect("retirement task should not panic")
+        {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("expected owner after drain"),
+        };
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(!stream.meta_dirty.load(Ordering::Acquire));
+        assert_eq!(store.sweep_meta_once(), 0);
+        assert!(!meta_path(&stream.file_path).exists());
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sweep_rechecks_fence_after_eligibility_before_writing_sidecar() {
+        let dir = tmp_dir("sweep-fence-race");
+        let store = retirement_store(dir.clone());
+        store.init_retirement_executor().unwrap();
+        let stream = create(&store, "s");
+        store.mark_meta_dirty(&stream);
+        let pause = sweep_meta_test_support::pause_after_eligibility(&stream);
+        let sweep_store = Arc::clone(&store);
+        let sweep = tokio::task::spawn_blocking(move || sweep_store.sweep_meta_once());
+        pause.wait_until_eligible().await;
+
+        retire_owner_and_wait(&store, stream.clone()).await;
+        assert!(!meta_path(&stream.file_path).exists());
+        pause.release();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), sweep)
+                .await
+                .expect("sweep must resume")
+                .expect("sweep task should not panic"),
+            0
+        );
+        assert!(!meta_path(&stream.file_path).exists());
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(pause);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_sidecar_written_while_holding_the_metadata_lock() {
+        let dir = tmp_dir("sweep-lock-before-cleanup");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let stream = create(&store, "s");
+        let meta_lock = stream
+            .meta_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        write_meta_sync_while_holding_meta_lock(&stream, false).unwrap();
+        assert!(meta_path(&stream.file_path).exists());
+        drop(meta_lock);
+
+        store
+            .cleanup_local_stream(&stream, LocalCleanupMode::ExplicitDelete)
+            .unwrap();
+        assert!(!meta_path(&stream.file_path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fenced_mark_meta_dirty_is_inert() {
+        let dir = tmp_dir("fenced-mark-inert");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let stream = create(&store, "s");
+        let appender = stream.appender.lock().await;
+        stream.fence_while_holding_appender(&appender);
+        drop(appender);
+
+        store.mark_meta_dirty(&stream);
+        store.mark_meta_dirty(&stream);
+        assert!(!stream.meta_dirty.load(Ordering::Acquire));
+        assert!(store.meta_sweep.lock().unwrap().is_empty());
+        assert_eq!(store.sweep_meta_once(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn soft_retirement_persists_its_tombstone_while_sweep_skips_fenced_stream() {
+        let dir = tmp_dir("soft-retirement-sweep");
+        let store = retirement_store(dir.clone());
+        store.init_retirement_executor().unwrap();
+        let stream = create(&store, "s");
+        stream.shared.write().unwrap().ref_count = 1;
+        store.mark_meta_dirty(&stream);
+
+        retire_owner_and_wait(&store, stream.clone()).await;
+
+        assert!(stream.fenced.load(Ordering::Acquire));
+        assert!(stream.shared.read().unwrap().soft_deleted);
+        assert!(disk_meta(&stream).soft_deleted);
+        assert_eq!(store.sweep_meta_once(), 0);
+        assert!(disk_meta(&stream).soft_deleted);
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
