@@ -3,7 +3,7 @@ mod api;
 mod blobstore;
 mod data_dir_lock;
 mod engine_raw;
-#[allow(dead_code)] // ehu-b wires the standalone index into Store/scanner paths.
+#[allow(dead_code)] // ehu-b wires the index; 1r0f-a owns inert scanner config.
 mod expiration;
 mod handlers;
 mod http1;
@@ -238,6 +238,7 @@ fn main() {
     // investigation, independent of the heavy `telemetry` OTLP feature.
     let mut wal_stats_secs: Option<u64> = None;
     let mut server_stats_secs: Option<u64> = None;
+    let mut expiration_reaper_config = expiration::ExpirationScannerConfig::default();
     let mut expected_store_id: Option<String> = None;
     let mut expected_store_generation: Option<String> = None;
     let mut expected_protocol_version: Option<u32> = None;
@@ -278,6 +279,20 @@ fn main() {
             }
             "--long-poll-timeout-ms" => {
                 handlers::set_long_poll_timeout(parse_val(args.next(), "--long-poll-timeout-ms"));
+            }
+            // Configuration is parsed now but remains inert until the future
+            // scanner runtime owns it. Repeated flags are last-value-wins,
+            // matching the rest of this hand-written argument parser.
+            "--expiry-reaper-mode"
+            | "--expiry-scan-rate"
+            | "--expiry-delete-rate"
+            | "--expiry-startup-grace-seconds"
+            | "--expiry-bulk-fraction"
+            | "--expiry-clock-jump-seconds" => {
+                let value = val(args.next(), &a);
+                expiration_reaper_config
+                    .set_cli_value(&a, &value)
+                    .unwrap_or_else(|error| exit_usage(error));
             }
             // Resident tail-cache cap (bytes); 0 disables it (reads → sendfile/pread).
             // Default is platform-dependent (off on Linux, 64 KiB on macOS).
@@ -571,6 +586,10 @@ fn main() {
         .expect("failed to build runtime");
 
     rt.block_on(async move {
+        // The future scanner runtime consumes this immutable configuration.
+        // Keeping it in the runtime block makes startup parsing explicit while
+        // 1r0f-a intentionally starts no scanner or retirement work.
+        let _expiration_reaper_config = expiration_reaper_config;
         // Hold the advisory lock until all runtime-owned store and WAL state is
         // drained.  Its drop at the end of this block is the release point.
         let _data_dir_lock = data_dir_lock;

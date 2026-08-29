@@ -6,10 +6,162 @@
 //! or taking Store locks while it is scanned.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use crate::store::StreamState;
+
+/// Requested behavior for the future expiration reaper.
+///
+/// `Delete` is deliberately accepted before the scanner exists so deployment
+/// configuration can be rolled out ahead of activation.  It has no effect in
+/// this configuration-only slice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExpirationReaperMode {
+    #[default]
+    Off,
+    Observe,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpirationReaperModeParseError;
+
+impl fmt::Display for ExpirationReaperModeParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("must be exactly off, observe, or delete")
+    }
+}
+
+impl FromStr for ExpirationReaperMode {
+    type Err = ExpirationReaperModeParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "observe" => Ok(Self::Observe),
+            "delete" => Ok(Self::Delete),
+            _ => Err(ExpirationReaperModeParseError),
+        }
+    }
+}
+
+/// Immutable scanner settings parsed at startup.
+///
+/// The rate limits are capped at one token per nanosecond so the future token
+/// pacer can represent their minimum interval without truncation to zero.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExpirationScannerConfig {
+    mode: ExpirationReaperMode,
+    scan_rate_candidates_per_second: u64,
+    delete_rate_deletions_per_second: u64,
+    startup_grace_duration: Duration,
+    bulk_fraction: f64,
+    clock_jump_threshold_duration: Duration,
+}
+
+impl Default for ExpirationScannerConfig {
+    fn default() -> Self {
+        Self {
+            mode: ExpirationReaperMode::Off,
+            scan_rate_candidates_per_second: 10_000,
+            delete_rate_deletions_per_second: 100,
+            startup_grace_duration: Duration::from_secs(60),
+            bulk_fraction: 0.25,
+            clock_jump_threshold_duration: Duration::from_secs(300),
+        }
+    }
+}
+
+impl ExpirationScannerConfig {
+    /// Apply one recognized CLI option. Repeated options deliberately replace
+    /// the prior value, matching the server's existing last-value-wins parser.
+    pub(crate) fn set_cli_value(&mut self, flag: &str, value: &str) -> Result<(), String> {
+        match flag {
+            "--expiry-reaper-mode" => {
+                self.mode = value
+                    .parse()
+                    .map_err(|error: ExpirationReaperModeParseError| format!("{flag} {error}"))?;
+            }
+            "--expiry-scan-rate" => {
+                self.scan_rate_candidates_per_second =
+                    parse_positive_rate(flag, value, "candidates")?;
+            }
+            "--expiry-delete-rate" => {
+                self.delete_rate_deletions_per_second =
+                    parse_positive_rate(flag, value, "deletions")?;
+            }
+            "--expiry-startup-grace-seconds" => {
+                self.startup_grace_duration = Duration::from_secs(parse_seconds(flag, value)?);
+            }
+            "--expiry-bulk-fraction" => {
+                self.bulk_fraction = parse_bulk_fraction(flag, value)?;
+            }
+            "--expiry-clock-jump-seconds" => {
+                let seconds = parse_seconds(flag, value)?;
+                if seconds == 0 {
+                    // Zero cannot mean "disabled": the future scanner must
+                    // always distinguish ordinary time from a clock jump.
+                    return Err(format!("{flag} must be a positive integer (seconds)"));
+                }
+                self.clock_jump_threshold_duration = Duration::from_secs(seconds);
+            }
+            _ => return Err(format!("unknown expiration reaper option: {flag}")),
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn mode(&self) -> ExpirationReaperMode {
+        self.mode
+    }
+
+    pub(crate) const fn scan_rate_candidates_per_second(&self) -> u64 {
+        self.scan_rate_candidates_per_second
+    }
+
+    pub(crate) const fn delete_rate_deletions_per_second(&self) -> u64 {
+        self.delete_rate_deletions_per_second
+    }
+
+    pub(crate) const fn startup_grace_duration(&self) -> Duration {
+        self.startup_grace_duration
+    }
+
+    pub(crate) const fn bulk_fraction(&self) -> f64 {
+        self.bulk_fraction
+    }
+
+    pub(crate) const fn clock_jump_threshold_duration(&self) -> Duration {
+        self.clock_jump_threshold_duration
+    }
+}
+
+const MAX_RATE_PER_SECOND: u64 = 1_000_000_000;
+
+fn parse_positive_rate(flag: &str, value: &str, unit: &str) -> Result<u64, String> {
+    match value.parse::<u64>() {
+        Ok(rate) if (1..=MAX_RATE_PER_SECOND).contains(&rate) => Ok(rate),
+        _ => Err(format!(
+            "{flag} must be a positive integer no greater than {MAX_RATE_PER_SECOND} ({unit} per second)"
+        )),
+    }
+}
+
+fn parse_seconds(flag: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{flag} must be a non-negative integer (seconds)"))
+}
+
+fn parse_bulk_fraction(flag: &str, value: &str) -> Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(fraction) if fraction.is_finite() && fraction > 0.0 && fraction <= 1.0 => Ok(fraction),
+        _ => Err(format!("{flag} must be a finite number in (0, 1]")),
+    }
+}
 
 /// Stable round-robin position owned by an expiration scanner.
 ///
@@ -245,6 +397,94 @@ mod tests {
     use crate::store::{CreateResult, Store, StreamConfig};
     use crate::tier::TierConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn scanner_config_defaults_and_valid_cli_overrides_are_typed() {
+        let mut config = ExpirationScannerConfig::default();
+        assert_eq!(config.mode(), ExpirationReaperMode::Off);
+        assert_eq!(config.scan_rate_candidates_per_second(), 10_000);
+        assert_eq!(config.delete_rate_deletions_per_second(), 100);
+        assert_eq!(config.startup_grace_duration(), Duration::from_secs(60));
+        assert_eq!(config.bulk_fraction(), 0.25);
+        assert_eq!(
+            config.clock_jump_threshold_duration(),
+            Duration::from_secs(300)
+        );
+
+        for (flag, value) in [
+            ("--expiry-reaper-mode", "delete"),
+            ("--expiry-scan-rate", "9999"),
+            ("--expiry-delete-rate", "99"),
+            ("--expiry-startup-grace-seconds", "0"),
+            ("--expiry-bulk-fraction", "1"),
+            ("--expiry-clock-jump-seconds", "1"),
+        ] {
+            config.set_cli_value(flag, value).unwrap();
+        }
+        assert_eq!(config.mode(), ExpirationReaperMode::Delete);
+        assert_eq!(config.scan_rate_candidates_per_second(), 9999);
+        assert_eq!(config.delete_rate_deletions_per_second(), 99);
+        assert_eq!(config.startup_grace_duration(), Duration::ZERO);
+        assert_eq!(config.bulk_fraction(), 1.0);
+        assert_eq!(
+            config.clock_jump_threshold_duration(),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn scanner_mode_is_exact_lowercase_and_delete_is_accepted_but_inert() {
+        assert_eq!("off".parse(), Ok(ExpirationReaperMode::Off));
+        assert_eq!("observe".parse(), Ok(ExpirationReaperMode::Observe));
+        assert_eq!("delete".parse(), Ok(ExpirationReaperMode::Delete));
+        for invalid in ["Off", "DELETE", "delete ", "", "scan"] {
+            assert_eq!(
+                invalid.parse::<ExpirationReaperMode>(),
+                Err(ExpirationReaperModeParseError)
+            );
+        }
+    }
+
+    #[test]
+    fn scanner_config_rejects_invalid_values_with_flag_specific_errors() {
+        let mut config = ExpirationScannerConfig::default();
+        for (flag, value) in [
+            ("--expiry-reaper-mode", "Delete"),
+            ("--expiry-scan-rate", "0"),
+            ("--expiry-scan-rate", "-1"),
+            ("--expiry-scan-rate", "1000000001"),
+            ("--expiry-scan-rate", "18446744073709551616"),
+            ("--expiry-delete-rate", "0"),
+            ("--expiry-delete-rate", "-1"),
+            ("--expiry-delete-rate", "18446744073709551616"),
+            ("--expiry-startup-grace-seconds", "-1"),
+            ("--expiry-startup-grace-seconds", "18446744073709551616"),
+            ("--expiry-bulk-fraction", "0"),
+            ("--expiry-bulk-fraction", "-0.1"),
+            ("--expiry-bulk-fraction", "1.01"),
+            ("--expiry-bulk-fraction", "NaN"),
+            ("--expiry-bulk-fraction", "inf"),
+            ("--expiry-clock-jump-seconds", "0"),
+            ("--expiry-clock-jump-seconds", "-1"),
+            ("--expiry-clock-jump-seconds", "18446744073709551616"),
+        ] {
+            let error = config.set_cli_value(flag, value).unwrap_err();
+            assert!(error.starts_with(flag), "{error}");
+        }
+    }
+
+    #[test]
+    fn scanner_config_repeated_flags_use_the_last_value() {
+        let mut config = ExpirationScannerConfig::default();
+        config.set_cli_value("--expiry-scan-rate", "1").unwrap();
+        config.set_cli_value("--expiry-scan-rate", "2").unwrap();
+        config
+            .set_cli_value("--expiry-reaper-mode", "observe")
+            .unwrap();
+        config.set_cli_value("--expiry-reaper-mode", "off").unwrap();
+        assert_eq!(config.scan_rate_candidates_per_second(), 2);
+        assert_eq!(config.mode(), ExpirationReaperMode::Off);
+    }
 
     fn config() -> StreamConfig {
         StreamConfig {
