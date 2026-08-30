@@ -3598,6 +3598,92 @@ mod retirement_executor_lifecycle_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn exact_registry_index_and_inventory_removals_cannot_touch_a_same_path_replacement() {
+        let (directory, store) = temporary_store("replacement-at-registry-removal");
+        store.init_retirement_executor().unwrap();
+        let expiry_config = StreamConfig {
+            ttl_seconds: Some(60),
+            ..stream_config()
+        };
+        let original = match store
+            .create("stream", expiry_config.clone(), None, 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected original stream"),
+        };
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::RegistryRemoval,
+            &original,
+        );
+        let owner_store = store.clone();
+        let owner_stream = original.clone();
+        let owner = tokio::spawn(async move { owner_store.retire_explicit(owner_stream).await });
+
+        pause.wait_until_held().await;
+        assert!(store.registered_stream("stream").is_none());
+        assert!(original.file_path.exists());
+        let replacement = match store.create("stream", expiry_config, None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("vacated registry path must admit a distinct replacement"),
+        };
+        assert_ne!(original.id, replacement.id);
+        assert!(Arc::ptr_eq(
+            &store.registered_stream("stream").unwrap(),
+            &replacement
+        ));
+        assert!(store
+            .inventory_page(None, None, 10)
+            .unwrap()
+            .1
+            .iter()
+            .any(|entry| entry.path == "stream" && entry.stream_id == replacement.id));
+
+        pause.release();
+        let ticket = match tokio::time::timeout(Duration::from_secs(5), owner)
+            .await
+            .expect("old retirement must finish after registry cut release")
+            .expect("retirement task should not panic")
+        {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("old identity must remain the owner of its own ticket"),
+        };
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(Arc::ptr_eq(
+            &store.registered_stream("stream").unwrap(),
+            &replacement
+        ));
+        let (_, inventory, _) = store.inventory_page(None, None, 10).unwrap();
+        assert!(inventory
+            .iter()
+            .any(|entry| entry.path == "stream" && entry.stream_id == replacement.id));
+        let page = store.expiration_page(crate::expiration::ExpirationCursor::start(), 10);
+        assert!(page.candidates.iter().any(|candidate| {
+            candidate.stream_id == replacement.id
+                && candidate
+                    .stream
+                    .upgrade()
+                    .is_some_and(|current| Arc::ptr_eq(&current, &replacement))
+        }));
+        assert!(!page
+            .candidates
+            .iter()
+            .any(|candidate| candidate.stream_id == original.id));
+        assert!(!original.file_path.exists());
+        assert!(replacement.file_path.exists());
+        assert!(store.is_exact_registered(&replacement));
+
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(replacement);
+        drop(original);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn explicit_retirement_store_rejects_unfenced_direct_cleanup() {
         let (directory, store) = temporary_store("unfenced");
         store.init_retirement_executor().unwrap();

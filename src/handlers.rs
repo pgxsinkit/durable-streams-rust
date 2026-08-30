@@ -2770,16 +2770,21 @@ mod deletion_wakes_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn deletion_wakes_long_poll_mid_wait() {
+    async fn deletion_wakes_long_poll_subscribe_then_recheck_without_a_lost_wakeup() {
         let (directory, state) = state("long-poll-wait");
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::DeletionWatchRecheck,
+            &state,
+        );
         let waiting_state = state.clone();
         let waiting = tokio::spawn(async move {
             let mut cache_hit = false;
             handle_long_poll(waiting_state, ParsedOffset::Now, None, &mut cache_hit).await
         });
-        tokio::task::yield_now().await;
 
+        pause.wait_until_held().await;
         state.signal_deletion();
+        pause.release();
         assert_eq!(
             timeout(Duration::from_secs(5), waiting)
                 .await
@@ -3333,30 +3338,101 @@ mod explicit_delete_handler_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn request_expiry_liveness_loses_to_a_fence_without_touching_ttl() {
+    async fn request_expiry_liveness_loses_to_an_exact_fence_without_touching_ttl() {
         let (directory, store) = store("fence-race");
-        store.init_retirement_executor().unwrap();
-        let stream = create_with_config(&store, "stream", config_with_ttl(Some(3_600), None));
-        let before = SystemTime::now() - Duration::from_secs(1);
+        let executor = store.init_retirement_executor().unwrap().clone();
+        let stream = create_with_config(&store, "stream", config_with_ttl(Some(1), None));
+        let before = SystemTime::UNIX_EPOCH;
         stream.shared.write().unwrap().last_access = before;
-        let appender = stream.appender.lock().await;
-        let reader_store = store.clone();
-        let reader =
-            tokio::spawn(async move { handle(reader_store, request(Method::Get, "stream")).await });
-        tokio::task::yield_now().await;
-        stream.fence_while_holding_appender(&appender);
-        drop(appender);
-
-        assert_eq!(
-            timeout(Duration::from_secs(5), reader)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            404
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::FenceAfterAppenderTransition,
+            &stream,
         );
+        let owner_store = store.clone();
+        let owner_stream = stream.clone();
+        let owner = tokio::spawn(async move { owner_store.retire_expiry(owner_stream).await });
+
+        pause.wait_until_held().await;
+        assert!(stream.fenced.load(Ordering::Acquire));
+        assert_eq!(executor.snapshot().total_jobs, 1);
+        assert!(matches!(
+            store.request_liveness(stream.clone(), true).await,
+            crate::store::RequestLiveness::Missing
+        ));
         assert_eq!(stream.shared.read().unwrap().last_access, before);
         assert!(!stream.meta_dirty.load(Ordering::Acquire));
+        pause.release();
+
+        let ticket = match timeout(Duration::from_secs(5), owner)
+            .await
+            .expect("fenced retirement must resume")
+            .expect("retirement task should not panic")
+        {
+            crate::store::ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("due expiry must retain the exact fenced owner"),
+        };
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert_eq!(executor.snapshot().total_jobs, 0);
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ttl_touch_before_exact_fence_renews_and_retains_the_live_identity() {
+        let (directory, store) = store("renew-before-fence");
+        let executor = store.init_retirement_executor().unwrap().clone();
+        let stream = create_with_config(&store, "stream", config_with_ttl(Some(1), None));
+        stream.shared.write().unwrap().last_access = SystemTime::UNIX_EPOCH;
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::FenceBeforeAppenderTransition,
+            &stream,
+        );
+        let owner_store = store.clone();
+        let owner_stream = stream.clone();
+        let owner =
+            tokio::spawn(async move { owner_store.retire_proactive_expiry(owner_stream).await });
+
+        pause.wait_until_held().await;
+        // A TTL-mutating operation that won the appender before this scanner
+        // pass's exact fence recheck renews the deadline. `request_liveness`
+        // intentionally refuses an already-expired target, so model the
+        // already-admitted touch at its actual serialization boundary.
+        let appender = stream.appender.lock().await;
+        stream.touch_at(SystemTime::now());
+        drop(appender);
+        assert!(!stream.fenced.load(Ordering::Acquire));
+        assert!(stream.shared.read().unwrap().last_access > SystemTime::UNIX_EPOCH);
+        pause.release();
+
+        let ticket = match timeout(Duration::from_secs(5), owner)
+            .await
+            .expect("renewed retirement must resume")
+            .expect("retirement task should not panic")
+        {
+            crate::store::ExplicitRetirementResult::Renewed(ticket) => ticket,
+            _ => panic!("only the appender-locked recheck may report renewal"),
+        };
+        assert_eq!(
+            ticket.wait_logical().await,
+            crate::retirement::LogicalCompletion::Cancelled
+        );
+        assert_eq!(
+            ticket.wait_terminal().await,
+            crate::retirement::TerminalCleanupCompletion::Cancelled
+        );
+        assert!(store
+            .registered_stream("stream")
+            .is_some_and(|current| Arc::ptr_eq(&current, &stream)));
+        assert!(store
+            .inventory_page(None, None, 10)
+            .unwrap()
+            .1
+            .iter()
+            .any(|entry| entry.path == "stream"));
+        assert_eq!(executor.snapshot().total_jobs, 0);
         shutdown(&store).await;
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -4086,6 +4162,103 @@ mod append_fence_tests {
         assert_eq!(state.tail().bytes, 0);
         assert_eq!(state.inflight_appends.load(Ordering::Acquire), 0);
 
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_before_wal_wait_cannot_publish_or_unlink_across_an_expiry_fence() {
+        let _durability = test_support::DurabilityGuard::wal();
+        let directory = directory("before-wal-expiry-fence");
+        let store =
+            Arc::new(Store::new_with_tier(directory.clone(), TierConfig::default()).unwrap());
+        let wal = WalSet::open(&directory, Some(1), 1).unwrap();
+        assert!(store.wal.set(wal.clone()).is_ok());
+        wal.spawn_committers();
+        let executor = store.init_retirement_executor().unwrap().clone();
+        let state = match store
+            .create("append-before-wal", config(Some(1)), None, 0)
+            .unwrap()
+        {
+            CreateResult::Created(state) => state,
+            _ => panic!("expected new stream"),
+        };
+
+        let append_pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::AppendAfterAppenderDropBeforeWalWait,
+            &state,
+        );
+        let append_store = store.clone();
+        let append =
+            tokio::spawn(
+                async move { handle(append_store, post("append-before-wal", b"x")).await },
+            );
+        append_pause.wait_until_held().await;
+        assert_eq!(state.inflight_appends.load(Ordering::Acquire), 1);
+        // The append won live admission. Make this exact incarnation due only
+        // after it has released the appender for its durability wait.
+        state.shared.write().unwrap().last_access = UNIX_EPOCH;
+
+        let fence_pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::FenceAfterAppenderTransition,
+            &state,
+        );
+        let retire_store = store.clone();
+        let retire_stream = state.clone();
+        let retire = tokio::spawn(async move { retire_store.retire_expiry(retire_stream).await });
+        fence_pause.wait_until_held().await;
+
+        assert!(state.fenced.load(Ordering::Acquire));
+        assert!(
+            state.file_path.exists(),
+            "cleanup cannot unlink before append resolves"
+        );
+        assert!(store
+            .registered_stream("append-before-wal")
+            .is_some_and(|current| Arc::ptr_eq(&current, &state)));
+        assert!(store
+            .inventory_page(None, None, 10)
+            .unwrap()
+            .1
+            .iter()
+            .any(|entry| entry.path == "append-before-wal"));
+        assert_eq!(executor.snapshot().total_jobs, 1);
+
+        append_pause.release();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), append)
+                .await
+                .expect("fenced append must resolve")
+                .expect("append task should not panic")
+                .status,
+            404,
+            "a pre-durability append never returns a successful publication after fencing"
+        );
+        assert_eq!(state.tail().bytes, 0);
+        assert_eq!(state.inflight_appends.load(Ordering::Acquire), 0);
+        assert!(
+            state.file_path.exists(),
+            "the blocked logical transition cannot unlink after a rejected append"
+        );
+
+        fence_pause.release();
+
+        let ticket = match tokio::time::timeout(Duration::from_secs(5), retire)
+            .await
+            .expect("retirement must continue after the append guard drains")
+            .expect("retirement task should not panic")
+        {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("the expiry owner must keep its exact ticket"),
+        };
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(store.registered_stream("append-before-wal").is_none());
+        assert!(!state.file_path.exists());
+        assert_eq!(executor.snapshot().total_jobs, 0);
+        shutdown(&store).await;
+        wal.stop_committers();
         let _ = std::fs::remove_dir_all(directory);
     }
 
