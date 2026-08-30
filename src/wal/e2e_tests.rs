@@ -15,6 +15,7 @@
 //! together (paths that pass in isolation but not end-to-end).
 
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -120,6 +121,53 @@ impl Harness {
         self.stop_committers();
         drop(self.store);
         drop(self.walset);
+    }
+}
+
+/// A test-only crash image captured while the original process remains alive at
+/// one exact identity cut.  Copying is deliberately a filesystem snapshot
+/// model, not a durability claim for an unsynced directory entry: callers only
+/// assert the documented file/meta states that were already present at the cut.
+struct FrozenCopy {
+    dir: std::path::PathBuf,
+    pause: crate::test_cut_points::CutPointLease,
+}
+
+impl FrozenCopy {
+    fn arm(stream: &crate::store::StreamState, point: crate::test_cut_points::CutPoint) -> Self {
+        let dir = tmp("frozen-recovery");
+        let pause = crate::test_cut_points::pause(point, stream);
+        Self { dir, pause }
+    }
+
+    async fn capture(&self, source: &Path) {
+        self.pause.wait_until_held().await;
+        copy_tree(source, &self.dir);
+    }
+
+    fn release(&self) {
+        self.pause.release();
+    }
+}
+
+impl Drop for FrozenCopy {
+    fn drop(&mut self) {
+        self.pause.release();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).expect("create frozen image directory");
+    for entry in std::fs::read_dir(source).expect("read frozen source directory") {
+        let entry = entry.expect("source directory entry");
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        if entry.file_type().expect("source entry type").is_dir() {
+            copy_tree(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).expect("copy frozen image file");
+        }
     }
 }
 
@@ -303,6 +351,327 @@ fn stream_file_bytes(store: &Arc<Store>, path: &str) -> Vec<u8> {
         .get(path)
         .unwrap_or_else(|| panic!("stream {path} not found"));
     std::fs::read(&st.file_path).unwrap()
+}
+
+async fn wait_for_frozen_owner(
+    retirement: tokio::task::JoinHandle<ExplicitRetirementResult>,
+) -> crate::retirement::RetirementTicket {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), retirement)
+        .await
+        .expect("frozen retirement resumes")
+        .expect("frozen retirement task does not panic")
+    {
+        ExplicitRetirementResult::Owner(ticket) => ticket,
+        _ => panic!("frozen exact identity must retain its owner ticket"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn frozen_expiry_fence_image_recovers_as_absent_without_losing_acked_bytes() {
+    let _guard = DurabilityGuard::wal();
+    let source = tmp("frozen-expiry-fence-source");
+    let live = Harness::boot(&source, Some(1), 1).unwrap();
+    let created = handlers::handle(
+        Arc::clone(&live.store),
+        put_req("expiry", OCTET, b"", &[("stream-ttl", "1")]),
+    )
+    .await;
+    assert_eq!(created.status, 201);
+    append_acked(&live.store, "expiry", OCTET, b"acked-before-fence").await;
+    let stream = live.store.registered_stream("expiry").unwrap();
+    let old_id = stream.id;
+    let live_file = stream.file_path.clone();
+    let live_meta = crate::store::meta_path(&live_file);
+    stream.shared.write().unwrap().last_access = std::time::UNIX_EPOCH;
+    write_meta_sync(&stream, true).unwrap();
+
+    let image = FrozenCopy::arm(
+        &stream,
+        crate::test_cut_points::CutPoint::FenceAfterAppenderTransition,
+    );
+    let retiring_store = Arc::clone(&live.store);
+    let retiring_stream = Arc::clone(&stream);
+    let retirement =
+        tokio::spawn(async move { retiring_store.retire_expiry(retiring_stream).await });
+    image.capture(&source).await;
+
+    assert!(live.store.registered_stream("expiry").is_some());
+    assert!(live_file.exists());
+    assert!(live_meta.exists());
+
+    // Cold boot uses the real WAL/Store/recovery/reset sequence while the
+    // original process is still paused at its exact appender-fence boundary.
+    let mut recovered = Harness::boot(&image.dir, Some(1), 1).unwrap();
+    let recovered_before_lazy = recovered.store.registered_stream("expiry").unwrap();
+    assert_eq!(recovered_before_lazy.id, old_id);
+    assert_eq!(
+        std::fs::read(&recovered_before_lazy.file_path).unwrap(),
+        b"acked-before-fence",
+        "the frozen image retains every acknowledged append before lazy expiry"
+    );
+    assert!(
+        recovered.store.get("expiry").is_none(),
+        "a recovered due identity is unavailable rather than revived"
+    );
+    let post = handlers::handle(
+        Arc::clone(&recovered.store),
+        post_req("expiry", OCTET, b"must-not-publish"),
+    )
+    .await;
+    assert_eq!(post.status, 404);
+    assert!(recovered.store.registered_stream("expiry").is_none());
+
+    recovered
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    recovered.stop_committers();
+    drop(recovered);
+
+    image.release();
+    let ticket = wait_for_frozen_owner(retirement).await;
+    assert!(matches!(
+        ticket.wait_terminal().await,
+        crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+    ));
+    live.store.retirement_executor().unwrap().shutdown().await;
+    drop(stream);
+    live.crash();
+    let _ = std::fs::remove_dir_all(source);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn frozen_registry_removal_image_cannot_displace_same_path_replacement() {
+    let _guard = DurabilityGuard::wal();
+    let source = tmp("frozen-registry-removal-source");
+    let live = Harness::boot(&source, Some(1), 1).unwrap();
+    let created = handlers::handle(
+        Arc::clone(&live.store),
+        put_req("same", OCTET, b"", &[("stream-ttl", "1")]),
+    )
+    .await;
+    assert_eq!(created.status, 201);
+    append_acked(&live.store, "same", OCTET, b"old-ack").await;
+    let stream = live.store.registered_stream("same").unwrap();
+    let old_id = stream.id;
+    let old_file = stream.file_path.clone();
+    let old_meta = crate::store::meta_path(&old_file);
+    stream.shared.write().unwrap().last_access = std::time::UNIX_EPOCH;
+    write_meta_sync(&stream, true).unwrap();
+
+    let image = FrozenCopy::arm(&stream, crate::test_cut_points::CutPoint::RegistryRemoval);
+    let retiring_store = Arc::clone(&live.store);
+    let retiring_stream = Arc::clone(&stream);
+    let retirement =
+        tokio::spawn(async move { retiring_store.retire_expiry(retiring_stream).await });
+    image.capture(&source).await;
+
+    assert!(live.store.registered_stream("same").is_none());
+    assert!(
+        old_file.exists(),
+        "physical cleanup has not started at registry removal"
+    );
+    assert!(
+        old_meta.exists(),
+        "the frozen image has the old durable sidecar"
+    );
+
+    let mut recovered = Harness::boot(&image.dir, Some(1), 1).unwrap();
+    let recovered_old = recovered.store.registered_stream("same").unwrap();
+    assert_eq!(recovered_old.id, old_id);
+    assert!(recovered_old.file_path.exists());
+    assert!(crate::store::meta_path(&recovered_old.file_path).exists());
+    assert!(recovered.store.get("same").is_none());
+    assert!(recovered.store.registered_stream("same").is_none());
+
+    create_stream(&recovered.store, "same", OCTET).await;
+    let replacement = recovered.store.registered_stream("same").unwrap();
+    assert_ne!(replacement.id, old_id);
+    assert!(!Arc::ptr_eq(&replacement, &recovered_old));
+    append_acked(&recovered.store, "same", OCTET, b"replacement-ack").await;
+    assert!(
+        Arc::ptr_eq(&recovered.store.get("same").unwrap(), &replacement),
+        "the recovered old identity cannot remove or mutate its same-path replacement"
+    );
+
+    recovered
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    recovered.stop_committers();
+    drop(recovered_old);
+    drop(replacement);
+    drop(recovered);
+
+    image.release();
+    let ticket = wait_for_frozen_owner(retirement).await;
+    assert!(matches!(
+        ticket.wait_terminal().await,
+        crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+    ));
+    live.store.retirement_executor().unwrap().shutdown().await;
+    drop(stream);
+    live.crash();
+    let _ = std::fs::remove_dir_all(source);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn frozen_wal_forget_images_preserve_before_and_prune_after_durable_tails() {
+    let _guard = DurabilityGuard::wal();
+
+    let before_source = tmp("frozen-wal-before-source");
+    let before_live = Harness::boot(&before_source, Some(1), 1).unwrap();
+    create_stream(&before_live.store, "before", OCTET).await;
+    append_acked(&before_live.store, "before", OCTET, b"before-ack").await;
+    let before_stream = before_live.store.registered_stream("before").unwrap();
+    let before_id = before_stream.id;
+    before_live
+        .walset
+        .shard_for(before_id)
+        .checkpoint()
+        .await
+        .unwrap();
+    assert!(before_live
+        .walset
+        .shard_for(before_id)
+        .read_durable_tails()
+        .contains_key(&before_id));
+    let before_image = FrozenCopy::arm(
+        &before_stream,
+        crate::test_cut_points::CutPoint::WalForgetBeforeDurableTails,
+    );
+    let before_store = Arc::clone(&before_live.store);
+    let before_retiring = Arc::clone(&before_stream);
+    let before_retirement =
+        tokio::spawn(async move { before_store.retire_explicit(before_retiring).await });
+    before_image.capture(&before_source).await;
+
+    let mut before_recovered = Harness::boot(&before_image.dir, Some(1), 1).unwrap();
+    let recovered_before = before_recovered.store.get("before").unwrap();
+    assert_eq!(recovered_before.id, before_id);
+    assert_eq!(
+        std::fs::read(&recovered_before.file_path).unwrap(),
+        b"before-ack",
+        "before forget returns, recovery conservatively keeps the old WAL identity"
+    );
+    before_recovered
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    before_recovered.stop_committers();
+    drop(recovered_before);
+    drop(before_recovered);
+
+    before_image.release();
+    let ticket = wait_for_frozen_owner(before_retirement).await;
+    assert!(matches!(
+        ticket.wait_terminal().await,
+        crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+    ));
+    before_live
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    drop(before_stream);
+    before_live.crash();
+    let _ = std::fs::remove_dir_all(before_source);
+
+    let after_source = tmp("frozen-wal-after-source");
+    let after_live = Harness::boot(&after_source, Some(1), 1).unwrap();
+    create_stream(&after_live.store, "after", OCTET).await;
+    append_acked(&after_live.store, "after", OCTET, b"after-ack").await;
+    let after_stream = after_live.store.registered_stream("after").unwrap();
+    let after_id = after_stream.id;
+    after_live
+        .walset
+        .shard_for(after_id)
+        .checkpoint()
+        .await
+        .unwrap();
+    let after_image = FrozenCopy::arm(
+        &after_stream,
+        crate::test_cut_points::CutPoint::WalForgetAndTailsCompleted,
+    );
+    let after_store = Arc::clone(&after_live.store);
+    let after_retiring = Arc::clone(&after_stream);
+    let after_retirement =
+        tokio::spawn(async move { after_store.retire_explicit(after_retiring).await });
+    after_image.capture(&after_source).await;
+
+    let after_shard = WalSet::open(&after_image.dir, Some(1), 1)
+        .unwrap()
+        .shard_for(after_id)
+        .read_durable_tails();
+    assert!(
+        !after_shard.contains_key(&after_id),
+        "the post-return image has durably forgotten the retired WAL identity"
+    );
+    let mut after_recovered = Harness::boot(&after_image.dir, Some(1), 1).unwrap();
+    let recovered_old = after_recovered.store.registered_stream("after").unwrap();
+    assert_eq!(recovered_old.id, after_id);
+    let ticket = match after_recovered
+        .store
+        .retire_explicit(Arc::clone(&recovered_old))
+        .await
+    {
+        ExplicitRetirementResult::Owner(ticket) => ticket,
+        _ => panic!("recovered old identity should settle exactly once"),
+    };
+    assert!(matches!(
+        ticket.wait_terminal().await,
+        crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+    ));
+    create_stream(&after_recovered.store, "after", OCTET).await;
+    let replacement = after_recovered.store.registered_stream("after").unwrap();
+    assert_ne!(replacement.id, after_id);
+    append_acked(&after_recovered.store, "after", OCTET, b"replacement-tail").await;
+    after_recovered
+        .walset
+        .shard_for(replacement.id)
+        .checkpoint()
+        .await
+        .unwrap();
+    let tails = after_recovered
+        .walset
+        .shard_for(replacement.id)
+        .read_durable_tails();
+    assert!(!tails.contains_key(&after_id));
+    assert!(tails.contains_key(&replacement.id));
+
+    after_recovered
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    after_recovered.stop_committers();
+    drop(recovered_old);
+    drop(replacement);
+    drop(after_recovered);
+
+    after_image.release();
+    let ticket = wait_for_frozen_owner(after_retirement).await;
+    assert!(matches!(
+        ticket.wait_terminal().await,
+        crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+    ));
+    after_live
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    drop(after_stream);
+    after_live.crash();
+    let _ = std::fs::remove_dir_all(after_source);
 }
 
 #[tokio::test]
