@@ -25,7 +25,8 @@ jobs:
   cargo:
     name: cargo build + test + clippy
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Manual scale qualification gets 42 minutes beyond the normal ~3 minute CI run.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -43,6 +44,12 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --release --locked --all-targets -- -D warnings
+
+      - name: Run manual release scale qualifications
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          cargo test --release --locked --bin durable-streams-server expiration_index_one_million_entry_qualification -- --ignored --nocapture --test-threads=1
+          cargo test --release --locked --bin durable-streams-server retirement_expiry_storm_one_hundred_thousand_uses_bounded_real_jobs -- --ignored --nocapture --test-threads=1
 
       - name: Upload server binaries
         uses: actions/upload-artifact@v4
