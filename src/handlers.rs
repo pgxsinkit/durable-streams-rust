@@ -3610,27 +3610,102 @@ mod fork_source_liveness_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fork_waiting_for_source_appender_loses_to_fence_without_creating() {
+    async fn fork_cannot_gain_a_source_reference_after_an_exact_expiry_fence_wins() {
         let (directory, store) = store("fence");
-        let source = create(&store, "source", None);
-        let appender = source.appender.lock().await;
-        let waiting_store = store.clone();
-        let waiting =
-            tokio::spawn(async move { handle(waiting_store, fork_put("source", "child")).await });
-        tokio::task::yield_now().await;
-        source.fence_while_holding_appender(&appender);
-        drop(appender);
+        store.init_retirement_executor().unwrap();
+        let source = create(&store, "source", Some(1));
+        source.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::FenceAfterAppenderTransition,
+            &source,
+        );
+        let retiring_store = store.clone();
+        let retiring_source = source.clone();
+        let retiring =
+            tokio::spawn(async move { retiring_store.retire_expiry(retiring_source).await });
+        pause.wait_until_held().await;
+        assert!(source.fenced.load(Ordering::Acquire));
 
         assert_eq!(
-            timeout(Duration::from_secs(5), waiting)
+            handle(store.clone(), fork_put("source", "child"))
                 .await
-                .unwrap()
-                .unwrap()
                 .status,
             404
         );
         assert_eq!(source.shared.read().unwrap().ref_count, 0);
         assert!(store.registered_stream("child").is_none());
+        pause.release();
+        let ticket = match timeout(Duration::from_secs(5), retiring)
+            .await
+            .expect("fenced expiry must resume")
+            .expect("retirement task should not panic")
+        {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("expiry retains its exact retirement owner"),
+        };
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_with_an_already_acquired_exact_lease_is_the_allowed_pre_fence_winner() {
+        let (directory, store) = store("lease-wins");
+        store.init_retirement_executor().unwrap();
+        let source = create(&store, "source", Some(1));
+        let lease_pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::ForkSourceLease,
+            &source,
+        );
+        let fork_store = store.clone();
+        let fork =
+            tokio::spawn(async move { handle(fork_store, fork_put("source", "child")).await });
+        lease_pause.wait_until_held().await;
+        assert_eq!(source.shared.read().unwrap().ref_count, 0);
+        source.shared.write().unwrap().last_access = UNIX_EPOCH;
+
+        let fence_pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::FenceAfterAppenderTransition,
+            &source,
+        );
+        let retiring_store = store.clone();
+        let retiring_source = source.clone();
+        let retiring =
+            tokio::spawn(async move { retiring_store.retire_expiry(retiring_source).await });
+        fence_pause.wait_until_held().await;
+        assert!(source.fenced.load(Ordering::Acquire));
+
+        lease_pause.release();
+        assert_eq!(
+            timeout(Duration::from_secs(5), fork)
+                .await
+                .expect("pre-fence fork lease must finish")
+                .expect("fork task should not panic")
+                .status,
+            201
+        );
+        assert_eq!(source.shared.read().unwrap().ref_count, 1);
+        assert!(store.registered_stream("child").is_some());
+
+        fence_pause.release();
+        let ticket = match timeout(Duration::from_secs(5), retiring)
+            .await
+            .expect("expiry resumes after the pre-fence lease drains")
+            .expect("retirement task should not panic")
+        {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("expiry retains its exact retirement owner"),
+        };
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(source.shared.read().unwrap().soft_deleted);
+        assert_eq!(source.shared.read().unwrap().ref_count, 1);
+        shutdown(&store).await;
         let _ = std::fs::remove_dir_all(directory);
     }
 

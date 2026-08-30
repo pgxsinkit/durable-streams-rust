@@ -3738,6 +3738,108 @@ mod retirement_executor_lifecycle_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn post_unlink_meta_sweep_cannot_recreate_the_exact_retired_sidecar() {
+        let (directory, store) = temporary_store("post-unlink-meta-writer");
+        store.init_retirement_executor().unwrap();
+        let stream = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected stream creation"),
+        };
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::MetadataLockAfterUnlink,
+            &stream,
+        );
+        let ticket = match store.retire_explicit(Arc::clone(&stream)).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("retirement must own the exact stream"),
+        };
+        pause.wait_until_held().await;
+
+        assert!(stream.fenced.load(Ordering::Acquire));
+        assert!(store.registered_stream("stream").is_none());
+        assert!(!stream.file_path.exists());
+        assert!(!meta_path(&stream.file_path).exists());
+        stream.meta_dirty.store(true, Ordering::Release);
+        store.meta_sweep.lock().unwrap().push(Arc::clone(&stream));
+        assert_eq!(
+            store.sweep_meta_once(),
+            0,
+            "a late metadata writer must recheck exact live registration"
+        );
+        assert!(!meta_path(&stream.file_path).exists());
+
+        pause.release();
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(!meta_path(&stream.file_path).exists());
+        store.retirement_executor().unwrap().shutdown().await;
+
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_exact_physical_unlink_cannot_mutate_a_same_path_replacement() {
+        let (directory, store) = temporary_store("late-physical-replacement");
+        let executor = store.init_retirement_executor().unwrap().clone();
+        let original = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected original stream"),
+        };
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::PhysicalHardUnlinkEntry,
+            &original,
+        );
+        let ticket = match store.retire_explicit(Arc::clone(&original)).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("retirement must own the old identity"),
+        };
+        pause.wait_until_held().await;
+        assert!(original.fenced.load(Ordering::Acquire));
+        assert!(store.registered_stream("stream").is_none());
+        assert!(original.file_path.exists());
+
+        let replacement = match store.create("stream", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("logical removal must allow a distinct replacement"),
+        };
+        assert_ne!(original.id, replacement.id);
+        assert!(Arc::ptr_eq(
+            &store.registered_stream("stream").unwrap(),
+            &replacement
+        ));
+        assert!(store
+            .inventory_page(None, None, 10)
+            .unwrap()
+            .1
+            .iter()
+            .any(|entry| entry.path == "stream" && entry.stream_id == replacement.id));
+
+        pause.release();
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(!original.file_path.exists());
+        assert!(replacement.file_path.exists());
+        assert!(Arc::ptr_eq(
+            &store.registered_stream("stream").unwrap(),
+            &replacement
+        ));
+        assert_eq!(executor.snapshot().total_jobs, 0);
+        assert_eq!(executor.snapshot().terminal_successes, 1);
+        store.retirement_executor().unwrap().shutdown().await;
+
+        drop(replacement);
+        drop(original);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn retirement_forgets_wal_residency_before_releasing_logical_cleanup() {
         let (directory, store) = temporary_store("wal-forget");
         let wal = attach_test_wal(&store, &directory);
@@ -3758,7 +3860,32 @@ mod retirement_executor_lifecycle_tests {
         assert!(shard.read_durable_tails().contains_key(&retired.id));
         assert!(shard.read_durable_tails().contains_key(&survivor.id));
 
-        let ticket = match store.retire_explicit(Arc::clone(&retired)).await {
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::WalForgetAndTailsCompleted,
+            &retired,
+        );
+        let retiring_store = Arc::clone(&store);
+        let retiring_stream = Arc::clone(&retired);
+        let retirement =
+            tokio::spawn(async move { retiring_store.retire_explicit(retiring_stream).await });
+        pause.wait_until_held().await;
+        assert!(retired.fenced.load(Ordering::Acquire));
+        assert!(!shard.read_durable_tails().contains_key(&retired.id));
+        shard.register_dirty(retired.id, Arc::clone(&retired));
+        assert!(
+            !shard.is_dirty(retired.id),
+            "a fenced identity cannot re-register after durable tails forget"
+        );
+        assert!(
+            store.is_exact_registered(&retired),
+            "logical removal must remain after the durable WAL boundary"
+        );
+        pause.release();
+        let ticket = match tokio::time::timeout(Duration::from_secs(5), retirement)
+            .await
+            .expect("retirement resumes after its durable WAL boundary")
+            .expect("retirement task should not panic")
+        {
             ExplicitRetirementResult::Owner(ticket) => ticket,
             _ => panic!("retirement should own its exact WAL hand-off"),
         };
@@ -3766,12 +3893,6 @@ mod retirement_executor_lifecycle_tests {
         assert!(retired.fenced.load(Ordering::Acquire));
         assert!(!shard.read_durable_tails().contains_key(&retired.id));
         assert!(shard.read_durable_tails().contains_key(&survivor.id));
-        shard.register_dirty(retired.id, Arc::clone(&retired));
-        assert!(
-            !shard.is_dirty(retired.id),
-            "a fenced retired identity cannot re-register after forget"
-        );
-
         let replacement = match store.create("retired", stream_config(), None, 0).unwrap() {
             CreateResult::Created(stream) => stream,
             _ => panic!("hard retirement frees the path for a distinct identity"),
@@ -4059,6 +4180,85 @@ mod retirement_executor_lifecycle_tests {
 
         store.retirement_executor().unwrap().shutdown().await;
         drop(replacement);
+        drop(parent);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_child_release_cannot_cascade_into_a_same_path_parent_replacement() {
+        let (directory, store) = temporary_store("late-cascade-parent-replacement");
+        store.init_retirement_executor().unwrap();
+        let parent = match store.create("parent", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create parent"),
+        };
+        let child = match store
+            .create("child", stream_config(), Some(Arc::clone(&parent)), 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create child"),
+        };
+        let parent_ticket = match store.retire_explicit(Arc::clone(&parent)).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("parent retirement must own its tombstone"),
+        };
+        assert!(matches!(
+            parent_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(parent.shared.read().unwrap().soft_deleted);
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::ForkReferenceTransition,
+            &parent,
+        );
+        let child_ticket = match store.retire_explicit(Arc::clone(&child)).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("child retirement must own its exact cleanup"),
+        };
+        pause.wait_until_held().await;
+        assert!(parent.fenced.load(Ordering::Acquire));
+        assert!(parent.shared.read().unwrap().soft_deleted);
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+
+        assert!(store.unregister_exact_for_test(&parent));
+        let replacement = match store.create("parent", stream_config(), None, 0).unwrap() {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("vacated parent path must admit a replacement"),
+        };
+        assert_ne!(parent.id, replacement.id);
+        assert!(Arc::ptr_eq(
+            &store.registered_stream("parent").unwrap(),
+            &replacement
+        ));
+        pause.release();
+
+        assert!(matches!(
+            child_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(Arc::ptr_eq(
+            &store.registered_stream("parent").unwrap(),
+            &replacement
+        ));
+        assert!(
+            parent.file_path.exists(),
+            "stale tombstone cannot be cascaded"
+        );
+        assert!(replacement.file_path.exists());
+        assert!(store
+            .inventory_page(None, None, 10)
+            .unwrap()
+            .1
+            .iter()
+            .any(|entry| entry.path == "parent" && entry.stream_id == replacement.id));
+
+        store.retirement_executor().unwrap().shutdown().await;
+        drop(replacement);
+        drop(child);
         drop(parent);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
