@@ -483,7 +483,7 @@ mod tests {
         let observer_idle_workers = Arc::clone(&idle_workers);
         let observer_idle_notify = Arc::clone(&idle_notify);
         let observer = Arc::new(move |index| {
-            observer_idle_workers.fetch_or(1 << index, AtomicOrdering::AcqRel);
+            observer_idle_workers.fetch_or(1usize << index, AtomicOrdering::AcqRel);
             observer_idle_notify.notify_waiters();
         });
         let starts = Arc::new(AtomicUsize::new(0));
