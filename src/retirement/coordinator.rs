@@ -1165,9 +1165,9 @@ mod tests {
     use crate::store::{CreateResult, LocalCleanupOutcome, Store, StreamConfig};
     use crate::tier::TierConfig;
     use std::io;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex as StdMutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn stream_config() -> StreamConfig {
         StreamConfig {
@@ -2521,5 +2521,336 @@ mod tests {
         executor.shutdown().await;
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    struct ScaleGate {
+        open: StdMutex<bool>,
+        wake: Condvar,
+        started: AtomicUsize,
+        started_notify: tokio::sync::Notify,
+    }
+
+    impl ScaleGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                open: StdMutex::new(false),
+                wake: Condvar::new(),
+                started: AtomicUsize::new(0),
+                started_notify: tokio::sync::Notify::new(),
+            })
+        }
+
+        fn wait(&self) {
+            let mut open = lock_recover(&self.open);
+            while !*open {
+                open = self
+                    .wake
+                    .wait(open)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+
+        async fn wait_for_starts(&self, expected: usize) {
+            if tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let notified = self.started_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self.started.load(Ordering::Acquire) >= expected {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .is_err()
+            {
+                panic!(
+                    "timed out waiting for {expected} blocked expiry starts; observed {}",
+                    self.started.load(Ordering::Acquire)
+                );
+            }
+        }
+
+        fn release(&self) {
+            *lock_recover(&self.open) = true;
+            self.wake.notify_all();
+        }
+    }
+
+    fn assert_scale_bounds(snapshot: &RetirementSnapshot) {
+        assert!(snapshot.total_jobs <= snapshot.queue_capacity);
+        assert!(snapshot.active_interactive <= snapshot.coordinator_capacity);
+        assert!(snapshot.active_proactive <= snapshot.proactive_coordinator_capacity);
+        assert!(
+            snapshot.physical_interactive_queued + snapshot.physical_proactive_queued
+                <= snapshot.interactive_physical_capacity + snapshot.proactive_physical_capacity
+        );
+        assert!(snapshot.physical_interactive_active <= snapshot.cleanup_workers_total);
+        assert!(snapshot.physical_proactive_active <= snapshot.cleanup_workers_total);
+        assert!(snapshot.retry_heap_count <= snapshot.queue_capacity);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_expiry_storm_scale_twin_bounds_real_executor_lanes_and_fences() {
+        let (store, retry, directory) = store_stream("expiry-storm-scale-twin");
+        let blocked_one = stream(&store, "expiry-blocked-one");
+        let blocked_two = stream(&store, "expiry-blocked-two");
+        let blocked_three = stream(&store, "expiry-blocked-three");
+        let explicit = stream(&store, "interactive-explicit");
+        let cascade = stream(&store, "interactive-cascade");
+        let overflow = stream(&store, "expiry-overflow");
+        let gate = ScaleGate::new();
+        let callback_gate = Arc::clone(&gate);
+        let retry_once = Arc::new(AtomicBool::new(true));
+        let callback_retry_once = Arc::clone(&retry_once);
+        let cleanup: CleanupCallback = Arc::new(move |stream, mode| {
+            if stream.path == "stream" && callback_retry_once.swap(false, Ordering::AcqRel) {
+                return Err(io::Error::other("deterministic retry"));
+            }
+            if mode == LocalCleanupMode::Expiry && stream.path.starts_with("expiry-blocked") {
+                callback_gate.started.fetch_add(1, Ordering::AcqRel);
+                callback_gate.started_notify.notify_waiters();
+                callback_gate.wait();
+            }
+            Ok(LocalCleanupOutcome::default())
+        });
+        let executor = RetirementExecutor::new(
+            cleanup,
+            RetirementConfig {
+                queue_capacity: 6,
+                coordinator_capacity: 10,
+                proactive_coordinator_capacity: 2,
+                interactive_physical_capacity: 1,
+                proactive_physical_capacity: 2,
+                physical_queue_capacity: 3,
+                cleanup_workers: 3,
+                retry_base: Duration::from_secs(60),
+                ..RetirementConfig::default()
+            },
+        )
+        .unwrap();
+
+        let retry_ticket = admit_released(
+            &executor,
+            Arc::clone(&retry),
+            RetirementPriority::Proactive,
+            LocalCleanupMode::Expiry,
+        );
+        retry.fenced.store(true, Ordering::Release);
+        executor.mark_expiry_fence(&retry);
+        assert_eq!(
+            retry_ticket.wait_first_attempt().await,
+            FirstAttemptCompletion::Failed
+        );
+        assert_eq!(executor.scheduled_retry_count(), 1);
+
+        let mut blocked_tickets = Vec::new();
+        for blocked in [&blocked_one, &blocked_two, &blocked_three] {
+            blocked.fenced.store(true, Ordering::Release);
+            executor.mark_expiry_fence(blocked);
+            blocked_tickets.push(admit_released(
+                &executor,
+                Arc::clone(blocked),
+                RetirementPriority::Proactive,
+                LocalCleanupMode::Expiry,
+            ));
+        }
+        gate.wait_for_starts(2).await;
+
+        let explicit_ticket = ticket(executor.admit(
+            Arc::clone(&explicit),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::ExplicitDelete,
+        ));
+        let cascade_ticket = ticket(executor.admit(
+            Arc::clone(&cascade),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::CascadeCollection,
+        ));
+        let saturated = executor.snapshot();
+        assert_eq!(saturated.total_jobs, 6);
+        assert_scale_bounds(&saturated);
+        assert_eq!(executor.expiry_telemetry_state_for_test().0, 4);
+
+        assert!(matches!(
+            executor.admit(
+                Arc::clone(&overflow),
+                RetirementPriority::Proactive,
+                LocalCleanupMode::Expiry,
+            ),
+            RetirementAdmissionResult::Rejected(RetirementAdmission::QueueFull)
+        ));
+        assert!(overflow.retirement_state().is_clean());
+        assert!(!overflow.fenced.load(Ordering::Acquire));
+        store.streams.remove("expiry-overflow");
+        let overflow_weak = Arc::downgrade(&overflow);
+        drop(overflow);
+        assert!(overflow_weak.upgrade().is_none());
+
+        assert!(executor.release_logical(&explicit, &explicit_ticket));
+        assert!(executor.release_logical(&cascade, &cascade_ticket));
+        assert!(matches!(
+            explicit_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        assert!(matches!(
+            cascade_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+
+        gate.release();
+        for ticket in &blocked_tickets {
+            assert!(matches!(
+                ticket.wait_terminal().await,
+                TerminalCleanupCompletion::Succeeded { .. }
+            ));
+        }
+        let drained = executor.snapshot();
+        assert_scale_bounds(&drained);
+        assert_eq!(
+            drained.total_jobs, 1,
+            "only the fenced retry remains retained"
+        );
+        assert_eq!(drained.retry_heap_count, 1);
+        assert_eq!(executor.expiry_telemetry_state_for_test().0, 1);
+
+        executor.shutdown().await;
+        assert_eq!(
+            retry_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Cancelled
+        );
+        let stopped = executor.snapshot();
+        assert_scale_bounds(&stopped);
+        assert_eq!(stopped.total_jobs, 0);
+        assert_eq!(stopped.interactive_pending, 0);
+        assert_eq!(stopped.proactive_pending, 0);
+        assert_eq!(stopped.active_interactive, 0);
+        assert_eq!(stopped.active_proactive, 0);
+        assert_eq!(stopped.physical_interactive_queued, 0);
+        assert_eq!(stopped.physical_proactive_queued, 0);
+        assert_eq!(stopped.physical_interactive_active, 0);
+        assert_eq!(stopped.physical_proactive_active, 0);
+        assert_eq!(stopped.retry_heap_count, 0);
+        assert_eq!(executor.expiry_telemetry_state_for_test(), (0, 0, None));
+        assert_eq!(executor.worker_count(), 0);
+
+        drop(executor);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "release-only 100,000-expiry bounded executor qualification"]
+    async fn retirement_expiry_storm_one_hundred_thousand_uses_bounded_real_jobs() {
+        const TOTAL: u64 = 100_000;
+        const WAVE: usize = 64;
+        let started = Instant::now();
+        let fail_once = Arc::new(AtomicBool::new(true));
+        let callback_fail_once = Arc::clone(&fail_once);
+        let cleanup: CleanupCallback = Arc::new(move |_, _| {
+            if callback_fail_once.swap(false, Ordering::AcqRel) {
+                Err(io::Error::other("one bounded retry"))
+            } else {
+                Ok(LocalCleanupOutcome::default())
+            }
+        });
+        let executor = RetirementExecutor::new(
+            cleanup,
+            RetirementConfig {
+                queue_capacity: WAVE,
+                coordinator_capacity: 16,
+                proactive_coordinator_capacity: 8,
+                interactive_physical_capacity: 4,
+                proactive_physical_capacity: 12,
+                physical_queue_capacity: 16,
+                cleanup_workers: 4,
+                retry_base: Duration::from_secs(1),
+                ..RetirementConfig::default()
+            },
+        )
+        .unwrap();
+        let shared_file = Arc::new(tempfile::tempfile().expect("shared synthetic stream file"));
+        let mut completed = 0_u64;
+
+        while completed < TOTAL {
+            let count = usize::try_from((TOTAL - completed).min(WAVE as u64)).unwrap();
+            let mut wave = Vec::with_capacity(count);
+            for offset in 0..count {
+                let id = completed + u64::try_from(offset).unwrap() + 1;
+                let stream =
+                    StreamState::synthetic_for_retirement_test(id, Arc::clone(&shared_file));
+                stream.fenced.store(true, Ordering::Release);
+                let ticket = ticket(executor.admit(
+                    Arc::clone(&stream),
+                    RetirementPriority::Proactive,
+                    LocalCleanupMode::Expiry,
+                ));
+                executor.mark_expiry_fence(&stream);
+                wave.push((stream, ticket));
+            }
+            let overflow = StreamState::synthetic_for_retirement_test(
+                TOTAL + completed + 1,
+                Arc::clone(&shared_file),
+            );
+            assert!(matches!(
+                executor.admit(
+                    Arc::clone(&overflow),
+                    RetirementPriority::Proactive,
+                    LocalCleanupMode::Expiry,
+                ),
+                RetirementAdmissionResult::Rejected(RetirementAdmission::QueueFull)
+            ));
+            let overflow_weak = Arc::downgrade(&overflow);
+            drop(overflow);
+            assert!(overflow_weak.upgrade().is_none());
+
+            let (first_stream, first_ticket) = &wave[0];
+            assert!(executor.release_logical(first_stream, first_ticket));
+            if completed == 0 {
+                assert_eq!(
+                    first_ticket.wait_first_attempt().await,
+                    FirstAttemptCompletion::Failed
+                );
+                assert_eq!(executor.scheduled_retry_count(), 1);
+            }
+            for (stream, ticket) in wave.iter().skip(1) {
+                assert!(executor.release_logical(stream, ticket));
+            }
+            for (stream, ticket) in wave {
+                assert!(matches!(
+                    ticket.wait_terminal().await,
+                    TerminalCleanupCompletion::Succeeded { .. }
+                ));
+                let weak = Arc::downgrade(&stream);
+                drop(ticket);
+                drop(stream);
+                assert!(weak.upgrade().is_none());
+            }
+            completed += u64::try_from(count).unwrap();
+            let snapshot = executor.snapshot();
+            assert_scale_bounds(&snapshot);
+            assert_eq!(snapshot.total_jobs, 0);
+            assert_eq!(executor.expiry_telemetry_state_for_test(), (0, 0, None));
+        }
+
+        let settled = executor.snapshot();
+        assert_eq!(settled.terminal_successes, TOTAL);
+        assert_eq!(settled.cumulative_retry_attempts, 1);
+        assert_eq!(settled.first_attempt_failures, 1);
+        assert_scale_bounds(&settled);
+        executor.shutdown().await;
+        let stopped = executor.snapshot();
+        assert_eq!(stopped.total_jobs, 0);
+        assert_eq!(stopped.retry_heap_count, 0);
+        assert_eq!(executor.worker_count(), 0);
+        println!(
+            "retirement expiry storm: total={TOTAL} elapsed_ms={} max_jobs={} max_physical_queue={} retries={}",
+            started.elapsed().as_millis(),
+            WAVE,
+            16,
+            settled.cumulative_retry_attempts,
+        );
+        drop(shared_file);
     }
 }

@@ -236,6 +236,7 @@ struct DeletionDeliveryTestHook {
     release: tokio::sync::watch::Sender<bool>,
     active_workers: AtomicUsize,
     peak_workers: AtomicUsize,
+    drained: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -249,6 +250,7 @@ impl DeletionDeliveryTestHook {
             release,
             active_workers: AtomicUsize::new(0),
             peak_workers: AtomicUsize::new(0),
+            drained: tokio::sync::Notify::new(),
         })
     }
 
@@ -275,10 +277,12 @@ impl DeletionDeliveryTestHook {
         while !*release.borrow_and_update() {
             if release.changed().await.is_err() {
                 self.active_workers.fetch_sub(1, Ordering::AcqRel);
+                self.drained.notify_waiters();
                 return;
             }
         }
         self.active_workers.fetch_sub(1, Ordering::AcqRel);
+        self.drained.notify_waiters();
     }
 
     async fn wait_for_workers(&self, expected: usize) {
@@ -295,6 +299,22 @@ impl DeletionDeliveryTestHook {
         })
         .await
         .expect("bounded deletion delivery workers must start");
+    }
+
+    async fn wait_for_drain(&self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = self.drained.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.active_workers.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("bounded deletion delivery workers must drain");
     }
 }
 
@@ -2187,12 +2207,21 @@ fn hex_decode(value: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::handlers::{handle, test_support::DurabilityGuard};
+    use crate::retirement::{RetirementConfig, TerminalCleanupCompletion};
+    use crate::store::{CreateResult, ExplicitRetirementResult, StreamConfig};
     use crate::tier::TierConfig;
     use std::sync::atomic::AtomicU64;
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
     fn test_store(name: &str) -> (Arc<Store>, std::path::PathBuf) {
+        test_store_with_retirement_config(name, RetirementConfig::default())
+    }
+
+    fn test_store_with_retirement_config(
+        name: &str,
+        config: RetirementConfig,
+    ) -> (Arc<Store>, std::path::PathBuf) {
         let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "ds-subscriptions-{name}-{}-{id}",
@@ -2200,8 +2229,21 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
-        store.init_retirement_executor().unwrap();
+        store.init_retirement_executor_for_test(config).unwrap();
         (store, dir)
+    }
+
+    fn retirement_scale_stream_config() -> StreamConfig {
+        StreamConfig {
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+        }
     }
 
     fn test_subscription(
@@ -2606,6 +2648,101 @@ mod tests {
         hook.release.send_replace(true);
 
         drop(manager);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_and_deletion_delivery_scale_twin_bound_real_lanes_and_drain() {
+        let (store, directory) = test_store_with_retirement_config(
+            "retirement-delivery-scale-twin",
+            RetirementConfig {
+                queue_capacity: 4,
+                coordinator_capacity: 9,
+                proactive_coordinator_capacity: 1,
+                interactive_physical_capacity: 1,
+                proactive_physical_capacity: 1,
+                physical_queue_capacity: 2,
+                cleanup_workers: 2,
+                ..RetirementConfig::default()
+            },
+        );
+        let executor = Arc::clone(store.retirement_executor().unwrap());
+        let hook = DeletionDeliveryTestHook::new();
+        hook.block_workers.store(true, Ordering::Release);
+        let manager = test_manager(1, 1, Some(Arc::clone(&hook)));
+        for id in ["one", "two", "three"] {
+            insert_test_subscription(
+                &manager,
+                test_subscription(
+                    id,
+                    BTreeMap::from([(
+                        "events/a".into(),
+                        StreamLink {
+                            explicit: true,
+                            glob: true,
+                            acked_offset: format_offset(5),
+                        },
+                    )]),
+                    None,
+                ),
+            )
+            .await;
+        }
+        let stream = match store
+            .create("events/a", retirement_scale_stream_config(), None, 0)
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("create real retirement-delivery stream"),
+        };
+
+        manager
+            .on_stream_deleted(Arc::clone(&store), "/root/events/a")
+            .await;
+        hook.wait_for_workers(1).await;
+        assert_eq!(hook.peak_workers.load(Ordering::Acquire), 1);
+        assert_eq!(
+            manager.deletion_delivery.dropped.load(Ordering::Acquire),
+            2,
+            "the bounded delivery lane keeps one weak intent and drops only excess"
+        );
+        let ticket = match store.retire_explicit(Arc::clone(&stream)).await {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("interactive retirement owns the exact live stream"),
+        };
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        let active = executor.snapshot();
+        assert!(active.total_jobs <= active.queue_capacity);
+        assert!(active.active_interactive <= active.coordinator_capacity);
+        assert!(active.active_proactive <= active.proactive_coordinator_capacity);
+        assert!(
+            active.physical_interactive_queued + active.physical_proactive_queued
+                <= active.interactive_physical_capacity + active.proactive_physical_capacity
+        );
+        assert_eq!(active.total_jobs, 0);
+
+        let weak_manager = Arc::downgrade(&manager);
+        drop(manager);
+        assert!(
+            weak_manager.upgrade().is_none(),
+            "a blocked real delivery intent retains neither manager nor worker-owned fence"
+        );
+        hook.release.send_replace(true);
+        hook.wait_for_drain().await;
+        assert_eq!(hook.active_workers.load(Ordering::Acquire), 0);
+        executor.shutdown().await;
+        let stopped = executor.snapshot();
+        assert_eq!(stopped.total_jobs, 0);
+        assert_eq!(stopped.retry_heap_count, 0);
+        assert_eq!(executor.worker_count(), 0);
+
+        drop(ticket);
+        drop(stream);
+        drop(executor);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }

@@ -638,6 +638,72 @@ impl StreamState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// Builds an in-memory-only stream identity for retirement scale tests.
+    /// The supplied file is deliberately shared by the whole test wave: the
+    /// coordinator exercises the real `StreamState` ownership path without
+    /// allocating a data file or file descriptor per synthetic candidate.
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_retirement_test(id: u64, file: Arc<File>) -> Arc<Self> {
+        let (tail_tx, _) = watch::channel(Tail {
+            bytes: 0,
+            closed: false,
+        });
+        let (deletion_tx, _) = watch::channel(false);
+        Arc::new(Self {
+            id,
+            path: format!("synthetic-retirement-{id}"),
+            config: StreamConfig {
+                content_type: "application/octet-stream".into(),
+                ttl_seconds: None,
+                expires_at: None,
+                expires_at_raw: None,
+                create_closed: false,
+                forked_from: None,
+                fork_offset_raw: None,
+                fork_sub_offset: None,
+            },
+            is_json: false,
+            file_path: PathBuf::from(format!("synthetic-retirement-{id}")),
+            base_offset: 0,
+            parent: None,
+            appender: AsyncMutex::new(Appender {
+                file: Arc::clone(&file),
+                written: 0,
+            }),
+            fenced: AtomicBool::new(false),
+            inflight_appends: AtomicUsize::new(0),
+            inflight_appends_zero: tokio::sync::Notify::new(),
+            parent_ref_released: AtomicBool::new(false),
+            retirement_state: StdMutex::new(crate::retirement::RetirementState::default()),
+            deletion_tx,
+            shared: RwLock::new(Shared {
+                tail: 0,
+                durable_tail: 0,
+                file_base: 0,
+                file,
+                closed: false,
+                closed_durable: false,
+                closed_by: None,
+                producers: HashMap::new(),
+                last_seq_header: None,
+                last_access: SystemTime::now(),
+                ref_count: 0,
+                soft_deleted: false,
+            }),
+            tail_tx,
+            boot_meta_durable_tail: Some(0),
+            meta_dirty: AtomicBool::new(false),
+            dirty_epoch: AtomicU64::new(0),
+            meta_lock: StdMutex::new(()),
+            last_chunk: RwLock::new(None),
+            tier: crate::tier::TierState::default(),
+            blobstore: None,
+            compaction: StdMutex::new(None),
+            #[cfg(target_os = "linux")]
+            sse_subs: StdMutex::new(None),
+        })
+    }
 }
 
 impl StreamState {
@@ -3583,6 +3649,83 @@ mod retirement_executor_lifecycle_tests {
                 .soft_deleted
         );
         drop(reopened);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retirement_small_filesystem_storm_persists_soft_tombstones_and_unlinks_hard_data() {
+        const STREAMS_PER_PATH: usize = 4;
+        let (directory, store) = temporary_store("small-filesystem-storm");
+        let executor = Arc::clone(store.init_retirement_executor().unwrap());
+        let mut hard = Vec::with_capacity(STREAMS_PER_PATH);
+        let mut soft = Vec::with_capacity(STREAMS_PER_PATH);
+
+        for index in 0..STREAMS_PER_PATH {
+            let stream = match store
+                .create(&format!("hard-{index}"), stream_config(), None, 0)
+                .unwrap()
+            {
+                CreateResult::Created(stream) => stream,
+                _ => panic!("create hard storm stream"),
+            };
+            hard.push((stream.file_path.clone(), meta_path(&stream.file_path)));
+            let ticket = match store.retire_explicit(stream).await {
+                ExplicitRetirementResult::Owner(ticket) => ticket,
+                _ => panic!("hard storm retirement owns its exact stream"),
+            };
+            assert!(matches!(
+                ticket.wait_terminal().await,
+                TerminalCleanupCompletion::Succeeded { .. }
+            ));
+        }
+
+        for index in 0..STREAMS_PER_PATH {
+            let stream = match store
+                .create(&format!("soft-{index}"), stream_config(), None, 0)
+                .unwrap()
+            {
+                CreateResult::Created(stream) => stream,
+                _ => panic!("create soft storm stream"),
+            };
+            stream.shared.write().unwrap().ref_count = 1;
+            let data_path = stream.file_path.clone();
+            let sidecar_path = meta_path(&data_path);
+            let ticket = match store.retire_explicit(stream).await {
+                ExplicitRetirementResult::Owner(ticket) => ticket,
+                _ => panic!("soft storm retirement owns its exact stream"),
+            };
+            assert!(matches!(
+                ticket.wait_terminal().await,
+                TerminalCleanupCompletion::Succeeded { .. }
+            ));
+            soft.push((data_path, sidecar_path));
+        }
+
+        for (data_path, sidecar_path) in hard {
+            assert!(!data_path.exists(), "hard cleanup unlinks its data file");
+            assert!(!sidecar_path.exists(), "hard cleanup unlinks its sidecar");
+        }
+        for (data_path, sidecar_path) in soft {
+            assert!(
+                data_path.exists(),
+                "soft cleanup retains its fork-visible data"
+            );
+            let persisted: Meta = serde_json::from_slice(
+                &std::fs::read(sidecar_path).expect("durable soft tombstone sidecar"),
+            )
+            .expect("parse durable soft tombstone sidecar");
+            assert!(persisted.soft_deleted);
+            assert_eq!(persisted.ref_count, 1);
+        }
+        let snapshot = executor.snapshot();
+        assert_eq!(snapshot.total_jobs, 0);
+        assert_eq!(snapshot.physical_interactive_queued, 0);
+        assert_eq!(snapshot.physical_proactive_queued, 0);
+        executor.shutdown().await;
+        assert_eq!(executor.worker_count(), 0);
+
+        drop(executor);
+        drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }
 
