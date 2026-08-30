@@ -2263,6 +2263,58 @@ mod tests {
         manager.subscription_count.fetch_add(1, Ordering::Release);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn deletion_delivery_default_lane_drops_only_excess_weak_intents() {
+        let (store, directory) = test_store("default-delivery-limits");
+        let hook = DeletionDeliveryTestHook::new();
+        hook.block_workers.store(true, Ordering::Release);
+        let manager = test_manager(
+            DEFAULT_DELETION_DELIVERY_QUEUE_CAPACITY,
+            DEFAULT_DELETION_DELIVERY_CONCURRENCY,
+            Some(hook.clone()),
+        );
+        assert_eq!(manager.deletion_delivery.concurrency, 32);
+        assert_eq!(manager.deletion_delivery.sender.capacity(), 256);
+        for index in 0..289 {
+            insert_test_subscription(
+                &manager,
+                test_subscription(
+                    &format!("sub-{index}"),
+                    BTreeMap::from([(
+                        "events/a".into(),
+                        StreamLink {
+                            explicit: true,
+                            glob: false,
+                            acked_offset: format_offset(5),
+                        },
+                    )]),
+                    None,
+                ),
+            )
+            .await;
+        }
+
+        manager
+            .on_stream_deleted(store.clone(), "/root/events/a")
+            .await;
+        assert_eq!(
+            manager.deletion_delivery.dropped.load(Ordering::Acquire),
+            33,
+            "the bounded 256-intent queue drops only the excess while workers are blocked"
+        );
+        hook.wait_for_workers(32).await;
+        assert_eq!(hook.peak_workers.load(Ordering::Acquire), 32);
+        let weak_store = Arc::downgrade(&store);
+        drop(store);
+        assert!(
+            weak_store.upgrade().is_none(),
+            "delivery intents retain neither the Store nor a retirement fence"
+        );
+        hook.release.send_replace(true);
+        drop(manager);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     fn json_request(method: Method, path: impl Into<String>, body: Value) -> Req {
         Req {
             method,

@@ -1259,6 +1259,140 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn retirement_reservations_bound_proactive_work_and_preserve_interactive_lanes() {
+        let (store, expiry, directory) = store_stream("reservation-lanes");
+        let queued_expiry = stream(&store, "queued-expiry");
+        let reserved_one = stream(&store, "reserved-one");
+        let reserved_two = stream(&store, "reserved-two");
+        let rejected = stream(&store, "rejected");
+        let explicit = stream(&store, "explicit");
+        let cascade = stream(&store, "cascade");
+        let gate = Arc::new((StdMutex::new(false), Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let expiry_started = Arc::new(tokio::sync::Notify::new());
+        let expiry_started_callback = Arc::clone(&expiry_started);
+        let cleanup: CleanupCallback = Arc::new(move |_, mode| {
+            if mode == LocalCleanupMode::Expiry {
+                expiry_started_callback.notify_one();
+                let (lock, wake) = &*worker_gate;
+                let mut released = lock_recover(lock);
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            }
+            Ok(LocalCleanupOutcome::default())
+        });
+        let config = RetirementConfig {
+            queue_capacity: 4,
+            coordinator_capacity: 9,
+            proactive_coordinator_capacity: 1,
+            interactive_physical_capacity: 1,
+            proactive_physical_capacity: 1,
+            physical_queue_capacity: 2,
+            cleanup_workers: 2,
+            ..RetirementConfig::default()
+        };
+        let executor = RetirementExecutor::new(cleanup, config).unwrap();
+
+        let started = expiry_started.notified();
+        tokio::pin!(started);
+        started.as_mut().enable();
+        let active_expiry = admit_released(
+            &executor,
+            expiry,
+            RetirementPriority::Proactive,
+            LocalCleanupMode::Expiry,
+        );
+        tokio::time::timeout(Duration::from_secs(5), started)
+            .await
+            .expect("the proactive physical lane starts one expiry attempt");
+        let queued_expiry_ticket = admit_released(
+            &executor,
+            queued_expiry,
+            RetirementPriority::Proactive,
+            LocalCleanupMode::Expiry,
+        );
+        let reserved_one_ticket = ticket(executor.admit(
+            reserved_one.clone(),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::ExplicitDelete,
+        ));
+        let reserved_two_ticket = ticket(executor.admit(
+            reserved_two.clone(),
+            RetirementPriority::Interactive,
+            LocalCleanupMode::CascadeCollection,
+        ));
+
+        let saturated = executor.snapshot();
+        assert_eq!(saturated.queue_capacity, 4);
+        assert_eq!(saturated.total_jobs, 4);
+        assert_eq!(saturated.active_proactive, 1);
+        assert_eq!(saturated.proactive_pending, 1);
+        assert!(saturated.active_interactive <= saturated.coordinator_capacity);
+        assert!(saturated.active_proactive <= saturated.proactive_coordinator_capacity);
+        assert!(saturated.physical_proactive_active <= saturated.proactive_physical_capacity);
+
+        assert!(matches!(
+            executor.admit(
+                rejected.clone(),
+                RetirementPriority::Proactive,
+                LocalCleanupMode::Expiry,
+            ),
+            RetirementAdmissionResult::Rejected(RetirementAdmission::QueueFull)
+        ));
+        assert!(rejected.retirement_state().is_clean());
+        assert!(!rejected.fenced.load(Ordering::Acquire));
+        store.streams.remove("rejected");
+        let rejected_weak = Arc::downgrade(&rejected);
+        drop(rejected);
+        assert!(rejected_weak.upgrade().is_none());
+
+        assert!(executor.cancel_prelogical(&reserved_one, &reserved_one_ticket));
+        assert!(executor.cancel_prelogical(&reserved_two, &reserved_two_ticket));
+        let explicit_ticket = admit_released(
+            &executor,
+            explicit,
+            RetirementPriority::Interactive,
+            LocalCleanupMode::ExplicitDelete,
+        );
+        assert!(matches!(
+            explicit_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        let cascade_ticket = admit_released(
+            &executor,
+            cascade,
+            RetirementPriority::Interactive,
+            LocalCleanupMode::CascadeCollection,
+        );
+        assert!(matches!(
+            cascade_ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+
+        *lock_recover(&gate.0) = true;
+        gate.1.notify_all();
+        for ticket in [&active_expiry, &queued_expiry_ticket] {
+            assert!(matches!(
+                ticket.wait_terminal().await,
+                TerminalCleanupCompletion::Succeeded { .. }
+            ));
+        }
+        let settled = executor.snapshot();
+        assert_eq!(settled.total_jobs, 0);
+        assert_eq!(settled.active_interactive, 0);
+        assert_eq!(settled.active_proactive, 0);
+        assert_eq!(settled.physical_interactive_queued, 0);
+        assert_eq!(settled.physical_proactive_queued, 0);
+        executor.shutdown().await;
+        assert_eq!(executor.snapshot().cleanup_workers_live, 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn retirement_queue_coordinator_deduplicates_ticket_and_retains_stream() {
         let (store, stream, directory) = store_stream("dedup");
         let executor = RetirementExecutor::new(callback(), config(2, 8, 0)).unwrap();

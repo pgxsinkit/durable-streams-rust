@@ -366,7 +366,9 @@ mod tests {
         assert_eq!(DEFAULT_PROACTIVE_COORDINATOR_CONCURRENCY, 56);
         assert_eq!(DEFAULT_INTERACTIVE_PHYSICAL_QUEUE_CAPACITY, 64);
         assert_eq!(DEFAULT_PROACTIVE_PHYSICAL_QUEUE_CAPACITY, 960);
+        assert_eq!(DEFAULT_PHYSICAL_QUEUE_CAPACITY, 1024);
         assert_eq!(DEFAULT_CLEANUP_WORKERS, 4);
+        assert_eq!(RESERVED_INTERACTIVE_CLEANUP_WORKERS, 1);
         assert_eq!(DEFAULT_PROACTIVE_CLEANUP_WORKERS, 3);
         assert_eq!(MAX_CLEANUP_ATTEMPTS, 10);
         assert_eq!(MAX_RETRY_BACKOFF, Duration::from_secs(60));
