@@ -2662,12 +2662,18 @@ async fn handle_delete(store: Arc<Store>, path: String) -> Resp {
         Some(s) => s,
         None => return text_response(404, "stream not found"),
     };
-    if st.shared.read().unwrap().soft_deleted {
+    let recovering_failed_soft_tombstone = {
+        let soft_deleted = st.shared.read().unwrap().soft_deleted;
+        soft_deleted && st.retirement_state().has_terminal_failure()
+    };
+    if st.shared.read().unwrap().soft_deleted && !recovering_failed_soft_tombstone {
         return gone();
     }
     let expired_at_dispatch = st.is_expired_at(SystemTime::now());
     match store.retire_explicit(st).await {
-        ExplicitRetirementResult::Owner(_) if expired_at_dispatch => {
+        ExplicitRetirementResult::Owner(_)
+            if expired_at_dispatch && !recovering_failed_soft_tombstone =>
+        {
             text_response(404, "stream not found")
         }
         ExplicitRetirementResult::Owner(ticket) => match ticket.wait_first_attempt().await {
@@ -3071,6 +3077,94 @@ mod explicit_delete_handler_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn expiry_permission_failure_enters_cooldown_and_delete_reports_retry_after_60() {
+        let _fault = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = store("expiry-permission-cooldown");
+        let executor = store
+            .init_retirement_executor_for_test(RetirementConfig {
+                retry_base: Duration::ZERO,
+                ..RetirementConfig::default()
+            })
+            .unwrap()
+            .clone();
+        let stream = create_with_config(&store, "stream", config_with_ttl(Some(1), None));
+        stream.shared.write().unwrap().ref_count = 1;
+        stream.shared.write().unwrap().last_access = SystemTime::UNIX_EPOCH;
+        let _reset = DeleteFaultReset(stream.clone());
+        set_delete_fault_for(&stream, 4);
+
+        let ticket = match store.retire_expiry(stream.clone()).await {
+            crate::store::ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("due expiry must own the exact cleanup ticket"),
+        };
+        assert_eq!(
+            ticket.wait_terminal().await,
+            crate::retirement::TerminalCleanupCompletion::Failed
+        );
+        assert!(stream.fenced.load(Ordering::Acquire));
+        assert!(stream.file_path.exists());
+        assert!(stream.shared.read().unwrap().soft_deleted);
+        assert!(stream.retirement_state().has_terminal_failure());
+        assert_eq!(executor.snapshot().terminal_cleanup_failed_current, 1);
+
+        let response = handle_delete(store.clone(), "stream".into()).await;
+        assert_eq!(response.status, 503);
+        assert_eq!(retry_after(&response), Some("60"));
+        assert!(store
+            .registered_stream("stream")
+            .is_some_and(|current| Arc::ptr_eq(&current, &stream)));
+        shutdown(&store).await;
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expiry_cleanup_recovery_after_zero_cooldown_retries_the_exact_soft_tombstone() {
+        let _fault = DELETE_FAULT_LOCK.lock().await;
+        let (directory, store) = store("expiry-permission-recovery");
+        let executor = store
+            .init_retirement_executor_for_test(RetirementConfig {
+                retry_base: Duration::ZERO,
+                cooldown: Duration::ZERO,
+                ..RetirementConfig::default()
+            })
+            .unwrap()
+            .clone();
+        let stream = create_with_config(&store, "stream", config_with_ttl(Some(1), None));
+        stream.shared.write().unwrap().ref_count = 1;
+        stream.shared.write().unwrap().last_access = SystemTime::UNIX_EPOCH;
+        let _reset = DeleteFaultReset(stream.clone());
+        set_delete_fault_for(&stream, 4);
+
+        let failed = match store.retire_expiry(stream.clone()).await {
+            crate::store::ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("due expiry must own the failing ticket"),
+        };
+        assert_eq!(
+            failed.wait_terminal().await,
+            crate::retirement::TerminalCleanupCompletion::Failed
+        );
+        assert_eq!(executor.snapshot().terminal_cleanup_failed_current, 1);
+
+        set_delete_fault_for(&stream, 0);
+        let recovered = handle_delete(store.clone(), "stream".into()).await;
+        assert_eq!(recovered.status, 204);
+        assert_eq!(executor.snapshot().terminal_cleanup_failed_current, 0);
+        assert!(stream.shared.read().unwrap().soft_deleted);
+        assert_eq!(
+            handle(store.clone(), request(Method::Get, "stream"))
+                .await
+                .status,
+            410
+        );
+        shutdown(&store).await;
+        drop(stream);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn explicit_delete_handler_duplicate_is_retryable_while_owner_waits() {
         let _fault = DELETE_FAULT_LOCK.lock().await;
         let (directory, store) = store("duplicate");
@@ -3234,6 +3328,56 @@ mod explicit_delete_handler_tests {
         );
         assert_eq!(head_stream.shared.read().unwrap().last_access, before);
         assert!(!head_stream.meta_dirty.load(Ordering::Acquire));
+        shutdown(&store).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sse_touches_ttl_once_at_dispatch_not_for_later_frames() {
+        let (directory, store) = store("sse-single-touch");
+        store.init_retirement_executor().unwrap();
+        let stream = create_with_config(&store, "stream", config_with_ttl(Some(3_600), None));
+        let before = SystemTime::now() - Duration::from_secs(1);
+        stream.shared.write().unwrap().last_access = before;
+
+        let mut sse = request(Method::Get, "stream");
+        sse.query = Some("offset=now&live=sse".into());
+        let response = handle(store.clone(), sse).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(name, _)| *name == "content-type")
+                .map(|(_, value)| value.as_str()),
+            Some("text/event-stream")
+        );
+        let admitted = stream.shared.read().unwrap().last_access;
+        assert!(admitted > before);
+
+        let mut source = match response.body {
+            Body::Sse(source) => source,
+            _ => panic!("SSE read must install the inline event source"),
+        };
+        assert!(
+            source.next_chunk().await.is_some(),
+            "initial SSE control frame"
+        );
+        assert_eq!(stream.shared.read().unwrap().last_access, admitted);
+
+        stream.tail_tx.send_replace(Tail {
+            bytes: 0,
+            closed: true,
+        });
+        assert!(
+            source.next_chunk().await.is_some(),
+            "SSE close control frame"
+        );
+        assert_eq!(
+            stream.shared.read().unwrap().last_access,
+            admitted,
+            "frame production must not renew TTL after dispatch"
+        );
         shutdown(&store).await;
         let _ = std::fs::remove_dir_all(directory);
     }

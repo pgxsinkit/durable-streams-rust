@@ -1496,7 +1496,11 @@ impl Store {
             }
             Some(_) => {}
         }
-        if stream.shared.read().unwrap().soft_deleted {
+        let recovering_failed_soft_tombstone = {
+            let soft_deleted = stream.shared.read().unwrap().soft_deleted;
+            soft_deleted && stream.retirement_state().has_terminal_failure()
+        };
+        if stream.shared.read().unwrap().soft_deleted && !recovering_failed_soft_tombstone {
             return ExplicitRetirementResult::Gone;
         }
         let Some(executor) = self.retirement_executor() else {
@@ -1520,6 +1524,22 @@ impl Store {
                 return ExplicitRetirementResult::Rejected(reason);
             }
         };
+
+        // A terminally failed soft tombstone has already completed the exact
+        // fence, WAL, notification, and logical-release boundaries. After its
+        // cooldown, retry only the retained physical sidecar write; reopening
+        // those earlier transitions would duplicate their externally visible
+        // effects.
+        if recovering_failed_soft_tombstone {
+            if !self.is_exact_registered(&stream) {
+                return self.cancel_retirement(&executor, &stream, ticket);
+            }
+            return if executor.release_logical(&stream, &ticket) {
+                ExplicitRetirementResult::Owner(ticket)
+            } else {
+                ExplicitRetirementResult::Cancelled(ticket)
+            };
+        }
 
         #[cfg(test)]
         crate::test_cut_points::hit_async(
@@ -1857,6 +1877,13 @@ impl Store {
                 crate::test_cut_points::CutPoint::PhysicalSoftWriteEntry,
                 stream,
             );
+            #[cfg(test)]
+            if delete_fault_for(stream) == 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected soft tombstone permission denial",
+                ));
+            }
             write_meta_sync(stream, true)?;
             self.publish_inventory(stream);
             let outcome = LocalCleanupOutcome {
@@ -2230,6 +2257,12 @@ impl Store {
         if st.shared.read().unwrap().soft_deleted {
             return Some(st);
         }
+        // Retirement owns a fenced identity through its bounded logical and
+        // physical phases. A subscription wake/get must treat it as absent,
+        // never re-enter synchronous lazy expiry cleanup for that same Arc.
+        if st.fenced.load(Ordering::Acquire) {
+            return None;
+        }
         if st.is_expired() {
             // Expiry retains the projection until synchronous local unlink
             // succeeds; unlike an acknowledged DELETE it does not sync the
@@ -2331,6 +2364,13 @@ impl Store {
         #[cfg(test)]
         if delete_fault_for(st) == 2 {
             return Err(std::io::Error::other("injected local cleanup failure"));
+        }
+        #[cfg(test)]
+        if delete_fault_for(st) == 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected local cleanup permission denial",
+            ));
         }
 
         let mut paths = HashSet::from([st.file_path.clone(), meta_path(&st.file_path)]);
@@ -3835,6 +3875,70 @@ mod retirement_executor_lifecycle_tests {
 
         drop(replacement);
         drop(original);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_treats_a_due_fenced_identity_as_absent_without_reentering_retirement() {
+        let (directory, store) = temporary_store("get-fenced-due");
+        let executor = store.init_retirement_executor().unwrap().clone();
+        let stream = match store
+            .create(
+                "stream",
+                StreamConfig {
+                    ttl_seconds: Some(1),
+                    ..stream_config()
+                },
+                None,
+                0,
+            )
+            .unwrap()
+        {
+            CreateResult::Created(stream) => stream,
+            _ => panic!("expected stream creation"),
+        };
+        stream.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let pause = crate::test_cut_points::pause(
+            crate::test_cut_points::CutPoint::FenceAfterAppenderTransition,
+            &stream,
+        );
+        let retiring_store = Arc::clone(&store);
+        let retiring_stream = Arc::clone(&stream);
+        let retirement =
+            tokio::spawn(async move { retiring_store.retire_expiry(retiring_stream).await });
+        pause.wait_until_held().await;
+        let before = executor.snapshot();
+
+        assert!(store.get("stream").is_none());
+        assert!(store.is_exact_registered(&stream));
+        assert!(stream.file_path.exists());
+        let after = executor.snapshot();
+        assert_eq!(after.total_jobs, before.total_jobs);
+        assert_eq!(after.terminal_successes, before.terminal_successes);
+        assert_eq!(after.terminal_failures, before.terminal_failures);
+        assert_eq!(after.terminal_cancellations, before.terminal_cancellations);
+        assert_eq!(
+            after.cumulative_retry_attempts,
+            before.cumulative_retry_attempts
+        );
+
+        pause.release();
+        let ticket = match tokio::time::timeout(Duration::from_secs(5), retirement)
+            .await
+            .expect("retirement resumes after get absence check")
+            .expect("retirement task should not panic")
+        {
+            ExplicitRetirementResult::Owner(ticket) => ticket,
+            _ => panic!("fenced due identity keeps its owner ticket"),
+        };
+        assert!(matches!(
+            ticket.wait_terminal().await,
+            TerminalCleanupCompletion::Succeeded { .. }
+        ));
+        store.retirement_executor().unwrap().shutdown().await;
+
+        drop(stream);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
     }

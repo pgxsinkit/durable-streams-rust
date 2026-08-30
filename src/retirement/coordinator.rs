@@ -1051,11 +1051,11 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
     }
     match outcome {
         AttemptOutcome::Succeeded(job, reclaimed_local_bytes, _) => {
+            job.stream.retirement_state().finish(&job.ticket);
             job.ticket
                 .complete_terminal(TerminalCleanupCompletion::Succeeded {
                     reclaimed_local_bytes,
                 });
-            job.stream.retirement_state().finish(&job.ticket);
         }
         AttemptOutcome::Retry(job) => {
             if job.mode == LocalCleanupMode::Expiry {
@@ -1069,19 +1069,19 @@ fn finish_attempt(inner: &Inner, event: WorkerEvent) {
                     count: 1,
                 });
             }
-            job.ticket
-                .complete_terminal(TerminalCleanupCompletion::Failed);
             job.stream.retirement_state().fail_terminal(
                 &job.ticket,
                 Instant::now(),
                 SystemTime::now(),
                 inner.config.cooldown,
             );
+            job.ticket
+                .complete_terminal(TerminalCleanupCompletion::Failed);
         }
         AttemptOutcome::Cancelled(job) => {
+            job.stream.retirement_state().finish(&job.ticket);
             job.ticket
                 .complete_terminal(TerminalCleanupCompletion::Cancelled);
-            job.stream.retirement_state().finish(&job.ticket);
         }
     }
     emit_expiry_telemetry(inner);
