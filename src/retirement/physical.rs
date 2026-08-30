@@ -363,7 +363,7 @@ mod tests {
     use crate::retirement::DEFAULT_CLEANUP_WORKERS;
     use crate::store::{CreateResult, Store, StreamConfig};
     use crate::tier::TierConfig;
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -478,11 +478,23 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn retirement_queue_physical_lanes_fill_independently() {
         let (store, stream, directory) = store_stream("full");
-        let (started_tx, started_rx) = mpsc::channel();
+        let idle_workers = Arc::new(AtomicUsize::new(0));
+        let idle_notify = Arc::new(tokio::sync::Notify::new());
+        let observer_idle_workers = Arc::clone(&idle_workers);
+        let observer_idle_notify = Arc::clone(&idle_notify);
+        let observer = Arc::new(move |index| {
+            observer_idle_workers.fetch_or(1 << index, AtomicOrdering::AcqRel);
+            observer_idle_notify.notify_waiters();
+        });
+        let starts = Arc::new(AtomicUsize::new(0));
+        let starts_notify = Arc::new(tokio::sync::Notify::new());
+        let cleanup_starts = Arc::clone(&starts);
+        let cleanup_starts_notify = Arc::clone(&starts_notify);
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let worker_gate = gate.clone();
         let cleanup: CleanupCallback = Arc::new(move |_, _| {
-            started_tx.send(()).unwrap();
+            cleanup_starts.fetch_add(1, AtomicOrdering::AcqRel);
+            cleanup_starts_notify.notify_waiters();
             let (lock, wake) = &*worker_gate;
             let mut released = lock_recover(lock);
             while !*released {
@@ -492,14 +504,27 @@ mod tests {
             }
             Ok(LocalCleanupOutcome::default())
         });
-        let executor = PhysicalExecutor::new(cleanup, &config(1, 1, 2)).unwrap();
-        let _ = executor
-            .submit(
-                stream.clone(),
-                RetirementPriority::Interactive,
-                LocalCleanupMode::Expiry,
-            )
-            .unwrap();
+        let executor =
+            PhysicalExecutor::new_with_idle_observer(cleanup, &config(1, 1, 2), observer).unwrap();
+        if tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = idle_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if idle_workers.load(AtomicOrdering::Acquire) == 0b11 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            panic!(
+                "timed out waiting for both physical workers to become idle; observed mask {:02b}",
+                idle_workers.load(AtomicOrdering::Acquire)
+            );
+        }
         let _ = executor
             .submit(
                 stream.clone(),
@@ -507,8 +532,51 @@ mod tests {
                 LocalCleanupMode::Expiry,
             )
             .unwrap();
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        if tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = starts_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if starts.load(AtomicOrdering::Acquire) == 1 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            panic!(
+                "timed out waiting for the proactive callback to start; observed {}",
+                starts.load(AtomicOrdering::Acquire)
+            );
+        }
+        let _ = executor
+            .submit(
+                stream.clone(),
+                RetirementPriority::Interactive,
+                LocalCleanupMode::Expiry,
+            )
+            .unwrap();
+        if tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = starts_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if starts.load(AtomicOrdering::Acquire) == 2 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            panic!(
+                "timed out waiting for the interactive callback to start; observed {}",
+                starts.load(AtomicOrdering::Acquire)
+            );
+        }
         let queued_interactive = executor
             .submit(
                 stream.clone(),
