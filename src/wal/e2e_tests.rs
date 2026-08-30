@@ -198,6 +198,17 @@ fn post_req(path: &str, content_type: &str, body: &[u8]) -> Req {
     }
 }
 
+/// Build a minimal `GET` request for protocol-visible recovery assertions.
+fn get_req(path: &str) -> Req {
+    Req {
+        method: Method::Get,
+        path: path.to_string(),
+        query: None,
+        headers: vec![],
+        body: Bytes::new(),
+    }
+}
+
 /// Create a stream over the REAL HTTP path; assert a 2xx.
 async fn create_stream(store: &Arc<Store>, path: &str, content_type: &str) {
     let resp = handlers::handle(Arc::clone(store), put_req(path, content_type, b"", &[])).await;
@@ -672,6 +683,427 @@ async fn frozen_wal_forget_images_preserve_before_and_prune_after_durable_tails(
     drop(after_stream);
     after_live.crash();
     let _ = std::fs::remove_dir_all(after_source);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn frozen_soft_tombstone_images_recover_conservatively_before_and_gone_after_write() {
+    let _guard = DurabilityGuard::wal();
+
+    let before_source = tmp("frozen-soft-before-source");
+    let before_live = Harness::boot(&before_source, Some(1), 1).unwrap();
+    let parent_created = handlers::handle(
+        Arc::clone(&before_live.store),
+        put_req("parent", OCTET, b"", &[("stream-ttl", "1")]),
+    )
+    .await;
+    assert_eq!(parent_created.status, 201);
+    append_acked(&before_live.store, "parent", OCTET, b"parent-ack").await;
+    let child_created = handlers::handle(
+        Arc::clone(&before_live.store),
+        put_req("child", OCTET, b"", &[("stream-forked-from", "parent")]),
+    )
+    .await;
+    assert_eq!(child_created.status, 201);
+    let before_parent = before_live.store.registered_stream("parent").unwrap();
+    let before_parent_id = before_parent.id;
+    let before_child = before_live.store.registered_stream("child").unwrap();
+    assert!(before_child
+        .parent
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &before_parent)));
+    before_parent.shared.write().unwrap().last_access = std::time::UNIX_EPOCH;
+    write_meta_sync(&before_parent, true).unwrap();
+
+    let before_image = FrozenCopy::arm(
+        &before_parent,
+        crate::test_cut_points::CutPoint::PhysicalSoftWriteEntry,
+    );
+    let retiring_store = Arc::clone(&before_live.store);
+    let retiring_parent = Arc::clone(&before_parent);
+    let retirement =
+        tokio::spawn(async move { retiring_store.retire_expiry(retiring_parent).await });
+    before_image.capture(&before_source).await;
+
+    assert!(before_parent.shared.read().unwrap().soft_deleted);
+    let mut before_recovered = Harness::boot(&before_image.dir, Some(1), 1).unwrap();
+    let recovered_parent = before_recovered.store.registered_stream("parent").unwrap();
+    let recovered_child = before_recovered.store.registered_stream("child").unwrap();
+    assert_eq!(recovered_parent.id, before_parent_id);
+    assert!(
+        !recovered_parent.shared.read().unwrap().soft_deleted
+            && !recovered_parent
+                .fenced
+                .load(std::sync::atomic::Ordering::Acquire),
+        "the pre-write image conservatively reconstructs its last durable live sidecar"
+    );
+    assert!(recovered_child
+        .parent
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &recovered_parent)));
+    assert_eq!(
+        std::fs::read(&recovered_parent.file_path).unwrap(),
+        b"parent-ack"
+    );
+    before_recovered
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    before_recovered.stop_committers();
+    drop(recovered_child);
+    drop(recovered_parent);
+    drop(before_recovered);
+
+    before_image.release();
+    let ticket = wait_for_frozen_owner(retirement).await;
+    assert!(matches!(
+        ticket.wait_terminal().await,
+        crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+    ));
+    before_live
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    drop(before_child);
+    drop(before_parent);
+    before_live.crash();
+    let _ = std::fs::remove_dir_all(before_source);
+
+    let after_source = tmp("frozen-soft-after-source");
+    let after_live = Harness::boot(&after_source, Some(1), 1).unwrap();
+    let parent_created = handlers::handle(
+        Arc::clone(&after_live.store),
+        put_req("parent", OCTET, b"", &[("stream-ttl", "1")]),
+    )
+    .await;
+    assert_eq!(parent_created.status, 201);
+    append_acked(&after_live.store, "parent", OCTET, b"parent-ack").await;
+    let child_created = handlers::handle(
+        Arc::clone(&after_live.store),
+        put_req("child", OCTET, b"", &[("stream-forked-from", "parent")]),
+    )
+    .await;
+    assert_eq!(child_created.status, 201);
+    let after_parent = after_live.store.registered_stream("parent").unwrap();
+    let after_parent_id = after_parent.id;
+    let after_child = after_live.store.registered_stream("child").unwrap();
+    after_parent.shared.write().unwrap().last_access = std::time::UNIX_EPOCH;
+    write_meta_sync(&after_parent, true).unwrap();
+
+    let after_image = FrozenCopy::arm(
+        &after_parent,
+        crate::test_cut_points::CutPoint::PhysicalSoftWriteDisposition,
+    );
+    let retiring_store = Arc::clone(&after_live.store);
+    let retiring_parent = Arc::clone(&after_parent);
+    let retirement =
+        tokio::spawn(async move { retiring_store.retire_expiry(retiring_parent).await });
+    after_image.capture(&after_source).await;
+
+    let mut after_recovered = Harness::boot(&after_image.dir, Some(1), 1).unwrap();
+    let recovered_parent = after_recovered.store.registered_stream("parent").unwrap();
+    let recovered_child = after_recovered.store.registered_stream("child").unwrap();
+    assert_eq!(recovered_parent.id, after_parent_id);
+    assert!(recovered_parent.shared.read().unwrap().soft_deleted);
+    assert!(recovered_parent
+        .fenced
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert!(recovered_child
+        .parent
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &recovered_parent)));
+    assert_eq!(
+        handlers::handle(Arc::clone(&after_recovered.store), get_req("parent"))
+            .await
+            .status,
+        410,
+        "a durably tombstoned fork parent never becomes a live recovered stream"
+    );
+    after_recovered
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    after_recovered.stop_committers();
+    drop(recovered_child);
+    drop(recovered_parent);
+    drop(after_recovered);
+
+    after_image.release();
+    let ticket = wait_for_frozen_owner(retirement).await;
+    assert!(matches!(
+        ticket.wait_terminal().await,
+        crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+    ));
+    after_live
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    drop(after_child);
+    drop(after_parent);
+    after_live.crash();
+    let _ = std::fs::remove_dir_all(after_source);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn frozen_hard_unlink_images_reject_pre_unlink_and_expose_post_unlink_absence() {
+    let _guard = DurabilityGuard::wal();
+
+    let before_source = tmp("frozen-hard-before-source");
+    let before_live = Harness::boot(&before_source, Some(1), 1).unwrap();
+    let created = handlers::handle(
+        Arc::clone(&before_live.store),
+        put_req("hard", OCTET, b"", &[("stream-ttl", "1")]),
+    )
+    .await;
+    assert_eq!(created.status, 201);
+    append_acked(&before_live.store, "hard", OCTET, b"hard-ack").await;
+    let before_stream = before_live.store.registered_stream("hard").unwrap();
+    let before_id = before_stream.id;
+    let before_file = before_stream.file_path.clone();
+    let before_meta = crate::store::meta_path(&before_file);
+    before_stream.shared.write().unwrap().last_access = std::time::UNIX_EPOCH;
+    write_meta_sync(&before_stream, true).unwrap();
+
+    let before_image = FrozenCopy::arm(
+        &before_stream,
+        crate::test_cut_points::CutPoint::PhysicalHardUnlinkEntry,
+    );
+    let retiring_store = Arc::clone(&before_live.store);
+    let retiring_stream = Arc::clone(&before_stream);
+    let retirement =
+        tokio::spawn(async move { retiring_store.retire_expiry(retiring_stream).await });
+    before_image.capture(&before_source).await;
+
+    assert!(before_file.exists());
+    assert!(before_meta.exists());
+    let mut before_recovered = Harness::boot(&before_image.dir, Some(1), 1).unwrap();
+    let recovered_stream = before_recovered.store.registered_stream("hard").unwrap();
+    assert_eq!(recovered_stream.id, before_id);
+    assert_eq!(
+        std::fs::read(&recovered_stream.file_path).unwrap(),
+        b"hard-ack"
+    );
+    let recovered_cleanup = crate::test_cut_points::pause(
+        crate::test_cut_points::CutPoint::PhysicalHardUnlinkDisposition,
+        &recovered_stream,
+    );
+    assert_eq!(
+        handlers::handle(Arc::clone(&before_recovered.store), get_req("hard"))
+            .await
+            .status,
+        404,
+        "the pre-unlink image may retain bytes but lazy expiry rejects it"
+    );
+    recovered_cleanup.wait_until_held().await;
+    assert!(before_recovered.store.registered_stream("hard").is_none());
+    assert!(!recovered_stream.file_path.exists());
+    assert!(!crate::store::meta_path(&recovered_stream.file_path).exists());
+    recovered_cleanup.release();
+    before_recovered
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    before_recovered.stop_committers();
+    drop(recovered_stream);
+    drop(before_recovered);
+
+    before_image.release();
+    let ticket = wait_for_frozen_owner(retirement).await;
+    assert!(matches!(
+        ticket.wait_terminal().await,
+        crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+    ));
+    before_live
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    drop(before_stream);
+    before_live.crash();
+    let _ = std::fs::remove_dir_all(before_source);
+
+    let after_source = tmp("frozen-hard-after-source");
+    let after_live = Harness::boot(&after_source, Some(1), 1).unwrap();
+    let created = handlers::handle(
+        Arc::clone(&after_live.store),
+        put_req("hard", OCTET, b"", &[("stream-ttl", "1")]),
+    )
+    .await;
+    assert_eq!(created.status, 201);
+    append_acked(&after_live.store, "hard", OCTET, b"hard-ack").await;
+    let after_stream = after_live.store.registered_stream("hard").unwrap();
+    let after_file = after_stream.file_path.clone();
+    let after_meta = crate::store::meta_path(&after_file);
+    after_stream.shared.write().unwrap().last_access = std::time::UNIX_EPOCH;
+    write_meta_sync(&after_stream, true).unwrap();
+
+    let after_image = FrozenCopy::arm(
+        &after_stream,
+        crate::test_cut_points::CutPoint::PhysicalHardUnlinkDisposition,
+    );
+    let retiring_store = Arc::clone(&after_live.store);
+    let retiring_stream = Arc::clone(&after_stream);
+    let retirement =
+        tokio::spawn(async move { retiring_store.retire_expiry(retiring_stream).await });
+    after_image.capture(&after_source).await;
+
+    assert!(!after_file.exists());
+    assert!(!after_meta.exists());
+    let mut after_recovered = Harness::boot(&after_image.dir, Some(1), 1).unwrap();
+    assert!(after_recovered.store.registered_stream("hard").is_none());
+    assert_eq!(
+        handlers::handle(Arc::clone(&after_recovered.store), get_req("hard"))
+            .await
+            .status,
+        404,
+        "the post-unlink snapshot is protocol-visible as absent"
+    );
+    after_recovered
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    after_recovered.stop_committers();
+    drop(after_recovered);
+
+    after_image.release();
+    let ticket = wait_for_frozen_owner(retirement).await;
+    assert!(matches!(
+        ticket.wait_terminal().await,
+        crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+    ));
+    after_live
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    drop(after_stream);
+    after_live.crash();
+    let _ = std::fs::remove_dir_all(after_source);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn frozen_final_child_release_cascade_reaps_only_its_exact_recovered_parent() {
+    let _guard = DurabilityGuard::wal();
+    let source = tmp("frozen-fork-final-release-source");
+    let live = Harness::boot(&source, Some(1), 1).unwrap();
+    let parent_created = handlers::handle(
+        Arc::clone(&live.store),
+        put_req("parent", OCTET, b"", &[("stream-ttl", "1")]),
+    )
+    .await;
+    assert_eq!(parent_created.status, 201);
+    append_acked(&live.store, "parent", OCTET, b"parent-ack").await;
+    let child_created = handlers::handle(
+        Arc::clone(&live.store),
+        put_req("child", OCTET, b"", &[("stream-forked-from", "parent")]),
+    )
+    .await;
+    assert_eq!(child_created.status, 201);
+    let parent = live.store.registered_stream("parent").unwrap();
+    let parent_id = parent.id;
+    let child = live.store.registered_stream("child").unwrap();
+    assert!(child
+        .parent
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &parent)));
+    parent.shared.write().unwrap().last_access = std::time::UNIX_EPOCH;
+    write_meta_sync(&parent, true).unwrap();
+
+    let parent_ticket = match live.store.retire_expiry(Arc::clone(&parent)).await {
+        ExplicitRetirementResult::Owner(ticket) => ticket,
+        _ => panic!("fork parent expiry must own its soft tombstone"),
+    };
+    assert!(matches!(
+        parent_ticket.wait_terminal().await,
+        crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+    ));
+    assert!(parent.shared.read().unwrap().soft_deleted);
+    assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+
+    let image = FrozenCopy::arm(
+        &parent,
+        crate::test_cut_points::CutPoint::ForkReferenceTransition,
+    );
+    let retiring_store = Arc::clone(&live.store);
+    let retiring_child = Arc::clone(&child);
+    let child_retirement =
+        tokio::spawn(async move { retiring_store.retire_explicit(retiring_child).await });
+    image.capture(&source).await;
+
+    assert!(parent.shared.read().unwrap().soft_deleted);
+    assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+    let mut recovered = Harness::boot(&image.dir, Some(1), 1).unwrap();
+    let recovered_parent = recovered.store.registered_stream("parent").unwrap();
+    assert_eq!(recovered_parent.id, parent_id);
+    assert!(recovered_parent.shared.read().unwrap().soft_deleted);
+    assert!(recovered_parent
+        .fenced
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(recovered_parent.shared.read().unwrap().ref_count, 0);
+    assert!(recovered.store.registered_stream("child").is_none());
+
+    // This mirrors the production post-recovery collector.  Its physical cut
+    // gives the replacement an exact old-parent cleanup race, without timing.
+    recovered.store.refresh_inventory();
+    let recovered_cascade = crate::test_cut_points::pause(
+        crate::test_cut_points::CutPoint::PhysicalHardUnlinkEntry,
+        &recovered_parent,
+    );
+    let collector = recovered.store.start_recovery_collector().unwrap();
+    recovered_cascade.wait_until_held().await;
+    assert!(recovered.store.registered_stream("parent").is_none());
+    create_stream(&recovered.store, "parent", OCTET).await;
+    let replacement = recovered.store.registered_stream("parent").unwrap();
+    assert_ne!(replacement.id, parent_id);
+    append_acked(&recovered.store, "parent", OCTET, b"replacement-ack").await;
+    let replacement_file = replacement.file_path.clone();
+
+    recovered_cascade.release();
+    collector.shutdown().await;
+    recovered
+        .store
+        .retirement_executor()
+        .unwrap()
+        .shutdown()
+        .await;
+    assert!(Arc::ptr_eq(
+        &recovered.store.registered_stream("parent").unwrap(),
+        &replacement
+    ));
+    assert!(replacement_file.exists());
+    assert_eq!(
+        std::fs::read(&replacement_file).unwrap(),
+        b"replacement-ack"
+    );
+    recovered.stop_committers();
+    drop(replacement);
+    drop(recovered_parent);
+    drop(recovered);
+
+    image.release();
+    let ticket = wait_for_frozen_owner(child_retirement).await;
+    assert!(matches!(
+        ticket.wait_terminal().await,
+        crate::retirement::TerminalCleanupCompletion::Succeeded { .. }
+    ));
+    live.store.retirement_executor().unwrap().shutdown().await;
+    drop(child);
+    drop(parent);
+    live.crash();
+    let _ = std::fs::remove_dir_all(source);
 }
 
 #[tokio::test]
