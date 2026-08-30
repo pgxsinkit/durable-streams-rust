@@ -2774,23 +2774,33 @@ mod tests {
         let mut completed = 0_u64;
 
         while completed < TOTAL {
-            let count = usize::try_from((TOTAL - completed).min(WAVE as u64)).unwrap();
-            let mut wave = Vec::with_capacity(count);
-            for offset in 0..count {
-                let id = completed + u64::try_from(offset).unwrap() + 1;
+            let target_count = usize::try_from((TOTAL - completed).min(WAVE as u64)).unwrap();
+            let mut wave = Vec::with_capacity(WAVE);
+            for offset in 0..WAVE {
+                let target = offset < target_count;
+                let id = if target {
+                    completed + u64::try_from(offset).unwrap() + 1
+                } else {
+                    TOTAL
+                        .saturating_mul(2)
+                        .saturating_add(completed)
+                        .saturating_add(u64::try_from(offset).unwrap())
+                        .saturating_add(1)
+                };
                 let stream =
                     StreamState::synthetic_for_retirement_test(id, Arc::clone(&shared_file));
-                stream.fenced.store(true, Ordering::Release);
                 let ticket = ticket(executor.admit(
                     Arc::clone(&stream),
                     RetirementPriority::Proactive,
                     LocalCleanupMode::Expiry,
                 ));
-                executor.mark_expiry_fence(&stream);
-                wave.push((stream, ticket));
+                wave.push((stream, ticket, target));
             }
             let overflow = StreamState::synthetic_for_retirement_test(
-                TOTAL + completed + 1,
+                TOTAL
+                    .saturating_mul(3)
+                    .saturating_add(completed)
+                    .saturating_add(1),
                 Arc::clone(&shared_file),
             );
             assert!(matches!(
@@ -2801,11 +2811,21 @@ mod tests {
                 ),
                 RetirementAdmissionResult::Rejected(RetirementAdmission::QueueFull)
             ));
+            assert!(overflow.retirement_state().is_clean());
+            assert!(!overflow.fenced.load(Ordering::Acquire));
             let overflow_weak = Arc::downgrade(&overflow);
             drop(overflow);
             assert!(overflow_weak.upgrade().is_none());
 
-            let (first_stream, first_ticket) = &wave[0];
+            for (stream, ticket, target) in &wave {
+                if *target {
+                    stream.fenced.store(true, Ordering::Release);
+                    executor.mark_expiry_fence(stream);
+                } else {
+                    assert!(executor.cancel_prelogical(stream, ticket));
+                }
+            }
+            let (first_stream, first_ticket, _) = &wave[0];
             assert!(executor.release_logical(first_stream, first_ticket));
             if completed == 0 {
                 assert_eq!(
@@ -2814,20 +2834,29 @@ mod tests {
                 );
                 assert_eq!(executor.scheduled_retry_count(), 1);
             }
-            for (stream, ticket) in wave.iter().skip(1) {
-                assert!(executor.release_logical(stream, ticket));
+            for (stream, ticket, target) in wave.iter().skip(1) {
+                if *target {
+                    assert!(executor.release_logical(stream, ticket));
+                }
             }
-            for (stream, ticket) in wave {
-                assert!(matches!(
-                    ticket.wait_terminal().await,
-                    TerminalCleanupCompletion::Succeeded { .. }
-                ));
+            for (stream, ticket, target) in wave {
+                if target {
+                    assert!(matches!(
+                        ticket.wait_terminal().await,
+                        TerminalCleanupCompletion::Succeeded { .. }
+                    ));
+                } else {
+                    assert_eq!(
+                        ticket.wait_terminal().await,
+                        TerminalCleanupCompletion::Cancelled
+                    );
+                }
                 let weak = Arc::downgrade(&stream);
                 drop(ticket);
                 drop(stream);
                 assert!(weak.upgrade().is_none());
             }
-            completed += u64::try_from(count).unwrap();
+            completed += u64::try_from(target_count).unwrap();
             let snapshot = executor.snapshot();
             assert_scale_bounds(&snapshot);
             assert_eq!(snapshot.total_jobs, 0);
@@ -2835,9 +2864,19 @@ mod tests {
         }
 
         let settled = executor.snapshot();
+        let expected_padding_cancellations =
+            u64::try_from((WAVE - usize::try_from(TOTAL).unwrap() % WAVE) % WAVE).unwrap();
         assert_eq!(settled.terminal_successes, TOTAL);
         assert_eq!(settled.cumulative_retry_attempts, 1);
         assert_eq!(settled.first_attempt_failures, 1);
+        assert_eq!(
+            settled.terminal_cancellations,
+            expected_padding_cancellations
+        );
+        assert_eq!(
+            settled.first_attempt_cancellations,
+            expected_padding_cancellations
+        );
         assert_scale_bounds(&settled);
         executor.shutdown().await;
         let stopped = executor.snapshot();
