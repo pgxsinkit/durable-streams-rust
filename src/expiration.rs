@@ -1349,6 +1349,22 @@ impl ExpiringStreams {
     fn register_replacement_for_test(&self, stream_id: u64, replacement: &Arc<StreamState>) {
         self.register_at_id(stream_id, replacement);
     }
+
+    /// Seed a contiguous test-only range of dead entries without allocating or
+    /// retaining matching `StreamState`s. The production page/cursor/prune
+    /// paths still operate on this exact B-tree and its real `Weak` entries.
+    #[cfg(test)]
+    fn seed_dead_range_for_test(&self, start: u64, count: usize) {
+        let end = start
+            .checked_add(u64::try_from(count).expect("test entry count fits u64"))
+            .expect("test entry range fits u64");
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(entries.is_empty(), "scale fixture seeds one fresh index");
+        entries.extend((start..end).map(|stream_id| (stream_id, Weak::new())));
+    }
 }
 
 fn collect_page<'a>(
@@ -2330,6 +2346,210 @@ mod tests {
             .iter()
             .map(|candidate| candidate.stream_id)
             .collect()
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct IndexPassDiagnostics {
+        pages: usize,
+        completed_passes: usize,
+        candidates: usize,
+        pruned_dead: usize,
+        wrapped_pages: usize,
+        max_page_candidates: usize,
+        max_page_capacity: usize,
+    }
+
+    /// Drive the production index's actual bounded page/cursor/prune loop.
+    /// No shadow `Vec` or alternate priority structure represents the index.
+    fn scan_dead_index_pass(
+        index: &ExpiringStreams,
+        mut cursor: ExpirationCursor,
+        page_size: usize,
+    ) -> IndexPassDiagnostics {
+        let mut diagnostics = IndexPassDiagnostics::default();
+        loop {
+            let page = index.page(cursor, page_size);
+            diagnostics.pages += 1;
+            diagnostics.candidates += page.candidates.len();
+            diagnostics.max_page_candidates =
+                diagnostics.max_page_candidates.max(page.candidates.len());
+            diagnostics.max_page_capacity = diagnostics
+                .max_page_capacity
+                .max(page.candidates.capacity());
+            if page.wrapped {
+                diagnostics.wrapped_pages += 1;
+            }
+            for candidate in &page.candidates {
+                assert!(
+                    candidate.stream.upgrade().is_none(),
+                    "qualification fixture holds no stream Arc in its scaled index"
+                );
+                assert!(
+                    index.prune_dead(candidate),
+                    "the current dead candidate is pruned by exact weak identity"
+                );
+                diagnostics.pruned_dead += 1;
+            }
+            if page.pass_complete {
+                diagnostics.completed_passes += 1;
+                assert_eq!(page.next_cursor, ExpirationCursor::start());
+                return diagnostics;
+            }
+            cursor = page.next_cursor;
+        }
+    }
+
+    /// Install a dead current occupant after proving that an older dead page
+    /// candidate cannot remove either a live or a different dead replacement.
+    fn install_replaced_dead_scale_entry(
+        index: &ExpiringStreams,
+        store: &Arc<Store>,
+        stream_id: u64,
+    ) {
+        let old = streams(store, &["scale-old"]).pop().unwrap();
+        index.register_replacement_for_test(stream_id, &old);
+        let stale = index
+            .page(ExpirationCursor::after(stream_id - 1), 1)
+            .candidates
+            .pop()
+            .unwrap();
+        assert_eq!(stale.stream_id, stream_id);
+        assert!(store.streams.remove("scale-old").is_some());
+        drop(old);
+
+        let live_replacement = streams(store, &["scale-live-replacement"]).pop().unwrap();
+        index.register_replacement_for_test(stream_id, &live_replacement);
+        assert!(
+            !index.prune_dead(&stale),
+            "a stale dead candidate cannot prune its live replacement"
+        );
+        assert!(store.streams.remove("scale-live-replacement").is_some());
+        drop(live_replacement);
+
+        let dead_replacement = streams(store, &["scale-dead-replacement"]).pop().unwrap();
+        index.register_replacement_for_test(stream_id, &dead_replacement);
+        assert!(store.streams.remove("scale-dead-replacement").is_some());
+        drop(dead_replacement);
+        assert!(
+            !index.prune_dead(&stale),
+            "a stale dead candidate cannot prune a different dead replacement"
+        );
+    }
+
+    fn assert_scale_pass(
+        index: &ExpiringStreams,
+        entry_count: usize,
+        page_size: usize,
+        anchor: u64,
+        expected_wrapped_pages: usize,
+    ) -> IndexPassDiagnostics {
+        let diagnostics = scan_dead_index_pass(index, ExpirationCursor::after(anchor), page_size);
+        assert_eq!(diagnostics.pages, entry_count / page_size);
+        assert_eq!(diagnostics.completed_passes, 1);
+        assert_eq!(diagnostics.candidates, entry_count);
+        assert_eq!(diagnostics.pruned_dead, entry_count);
+        assert_eq!(diagnostics.wrapped_pages, expected_wrapped_pages);
+        assert!(diagnostics.max_page_candidates <= page_size);
+        assert!(diagnostics.max_page_capacity <= page_size);
+        assert_eq!(index.len(), 0, "one full pass prunes every dead entry");
+        diagnostics
+    }
+
+    #[test]
+    fn expiration_index_scale_twin_uses_bounded_pages_and_read_only_observe() {
+        const ENTRY_COUNT: usize = 12;
+        const PAGE_SIZE: usize = 3;
+        const ANCHOR: u64 = 5;
+        const REPLACED_ID: u64 = 6;
+
+        let (directory, store) = store("scale-twin");
+        let index = ExpiringStreams::default();
+        index.seed_dead_range_for_test(0, ENTRY_COUNT);
+        install_replaced_dead_scale_entry(&index, &store, REPLACED_ID);
+        assert_eq!(index.len(), ENTRY_COUNT);
+        let diagnostics = assert_scale_pass(&index, ENTRY_COUNT, PAGE_SIZE, ANCHOR, 2);
+        assert_eq!(
+            diagnostics,
+            IndexPassDiagnostics {
+                pages: 4,
+                completed_passes: 1,
+                candidates: 12,
+                pruned_dead: 12,
+                wrapped_pages: 2,
+                max_page_candidates: 3,
+                max_page_capacity: 3,
+            }
+        );
+
+        // The production Observe path classifies a due stream but owns no
+        // retirement callback. The stream remains registered and unfenced.
+        let observed_stream = streams(&store, &["scale-observe"]).pop().unwrap();
+        observed_stream.shared.write().unwrap().last_access = UNIX_EPOCH;
+        let observed = observe_page(
+            &store,
+            ExpirationCursor::start(),
+            UNIX_EPOCH + Duration::from_secs(61),
+        );
+        assert_eq!(observed.due_count, 1);
+        assert_eq!(observed.due_streams.len(), 1);
+        assert!(store
+            .registered_stream("scale-observe")
+            .is_some_and(|current| Arc::ptr_eq(&current, &observed_stream)));
+        assert!(!observed_stream.fenced.load(Ordering::Acquire));
+        assert!(!observed_stream.meta_dirty.load(Ordering::Acquire));
+        drop(observed);
+
+        // Off is a level-complete no-op: it starts no task and does not scan
+        // or retire the observed identity.
+        let off = ExpirationScanner::start(&store, scanner_config(ExpirationReaperMode::Off));
+        assert!(off.task.is_none());
+        let off_snapshot = off.snapshot_at(Instant::now());
+        assert_eq!(off_snapshot.total_pages, 0);
+        assert_eq!(off_snapshot.outcomes, ExpirationOutcomeCounts::default());
+        drop(off);
+        assert!(store
+            .registered_stream("scale-observe")
+            .is_some_and(|current| Arc::ptr_eq(&current, &observed_stream)));
+        assert!(!observed_stream.fenced.load(Ordering::Acquire));
+
+        drop(observed_stream);
+        drop(index);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    #[ignore = "release-only one-million-entry expiration-index qualification"]
+    fn expiration_index_one_million_entry_qualification() {
+        const ENTRY_COUNT: usize = 1_000_000;
+        const PAGE_SIZE: usize = 10_000;
+        const ANCHOR: u64 = 499_999;
+        const REPLACED_ID: u64 = 500_000;
+
+        let (directory, store) = store("scale-million");
+        let index = ExpiringStreams::default();
+        index.seed_dead_range_for_test(0, ENTRY_COUNT);
+        install_replaced_dead_scale_entry(&index, &store, REPLACED_ID);
+        assert_eq!(index.len(), ENTRY_COUNT);
+
+        let started = Instant::now();
+        let diagnostics = assert_scale_pass(&index, ENTRY_COUNT, PAGE_SIZE, ANCHOR, 50);
+        let elapsed = started.elapsed();
+        eprintln!(
+            "expiration-index qualification elapsed_ms={} entries={} pages={} candidates={} pruned_dead={} wrapped_pages={} max_page_candidates={} max_page_capacity={}",
+            elapsed.as_millis(),
+            ENTRY_COUNT,
+            diagnostics.pages,
+            diagnostics.candidates,
+            diagnostics.pruned_dead,
+            diagnostics.wrapped_pages,
+            diagnostics.max_page_candidates,
+            diagnostics.max_page_capacity,
+        );
+
+        drop(index);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
