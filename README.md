@@ -99,6 +99,7 @@ durable, single-node server on `127.0.0.1:4437` with its data dir under `$TMPDIR
 | `--port`                 | `4437`                         | listen port (the protocol default, PROTOCOL.md §13.1)           |
 | `--data-dir`             | `$TMPDIR/durable-streams-rust` | storage directory. **Required with `--durability wal`** — the default is a temp dir, so wal would fsync every append and discard it on restart; the server refuses that combination at startup rather than let it look healthy. Optional in `memory` mode, which makes no durability claim. |
 | `--long-poll-timeout-ms` | `30000`                        | how long a `live=long-poll` request blocks before returning 204 |
+| `--max-chunk-bytes`      | `4194304` (4 MiB)              | maximum bytes one read response may carry (PROTOCOL.md §5.6, and the upstream reference server's own budget). A larger backlog is served as pages: the response omits `Stream-Up-To-Date` and the client continues from `Stream-Next-Offset`. `0` = unlimited (one response for the whole remainder). Env fallback: `DS_MAX_CHUNK_BYTES`; the flag wins. |
 
 **Durability** — controls how appends are made durable. See [ARCHITECTURE.md › Durability modes](ARCHITECTURE.md#durability-modes).
 
@@ -182,8 +183,8 @@ not the server. Options, in order of preference:
 ### Run-configuration matrix
 
 Every run configuration — durability (`wal` vs `memory`), resident tail cache
-on/off, read-offload — is **protocol-equivalent**, and CI runs the full
-conformance suite once per configuration (the `conformance` matrix in
+on/off, read-offload, response chunk size — is **protocol-equivalent**, and CI
+runs the full conformance suite once per configuration (the `conformance` matrix in
 `.github/workflows/ci.yml`; flags are passed via `RUST_SERVER_ARGS`, e.g.
 `RUST_SERVER_ARGS="--durability memory" bun run test:conformance`).
 

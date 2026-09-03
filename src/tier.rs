@@ -111,16 +111,45 @@ const COMMA: u8 = b',';
 /// no such boundary exists at or before `limit` (e.g. a single value larger than
 /// `limit`, in which case the caller should wait for it to complete rather than
 /// split mid-value).
-///
-/// The scan is a byte-level state machine that ignores commas/brackets/braces
-/// inside JSON strings and honours backslash escapes, exactly like stratovolt's
-/// boundary finder. It tracks the last in-bounds top-level comma seen.
 pub fn last_json_value_boundary(data: &[u8], limit: u64) -> u64 {
-    let limit = (limit as usize).min(data.len());
+    let limit = (limit as usize).min(data.len()) as u64;
+    let mut last_boundary = 0u64;
+    scan_json_value_boundaries(data, |boundary| {
+        if boundary <= limit {
+            last_boundary = boundary;
+            true
+        } else {
+            // We've passed the limit; no further in-bounds boundary can be
+            // larger, so stop.
+            false
+        }
+    });
+    last_boundary
+}
+
+/// The SMALLEST cut length `k` such that `data[..k]` ends exactly on a top-level
+/// value separator — i.e. exactly one whole value. Returns 0 when `data` holds
+/// no complete value. Used by the read path to honour "never return an empty
+/// page when data exists": a single value larger than the response chunk cap is
+/// served whole rather than split (PROTOCOL.md §5.6).
+pub fn first_json_value_boundary(data: &[u8]) -> u64 {
+    let mut first_boundary = 0u64;
+    scan_json_value_boundaries(data, |boundary| {
+        first_boundary = boundary;
+        false
+    });
+    first_boundary
+}
+
+/// Byte-level state machine over the JSON wire form: calls `on_boundary(k)` for
+/// each `k` where `data[..k]` ends just past a TOP-LEVEL `,` (commas, brackets
+/// and braces inside strings are ignored, backslash escapes honoured — exactly
+/// like stratovolt's boundary finder). Scanning stops when `on_boundary`
+/// returns `false`.
+fn scan_json_value_boundaries(data: &[u8], mut on_boundary: impl FnMut(u64) -> bool) {
     let mut depth: i32 = 0;
     let mut in_string = false;
     let mut escape = false;
-    let mut last_boundary: usize = 0;
     let mut pos = 0usize;
     while pos < data.len() {
         let b = data[pos];
@@ -148,21 +177,17 @@ pub fn last_json_value_boundary(data: &[u8], limit: u64) -> u64 {
             }
             COMMA if depth == 0 => {
                 // `data[..pos+1]` ends just past this top-level comma — a clean
-                // value boundary. Record it if still within the limit.
-                let boundary = pos + 1;
-                if boundary <= limit {
-                    last_boundary = boundary;
-                } else {
-                    // We've passed the limit; no further in-bounds boundary can
-                    // be larger, so stop.
-                    break;
+                // value boundary. The callback decides whether later boundaries
+                // are still interesting.
+                let keep_scanning = on_boundary(pos as u64 + 1);
+                if !keep_scanning {
+                    return;
                 }
             }
             _ => {}
         }
         pos += 1;
     }
-    last_boundary as u64
 }
 
 // ---------------- runtime tiering config ----------------

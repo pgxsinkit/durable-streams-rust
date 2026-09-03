@@ -36,6 +36,51 @@ bun run test:conformance
 The harness resolves Cargo's configured target directory, bootstraps the WAL
 store identity when needed, and enables the subscription suite.
 
+## Chunked catch-up reads (§5.6)
+
+Section 5.6 defines a catch-up read as returning bytes from the requested offset
+"up to a server-defined maximum chunk size", with `Stream-Next-Offset` as the
+cursor for the next request. `Stream-Up-To-Date: true` MUST be present only when
+the response includes all data available at that moment and "SHOULD NOT be
+present when returning partial data due to server-defined chunk size limits";
+`Stream-Closed` likewise belongs to the response that reaches the final offset
+and "SHOULD NOT be present when returning partial data from a closed stream".
+
+This server previously defined no maximum: one `GET` returned the entire
+remainder of a stream, so a client that buffers and parses a response scaled its
+memory with the stream rather than with the request (measured: a single 65.6 MB
+JSON response of 9,421 items; four concurrent readers of a 250 MB stream killed
+a 3 GiB process).
+
+Reads are now bounded by `--max-chunk-bytes` (env `DS_MAX_CHUNK_BYTES`), default
+**4 MiB** — the same per-response budget the upstream reference server applies
+(`MAX_READ_BATCH_BYTES` in `packages/server-cloudflare/src/stream-object.ts`), so
+a paginating client sees the same page sizes here as upstream. `0` restores the
+previous unlimited behavior for operators who want it.
+
+A capped page:
+
+- ends on a boundary that keeps the response well-formed. Byte streams cut at
+  any byte; JSON streams cut only just past a top-level value separator, using
+  the same `last_json_value_boundary` scanner the tiering path uses to seal
+  segments, so every page is a whole number of values and still parses as a JSON
+  array. A single value larger than the cap is returned whole rather than split —
+  a page with data available is never empty.
+- reports the aligned end as `Stream-Next-Offset`, omits `Stream-Up-To-Date`, and
+  omits `Stream-Closed` (a closed stream is closed *to the reader* only once the
+  page that reaches the tail is delivered). The `ETag` covers the range actually
+  returned, so a partial page and a later full-tail page never share a validator.
+
+The cap applies to long-poll responses too: chunk semantics are a property of a
+read, and a woken long-poll consumer is often the one furthest behind. The
+client already advances by `Stream-Next-Offset`, and the omitted
+`Stream-Up-To-Date` tells it to come straight back for the remainder. SSE is
+unaffected — it is already an incremental framing.
+
+CI runs the published conformance suite once more with `--max-chunk-bytes 4096`
+(the `wal-small-chunk` matrix entry) so the contract is exercised with chunking
+forced on nearly every read.
+
 ## Production behavior beyond the published fixture
 
 The six upstream subscription cases do not exercise restart and deployment

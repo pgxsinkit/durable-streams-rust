@@ -36,6 +36,26 @@ pub fn set_long_poll_timeout(ms: u64) {
     LONG_POLL_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Default server-defined maximum response chunk size (PROTOCOL.md §5.6): 4 MiB,
+/// the same budget the upstream reference server uses (`MAX_READ_BATCH_BYTES` in
+/// `packages/server-cloudflare/src/stream-object.ts`), so a reader paginating
+/// against this server sees the same page sizes it would upstream. Without a cap
+/// one GET returns the whole remainder of a stream, and a client that buffers
+/// and parses the body scales its memory with the stream, not with the request.
+pub const DEFAULT_MAX_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+
+static MAX_CHUNK_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_MAX_CHUNK_BYTES);
+
+/// Set the maximum bytes one read response may carry; `0` = unlimited.
+pub fn set_max_chunk_bytes(bytes: u64) {
+    MAX_CHUNK_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn max_chunk_bytes() -> u64 {
+    MAX_CHUNK_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // ---------- durability mode ----------
 
 /// Server durability mode, chosen at startup via `--durability`.
@@ -76,11 +96,12 @@ pub fn durability() -> DurabilityMode {
 /// guard for its entire body; two such tests are then mutually exclusive.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{set_durability, DurabilityMode};
+    use super::{set_durability, set_max_chunk_bytes, DurabilityMode, DEFAULT_MAX_CHUNK_BYTES};
     use std::sync::{Arc, Mutex, MutexGuard};
     use tokio::sync::Notify;
 
     static MODE_LOCK: Mutex<()> = Mutex::new(());
+    static CHUNK_LOCK: Mutex<()> = Mutex::new(());
     static APPEND_HOOK: Mutex<Option<Arc<AppendHook>>> = Mutex::new(None);
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +196,24 @@ pub(crate) mod test_support {
     impl Drop for DurabilityGuard {
         fn drop(&mut self) {
             set_durability(DurabilityMode::Wal);
+        }
+    }
+
+    /// Pins the process-wide read chunk cap for one test (it is a global, like
+    /// the durability mode) and restores the default on drop.
+    pub(crate) struct MaxChunkGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl MaxChunkGuard {
+        pub(crate) fn bytes(cap: u64) -> Self {
+            let g = CHUNK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            set_max_chunk_bytes(cap);
+            MaxChunkGuard(g)
+        }
+    }
+
+    impl Drop for MaxChunkGuard {
+        fn drop(&mut self) {
+            set_max_chunk_bytes(DEFAULT_MAX_CHUNK_BYTES);
         }
     }
 }
@@ -2011,6 +2050,57 @@ async fn read_range_body(
     }
 }
 
+/// Cap a read of `[start, tail)` at the configured maximum chunk size
+/// (PROTOCOL.md §5.6: "up to a server-defined maximum chunk size"), returning
+/// the end offset the response should actually carry. `tail` means nothing was
+/// capped; anything smaller is a partial page whose response MUST omit
+/// `Stream-Up-To-Date` and leave `Stream-Closed` to the page that reaches the
+/// tail.
+///
+/// The cut has to keep the response well-formed. Byte streams may be cut
+/// anywhere. JSON streams are stored as the wire form `value,value,…,` and are
+/// served wrapped as `[ … ]` (`read_range_body` strips the final `,` via its
+/// `end - 1` framing), so a JSON cut may only land just past a TOP-LEVEL comma —
+/// the same value-boundary rule the tier's sealing path applies, using the same
+/// `last_json_value_boundary` scanner.
+///
+/// Finding that boundary costs one extra materializing read of the candidate
+/// window before the body itself is served — bounded by the cap, so it scales
+/// with the response, never with the stream. When one value is larger than the
+/// cap there is no in-cap boundary: rather than return an empty page, the window
+/// grows until that value completes and the single oversize value is served.
+async fn chunk_capped_end(st: &Arc<StreamState>, start: u64, tail: u64) -> u64 {
+    let cap = max_chunk_bytes();
+    if cap == 0 || tail.saturating_sub(start) <= cap {
+        return tail;
+    }
+    if !st.is_json {
+        return start + cap;
+    }
+    let mut window = cap;
+    loop {
+        let window_end = (start + window).min(tail);
+        // A short/failed read must not be mistaken for "no boundary here": fall
+        // back to the uncapped tail and let the body read report the failure.
+        let Ok(data) = read_range_bytes(st, start, window_end).await else {
+            return tail;
+        };
+        let boundary = if window == cap {
+            crate::tier::last_json_value_boundary(&data, cap)
+        } else {
+            // Past the cap we are only completing one oversize value.
+            crate::tier::first_json_value_boundary(&data)
+        };
+        if boundary > 0 {
+            return start + boundary;
+        }
+        if window_end >= tail {
+            return tail;
+        }
+        window = window.saturating_mul(2);
+    }
+}
+
 /// Per-item read window for the local parts of a streamed cold/mixed read.
 /// Remote parts are already one range-GET per sealed segment (the natural unit:
 /// one object = one segment, so per-segment GETs minimize object-store
@@ -2277,32 +2367,50 @@ async fn handle_catchup(
         now_mode,
         next_offset,
     } = resolve_start(offset, t.bytes);
-    let end = t.bytes;
+    // A catch-up read returns bytes from `start` up to the server-defined
+    // maximum chunk size (PROTOCOL.md §5.6); `Stream-Next-Offset` is the cursor
+    // for the client's next request. In sentinel mode the range is empty, so the
+    // cap is a no-op there.
+    let end = chunk_capped_end(&st, start, t.bytes).await;
+    let partial = end < t.bytes;
+    // §5.6: `Stream-Up-To-Date` MUST be present only when the response includes
+    // all data available at that moment, and SHOULD NOT be present when data is
+    // withheld by the chunk-size limit. `Stream-Closed` likewise belongs to the
+    // page that actually reaches the final offset — a reader discovers closure
+    // by requesting the next offset.
+    let up_to_date = !partial;
+    let closed = t.closed && !partial;
     // In sentinel mode (offset=now or a beyond-tail offset) the range is empty
     // (`start == end == tail`); report the resolved next offset — the requested
     // offset for a beyond-tail read (PROTOCOL.md §5.5). Otherwise report the
-    // tail reached by the catch-up read.
+    // tail (or capped end) reached by the catch-up read.
     let reported = if now_mode { next_offset } else { end };
     // No ETag for offset=now (§10.1) — it's a tail sentinel, not a cacheable range.
-    let etag = (!now_mode).then(|| st.etag(start, end, t.closed));
+    // It covers the range actually returned, so a partial page and the later
+    // full-tail page never share a validator.
+    let etag = (!now_mode).then(|| st.etag(start, end, closed));
     if let Some(etag) = &etag {
         if header_str(req, "if-none-match") == Some(etag.as_str()) {
             let mut b = ResponseBuilder::new(304)
                 .h("etag", etag.clone())
-                .h(H_NEXT_OFFSET, format_offset(reported))
-                .hs(H_UP_TO_DATE, "true");
-            if t.closed {
+                .h(H_NEXT_OFFSET, format_offset(reported));
+            if up_to_date {
+                b = b.hs(H_UP_TO_DATE, "true");
+            }
+            if closed {
                 b = b.hs(H_CLOSED, "true");
             }
             return b.body(empty());
         }
+    }
+    if partial {
+        crate::telemetry::record_chunk_capped("catchup");
     }
     // Catch-up read of historical bytes: not a live tail feed.
     let body = read_range_body(&st, start, end, false, "catchup", cache_hit).await;
     let mut b = ResponseBuilder::new(200)
         .h("content-type", st.config.content_type.clone())
         .h(H_NEXT_OFFSET, format_offset(reported))
-        .hs(H_UP_TO_DATE, "true")
         .h(
             "cache-control",
             if now_mode {
@@ -2311,10 +2419,13 @@ async fn handle_catchup(
                 CACHEABLE.to_string()
             },
         );
+    if up_to_date {
+        b = b.hs(H_UP_TO_DATE, "true");
+    }
     if let Some(etag) = etag {
         b = b.h("etag", etag);
     }
-    if t.closed {
+    if closed {
         b = b.hs(H_CLOSED, "true");
     }
     b.body(body)
@@ -2397,15 +2508,30 @@ async fn long_poll_data(
     cache_hit: &mut bool,
 ) -> Resp {
     let cursor = compute_cursor(client_cursor);
-    let body = read_range_body(st, from, t.bytes, hot, "long-poll", cache_hit).await;
+    // The chunk cap is a property of a READ, not of the catch-up path: a
+    // long-poll that wakes on (or returns) a large backlog would otherwise
+    // deliver the whole remainder in one response — the very case the cap
+    // exists for, since a woken consumer is often the furthest behind. The
+    // client already advances by `Stream-Next-Offset`, and omitting
+    // `Stream-Up-To-Date` tells it to come straight back for the rest.
+    let end = chunk_capped_end(st, from, t.bytes).await;
+    let partial = end < t.bytes;
+    let up_to_date = !partial;
+    let closed = t.closed && !partial;
+    if partial {
+        crate::telemetry::record_chunk_capped("long-poll");
+    }
+    let body = read_range_body(st, from, end, hot, "long-poll", cache_hit).await;
     let mut b = ResponseBuilder::new(200)
         .h("content-type", st.config.content_type.clone())
-        .h(H_NEXT_OFFSET, format_offset(t.bytes))
+        .h(H_NEXT_OFFSET, format_offset(end))
         .h(H_CURSOR, cursor.to_string())
-        .h("etag", st.etag(from, t.bytes, t.closed))
-        .hs(H_UP_TO_DATE, "true")
+        .h("etag", st.etag(from, end, closed))
         .hs("cache-control", CACHEABLE);
-    if t.closed {
+    if up_to_date {
+        b = b.hs(H_UP_TO_DATE, "true");
+    }
+    if closed {
         b = b.hs(H_CLOSED, "true");
     }
     b.body(body)
@@ -4499,5 +4625,385 @@ mod memory_mode_tests {
         drop(hook);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod chunk_cap_tests {
+    //! Read responses are bounded by the server-defined maximum chunk size
+    //! (PROTOCOL.md §5.6): a capped page omits `Stream-Up-To-Date`, reports the
+    //! aligned end as `Stream-Next-Offset`, and leaves `Stream-Closed` to the
+    //! page that reaches the tail.
+    use super::*;
+    use crate::api::{Method, Req};
+    use crate::store::Store;
+    use crate::tier::TierConfig;
+    use bytes::Bytes;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let p = std::env::temp_dir().join(format!(
+            "ds-chunk-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn put_req(path: &str, content_type: &str) -> Req {
+        Req {
+            method: Method::Put,
+            path: path.to_string(),
+            query: None,
+            headers: vec![("content-type".to_string(), content_type.to_string())],
+            body: Bytes::new(),
+        }
+    }
+
+    fn post_req(path: &str, content_type: &str, body: &[u8]) -> Req {
+        Req {
+            method: Method::Post,
+            path: path.to_string(),
+            query: None,
+            headers: vec![("content-type".to_string(), content_type.to_string())],
+            body: Bytes::copy_from_slice(body),
+        }
+    }
+
+    fn close_req(path: &str) -> Req {
+        Req {
+            method: Method::Post,
+            path: path.to_string(),
+            query: None,
+            headers: vec![("stream-closed".to_string(), "true".to_string())],
+            body: Bytes::new(),
+        }
+    }
+
+    fn get_req(path: &str, offset: Option<u64>) -> Req {
+        Req {
+            method: Method::Get,
+            path: path.to_string(),
+            query: offset.map(|o| format!("offset={}", format_offset(o))),
+            headers: vec![],
+            body: Bytes::new(),
+        }
+    }
+
+    fn header<'a>(resp: &'a Resp, name: &str) -> Option<&'a str> {
+        resp.headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn next_offset(resp: &Resp) -> u64 {
+        header(resp, H_NEXT_OFFSET)
+            .expect("every read reports Stream-Next-Offset")
+            .rsplit('_')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn up_to_date(resp: &Resp) -> bool {
+        header(resp, H_UP_TO_DATE) == Some("true")
+    }
+
+    fn body_bytes(body: Body) -> Vec<u8> {
+        match body {
+            Body::Empty => Vec::new(),
+            Body::Full(b) => b.to_vec(),
+            Body::FileRange {
+                segments,
+                prefix,
+                suffix,
+                ..
+            } => {
+                let mut out = prefix.to_vec();
+                out.extend_from_slice(&crate::store::materialize_segments(&segments));
+                out.extend_from_slice(suffix);
+                out
+            }
+            _ => panic!("unexpected streaming body for a catch-up read"),
+        }
+    }
+
+    async fn create(store: &Arc<Store>, path: &str, content_type: &str) {
+        let resp = handle(Arc::clone(store), put_req(path, content_type)).await;
+        assert_eq!(resp.status, 201, "create {path}");
+    }
+
+    async fn append(store: &Arc<Store>, path: &str, content_type: &str, body: &[u8]) {
+        let resp = handle(Arc::clone(store), post_req(path, content_type, body)).await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "append to {path}: {}",
+            resp.status
+        );
+    }
+
+    async fn read(store: &Arc<Store>, path: &str, offset: Option<u64>) -> Resp {
+        handle(Arc::clone(store), get_req(path, offset)).await
+    }
+
+    fn json_item(index: usize, pad: usize) -> String {
+        format!(r#"{{"i":{index},"pad":"{}"}}"#, "a".repeat(pad))
+    }
+
+    /// A JSON stream larger than the cap is paged: each page is a valid JSON
+    /// array cut on a value boundary, carries no `Stream-Up-To-Date`, and the
+    /// follow-up read from its `Stream-Next-Offset` returns the rest.
+    #[tokio::test]
+    async fn json_pages_are_valid_arrays_and_resume_from_next_offset() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(512);
+        let dir = tmp("json-pages");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "c/json", "application/json").await;
+        for i in 0..40 {
+            append(
+                &store,
+                "c/json",
+                "application/json",
+                json_item(i, 60).as_bytes(),
+            )
+            .await;
+        }
+        let tail = store.streams.get("c/json").unwrap().tail().bytes;
+
+        let first = read(&store, "c/json", None).await;
+        assert_eq!(first.status, 200);
+        assert!(
+            !up_to_date(&first),
+            "a chunk-capped page must not claim Stream-Up-To-Date (§5.6)"
+        );
+        let cut = next_offset(&first);
+        assert!(
+            cut > 0 && cut < tail,
+            "partial next offset: {cut} of {tail}"
+        );
+        assert!(cut <= 512, "the page must respect the cap, got {cut} bytes");
+
+        let mut seen: Vec<serde_json::Value> = Vec::new();
+        let mut offset = None;
+        let mut pages = 0;
+        loop {
+            let resp = read(&store, "c/json", offset).await;
+            assert_eq!(resp.status, 200);
+            pages += 1;
+            assert!(pages < 100, "paging must terminate");
+            let done = up_to_date(&resp);
+            let at = next_offset(&resp);
+            let body = body_bytes(resp.body);
+            let parsed: Vec<serde_json::Value> = serde_json::from_slice(&body)
+                .unwrap_or_else(|e| panic!("page must be a valid JSON array: {e}"));
+            seen.extend(parsed);
+            if done {
+                assert_eq!(at, tail, "the final page reports the tail");
+                break;
+            }
+            offset = Some(at);
+        }
+        assert!(pages > 1, "the stream must have been split into pages");
+        assert_eq!(seen.len(), 40, "every appended value is delivered once");
+        for (i, value) in seen.iter().enumerate() {
+            assert_eq!(
+                value["i"],
+                serde_json::json!(i as i64),
+                "values stay ordered"
+            );
+        }
+    }
+
+    /// A byte stream may be cut at any byte: the page is exactly the cap.
+    #[tokio::test]
+    async fn byte_stream_is_cut_at_the_cap() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(256);
+        let dir = tmp("bytes-cut");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "c/bytes", "application/octet-stream").await;
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        append(&store, "c/bytes", "application/octet-stream", &payload).await;
+
+        let first = read(&store, "c/bytes", None).await;
+        assert_eq!(next_offset(&first), 256);
+        assert!(!up_to_date(&first));
+        let head = body_bytes(first.body);
+        assert_eq!(head, payload[..256], "the page is the first cap bytes");
+
+        let mut all = head;
+        let mut offset = 256;
+        loop {
+            let resp = read(&store, "c/bytes", Some(offset)).await;
+            let done = up_to_date(&resp);
+            offset = next_offset(&resp);
+            all.extend_from_slice(&body_bytes(resp.body));
+            if done {
+                break;
+            }
+        }
+        assert_eq!(all, payload, "paging reassembles the stream exactly");
+    }
+
+    /// `--max-chunk-bytes 0` restores the uncapped single-response behaviour.
+    #[tokio::test]
+    async fn cap_zero_is_unlimited() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(0);
+        let dir = tmp("cap-zero");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "c/unlimited", "application/octet-stream").await;
+        let payload = vec![b'x'; 100_000];
+        append(&store, "c/unlimited", "application/octet-stream", &payload).await;
+
+        let resp = read(&store, "c/unlimited", None).await;
+        assert!(up_to_date(&resp), "an uncapped read is up to date");
+        assert_eq!(next_offset(&resp), 100_000);
+        assert_eq!(body_bytes(resp.body).len(), 100_000);
+    }
+
+    /// A single JSON value larger than the cap has no in-cap value boundary. The
+    /// page must never come back empty: the oversize value is served whole.
+    #[tokio::test]
+    async fn oversize_json_value_is_served_whole() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(64);
+        let dir = tmp("oversize-json");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "c/big", "application/json").await;
+        let big = json_item(0, 4000);
+        append(&store, "c/big", "application/json", big.as_bytes()).await;
+        append(
+            &store,
+            "c/big",
+            "application/json",
+            json_item(1, 8).as_bytes(),
+        )
+        .await;
+
+        let resp = read(&store, "c/big", None).await;
+        assert_eq!(resp.status, 200);
+        assert!(!up_to_date(&resp), "more values remain after the big one");
+        assert_eq!(
+            next_offset(&resp),
+            big.len() as u64 + 1,
+            "the cut lands just past the oversize value's separator"
+        );
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_slice(&body_bytes(resp.body)).unwrap();
+        assert_eq!(parsed.len(), 1, "exactly the oversize value is returned");
+        assert_eq!(parsed[0]["i"], serde_json::json!(0));
+    }
+
+    /// A closed stream is closed *to the reader* only once the last page is
+    /// delivered: intermediate pages must not claim `Stream-Closed` (§5.6).
+    #[tokio::test]
+    async fn closed_is_reported_only_on_the_final_page() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(128);
+        let dir = tmp("closed-pages");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "c/closed", "application/octet-stream").await;
+        append(
+            &store,
+            "c/closed",
+            "application/octet-stream",
+            &vec![b'y'; 500],
+        )
+        .await;
+        assert!((200..300).contains(
+            &handle(Arc::clone(&store), close_req("c/closed"))
+                .await
+                .status
+        ));
+
+        let first = read(&store, "c/closed", None).await;
+        assert!(
+            header(&first, H_CLOSED).is_none(),
+            "a partial page of a closed stream must not report Stream-Closed"
+        );
+        assert!(!up_to_date(&first));
+
+        let mut offset = next_offset(&first);
+        let mut last = first;
+        while !up_to_date(&last) {
+            last = read(&store, "c/closed", Some(offset)).await;
+            offset = next_offset(&last);
+        }
+        assert_eq!(offset, 500);
+        assert_eq!(
+            header(&last, H_CLOSED),
+            Some("true"),
+            "the page that reaches the tail reports closure"
+        );
+    }
+
+    /// The ETag covers the range actually returned, and a conditional request
+    /// for a capped page answers 304 with the same partial-page headers.
+    #[tokio::test]
+    async fn conditional_request_matches_the_partial_page() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(128);
+        let dir = tmp("partial-etag");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "c/etag", "application/octet-stream").await;
+        append(
+            &store,
+            "c/etag",
+            "application/octet-stream",
+            &vec![b'z'; 400],
+        )
+        .await;
+
+        let first = read(&store, "c/etag", None).await;
+        let etag = header(&first, "etag")
+            .expect("a range read is cacheable")
+            .to_string();
+        let mut conditional = get_req("c/etag", None);
+        conditional
+            .headers
+            .push(("if-none-match".into(), etag.clone()));
+        let resp = handle(Arc::clone(&store), conditional).await;
+        assert_eq!(resp.status, 304);
+        assert_eq!(next_offset(&resp), 128);
+        assert!(
+            !up_to_date(&resp),
+            "the 304 for a partial page must not claim up-to-date either"
+        );
+    }
+
+    /// A long-poll that returns a backlog is a read like any other: the same cap
+    /// applies, so one wake cannot deliver a whole stream.
+    #[tokio::test]
+    async fn long_poll_backlog_is_capped() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(256);
+        let dir = tmp("long-poll-cap");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "c/lp", "application/octet-stream").await;
+        append(&store, "c/lp", "application/octet-stream", &vec![b'q'; 900]).await;
+
+        let resp = handle(
+            Arc::clone(&store),
+            Req {
+                method: Method::Get,
+                path: "c/lp".into(),
+                query: Some(format!("live=long-poll&offset={}", format_offset(0))),
+                headers: vec![],
+                body: Bytes::new(),
+            },
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(next_offset(&resp), 256);
+        assert!(!up_to_date(&resp), "a capped long-poll page is partial");
+        assert_eq!(body_bytes(resp.body).len(), 256);
     }
 }
