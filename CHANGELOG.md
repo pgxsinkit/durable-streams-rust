@@ -21,6 +21,14 @@
   data/control pairs instead of one event framing the whole remainder. Capped
   `text/*` frames are cut on UTF-8 character boundaries.
 
+- Advertise the effective read chunk cap in the store readiness document.
+
+  `GET /_admin/ready` now carries a top-level `max_chunk_bytes` (the effective
+  `--max-chunk-bytes`, `0` when reads are uncapped). The field is always present, so a
+  client reading readiness at boot can size its own response buffer against the page the
+  store will actually serve instead of guessing — previously the cap was unobservable
+  and a consumer could only assume an unbounded response.
+
 ## 0.1.5
 
 ### Patch Changes

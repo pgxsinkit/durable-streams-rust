@@ -113,6 +113,38 @@ CI runs the published conformance suite once more with `--max-chunk-bytes 4096`
 (the `wal-small-chunk` matrix entry) so the contract is exercised with chunking
 forced on nearly every read.
 
+### The cap is advertised in the readiness document
+
+A cap the client cannot see is a cap the client has to guess at. `GET
+/_admin/ready` therefore carries the effective value as a top-level
+`max_chunk_bytes` (integer bytes) alongside `manifest`, `recovery` and
+`reserve`:
+
+```json
+{
+  "contract_version": "durable-streams-store-ready-v1",
+  "status": "ready",
+  "artifact_digest": "sha256:...",
+  "manifest": { "...": "..." },
+  "recovery": { "...": "..." },
+  "reserve": { "...": "..." },
+  "max_chunk_bytes": 4194304
+}
+```
+
+The field is **always present**, and `0` means uncapped. An absent field and a
+`0` would otherwise be indistinguishable to a reader, and the two are not the
+same claim: absent means "this store predates the field", `0` means "this store
+will hand you the whole remainder in one response". A consumer that sizes its
+own response buffer from readiness — the Electric Circuits engine checks it once
+at boot and falls back to a larger client-side body cap when the store says
+nothing — can then tell an older store from a deliberately uncapped one.
+
+`contract_version` stays `durable-streams-store-ready-v1`. The change is
+additive: it adds a field to the document and removes none, so a reader written
+against the earlier v1 shape still parses this one. Reserving a version bump for
+a breaking change is what keeps the version meaningful.
+
 ## Production behavior beyond the published fixture
 
 The six upstream subscription cases do not exercise restart and deployment

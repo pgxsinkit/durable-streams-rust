@@ -28,6 +28,11 @@ struct ReadyResponse<'a> {
     manifest: &'a StoreManifestV1,
     recovery: Recovery,
     reserve: Reserve,
+    /// Effective `--max-chunk-bytes`: the largest body one read response may
+    /// carry (PROTOCOL.md §5.6). Always present, `0` when reads are uncapped,
+    /// so a client can size its own response buffer from the readiness
+    /// document instead of guessing.
+    max_chunk_bytes: u64,
 }
 #[derive(Serialize)]
 struct Recovery {
@@ -123,6 +128,7 @@ impl AdminReadiness {
                 minimum_free_inodes: self.minimum_free_inodes,
                 satisfied: reserve_ok,
             },
+            max_chunk_bytes: crate::handlers::max_chunk_bytes(),
         })
         .expect("ready response serializes");
         (if completed && reserve_ok { 200 } else { 503 }, body)
@@ -176,6 +182,47 @@ mod tests {
             creation_time: "2026-08-27T19:00:00Z".into(),
         }
     }
+    /// The readiness document is how a client learns the store's read page
+    /// budget before its first read. `--max-chunk-bytes` is what the read path
+    /// applies, so that is the number readiness must publish.
+    #[test]
+    fn readiness_advertises_the_configured_read_chunk_cap() {
+        let _settings =
+            crate::handlers::test_support::DurabilityGuard::memory_with_max_chunk(65_536);
+        let readiness = AdminReadiness::new(
+            manifest(),
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            0,
+            0,
+        );
+        readiness.ready();
+        let (_, body) = readiness.json(std::path::Path::new("."));
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["max_chunk_bytes"], 65_536);
+    }
+
+    /// `--max-chunk-bytes 0` (unlimited) must be advertised as `0`, not by
+    /// omitting the field: a client cannot distinguish an absent field from an
+    /// older store that does not publish one, so the field is always present.
+    #[test]
+    fn uncapped_reads_are_advertised_as_zero_rather_than_omitted() {
+        let _settings = crate::handlers::test_support::DurabilityGuard::memory_with_max_chunk(0);
+        let readiness = AdminReadiness::new(
+            manifest(),
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            0,
+            0,
+        );
+        readiness.ready();
+        let (_, body) = readiness.json(std::path::Path::new("."));
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body.as_object().unwrap().contains_key("max_chunk_bytes"),
+            "an uncapped store must still publish the field: {body}"
+        );
+        assert_eq!(body["max_chunk_bytes"], 0);
+    }
+
     #[test]
     fn reserve_failed_readiness_is_503_and_never_ready() {
         *TEST_FILESYSTEM_FREE.lock().unwrap() = Some((1, 1));
