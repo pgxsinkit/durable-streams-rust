@@ -56,6 +56,12 @@ pub fn max_chunk_bytes() -> u64 {
     MAX_CHUNK_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Bytes read by the JSON boundary scan (test-only observability: a boundary
+/// scan that re-reads the same bytes is the regression this counts).
+#[cfg(test)]
+pub(crate) static BOUNDARY_SCAN_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 // ---------- durability mode ----------
 
 /// Server durability mode, chosen at startup via `--durability`.
@@ -2052,8 +2058,11 @@ async fn read_range_body(
 
 /// Outcome of sizing one read response.
 enum ChunkEnd {
-    /// Serve `[start, end)`. `end == tail` means nothing was capped.
-    At(u64),
+    /// Serve `[start, end)`. `end == tail` means nothing was capped. `body`
+    /// carries the range's bytes when the sizing pass already read them, so the
+    /// response is framed from those instead of resolving and reading the same
+    /// range a second time.
+    At { end: u64, body: Option<Bytes> },
     /// A JSON range that does not decompose into whole top-level values: the
     /// requested offset is not a value boundary (only a client-fabricated offset
     /// can be — server-minted offsets, fork points and tier cuts all land on
@@ -2075,63 +2084,107 @@ enum ChunkEnd {
 /// tail.
 ///
 /// The cut has to keep the response well-formed. Byte streams may be cut
-/// anywhere. JSON streams are stored as the wire form `value,value,…,` and are
-/// served wrapped as `[ … ]` (`read_range_body` strips the final `,` via its
-/// `end - 1` framing), so a JSON cut may only land just past a TOP-LEVEL comma —
-/// the same value-boundary rule the tier's sealing path applies, using the same
-/// `last_json_value_boundary` scanner.
+/// anywhere — no read, no scan, so the common capped path stays zero-copy. JSON
+/// streams are stored as the wire form `value,value,…,` and are served wrapped
+/// as `[ … ]` (`read_range_body` strips the final `,` via its `end - 1`
+/// framing), so a JSON cut may only land just past a TOP-LEVEL comma — the same
+/// value-boundary rule the tier's sealing path applies, via the same scanner.
 ///
-/// Finding that boundary costs one extra materializing read of the candidate
-/// window before the body itself is served — bounded by the cap, so it scales
-/// with the response, never with the stream. When one value is larger than the
-/// cap there is no in-cap boundary: rather than return an empty page, the window
-/// grows until that value completes and the single oversize value is served. A
-/// window that reaches the tail with NO top-level boundary anywhere is not an
-/// oversize value — the range itself is inconsistent — and is reported as
+/// Finding that boundary means reading the range, so the bytes are handed back
+/// to be served directly: a capped JSON page is read ONCE, not once to scan and
+/// once to send (which on a cold tier is an extra range read per page). The scan
+/// walks forward in cap-sized windows and is resumable, so an oversize value —
+/// one larger than the cap, which must be framed whole because there is no
+/// smaller well-formed page — is located without re-reading what it already
+/// scanned. A range that reaches the tail with no top-level boundary anywhere is
+/// not an oversize value: the range itself is not value-aligned, reported as
 /// `NotAValueBoundary`.
 async fn chunk_capped_end(st: &Arc<StreamState>, start: u64, tail: u64) -> ChunkEnd {
     let cap = max_chunk_bytes();
     if cap == 0 || tail.saturating_sub(start) <= cap {
-        return ChunkEnd::At(tail);
+        return ChunkEnd::At {
+            end: tail,
+            body: None,
+        };
     }
     if !st.is_json {
-        return ChunkEnd::At(start + cap);
+        return ChunkEnd::At {
+            end: start + cap,
+            body: None,
+        };
     }
-    let mut window = cap;
-    loop {
-        let window_end = (start + window).min(tail);
-        let Ok(data) = read_range_bytes(st, start, window_end).await else {
+    let mut scan = crate::tier::JsonValueBoundaryScan::new();
+    let mut buffered = BytesMut::new();
+    let mut pos = start;
+    let mut last_in_cap = 0u64;
+    let mut first_past_cap = 0u64;
+    while pos < tail {
+        let window_end = (pos + cap).min(tail);
+        let Ok(data) = read_range_bytes(st, pos, window_end).await else {
             return ChunkEnd::ReadFailed;
         };
-        let boundary = if window == cap {
-            crate::tier::last_json_value_boundary(&data, cap)
-        } else {
-            // Past the cap we are only completing one oversize value.
-            crate::tier::first_json_value_boundary(&data)
-        };
-        if boundary > 0 {
-            return ChunkEnd::At(start + boundary);
+        #[cfg(test)]
+        BOUNDARY_SCAN_BYTES.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        scan.feed(&data, |boundary| {
+            if boundary <= cap {
+                last_in_cap = boundary;
+                true
+            } else {
+                // Past the cap: this is the end of the oversize first value, and
+                // no later boundary can be a better cut.
+                first_past_cap = boundary;
+                false
+            }
+        });
+        buffered.put_slice(&data);
+        pos = window_end;
+        if last_in_cap > 0 || first_past_cap > 0 {
+            break;
         }
-        if window_end >= tail {
-            // The whole remainder holds no top-level value separator, but the
-            // tail always sits just past one — so `start` is not a boundary.
-            tracing::warn!(
-                stream = %st.path,
-                start,
-                tail,
-                "JSON read offset is not a value boundary; refusing to serve a malformed page"
-            );
-            return ChunkEnd::NotAValueBoundary;
-        }
-        window = window.saturating_mul(2);
     }
+    let cut = if last_in_cap > 0 {
+        last_in_cap
+    } else {
+        first_past_cap
+    };
+    if cut == 0 {
+        // The whole remainder holds no top-level value separator, but the tail
+        // always sits just past one — so `start` is not a boundary.
+        tracing::warn!(
+            stream = %st.path,
+            start,
+            tail,
+            "JSON read offset is not a value boundary; refusing to serve a malformed page"
+        );
+        return ChunkEnd::NotAValueBoundary;
+    }
+    let mut body = buffered.freeze();
+    body.truncate(cut as usize);
+    ChunkEnd::At {
+        end: start + cut,
+        body: Some(body),
+    }
+}
+
+/// Frame already-materialized wire bytes as a response body: JSON drops the
+/// trailing `,` and wraps the values as an array, matching `read_range_body`.
+fn framed_body(st: &StreamState, bytes: Bytes) -> Body {
+    if !st.is_json {
+        return Body::Full(bytes);
+    }
+    let inner = bytes.slice(..bytes.len().saturating_sub(1));
+    let mut out = BytesMut::with_capacity(inner.len() + 2);
+    out.put_u8(b'[');
+    out.put_slice(&inner);
+    out.put_u8(b']');
+    Body::Full(out.freeze())
 }
 
 /// Map a failed sizing decision onto its response. Kept next to `ChunkEnd` so
 /// both read paths refuse identically.
 fn chunk_end_error(outcome: ChunkEnd) -> Resp {
     match outcome {
-        ChunkEnd::At(_) => unreachable!("only failures reach here"),
+        ChunkEnd::At { .. } => unreachable!("only failures reach here"),
         ChunkEnd::NotAValueBoundary => text_response(
             400,
             "offset is not a JSON message boundary; re-read from a server-issued offset",
@@ -2410,8 +2463,8 @@ async fn handle_catchup(
     // maximum chunk size (PROTOCOL.md §5.6); `Stream-Next-Offset` is the cursor
     // for the client's next request. In sentinel mode the range is empty, so the
     // cap is a no-op there.
-    let end = match chunk_capped_end(&st, start, t.bytes).await {
-        ChunkEnd::At(end) => end,
+    let (end, prefetched) = match chunk_capped_end(&st, start, t.bytes).await {
+        ChunkEnd::At { end, body } => (end, body),
         failure => return chunk_end_error(failure),
     };
     let partial = end < t.bytes;
@@ -2448,8 +2501,16 @@ async fn handle_catchup(
     if partial {
         crate::telemetry::record_chunk_capped("catchup");
     }
-    // Catch-up read of historical bytes: not a live tail feed.
-    let body = read_range_body(&st, start, end, false, "catchup", cache_hit).await;
+    // Catch-up read of historical bytes: not a live tail feed. A capped JSON
+    // page was already read whole while locating its value boundary — serve
+    // those bytes instead of resolving and reading the range again.
+    let body = match prefetched {
+        Some(bytes) => {
+            crate::telemetry::record_tail_cache(false, "catchup");
+            framed_body(&st, bytes)
+        }
+        None => read_range_body(&st, start, end, false, "catchup", cache_hit).await,
+    };
     let mut b = ResponseBuilder::new(200)
         .h("content-type", st.config.content_type.clone())
         .h(H_NEXT_OFFSET, format_offset(reported))
@@ -2556,8 +2617,8 @@ async fn long_poll_data(
     // exists for, since a woken consumer is often the furthest behind. The
     // client already advances by `Stream-Next-Offset`, and omitting
     // `Stream-Up-To-Date` tells it to come straight back for the rest.
-    let end = match chunk_capped_end(st, from, t.bytes).await {
-        ChunkEnd::At(end) => end,
+    let (end, prefetched) = match chunk_capped_end(st, from, t.bytes).await {
+        ChunkEnd::At { end, body } => (end, body),
         failure => return chunk_end_error(failure),
     };
     let partial = end < t.bytes;
@@ -2566,7 +2627,13 @@ async fn long_poll_data(
     if partial {
         crate::telemetry::record_chunk_capped("long-poll");
     }
-    let body = read_range_body(st, from, end, hot, "long-poll", cache_hit).await;
+    let body = match prefetched {
+        Some(bytes) => {
+            crate::telemetry::record_tail_cache(false, "long-poll");
+            framed_body(st, bytes)
+        }
+        None => read_range_body(st, from, end, hot, "long-poll", cache_hit).await,
+    };
     let mut b = ResponseBuilder::new(200)
         .h("content-type", st.config.content_type.clone())
         .h(H_NEXT_OFFSET, format_offset(end))
@@ -2738,8 +2805,8 @@ impl SseSource {
                 // read memory the cap exists to prevent. A capped batch simply
                 // leaves `pos` short of the tail, so `up_to_date`/`closed_now`
                 // stay false and the next call emits the following batch.
-                let end = match chunk_capped_end(&self.st, self.pos, t.bytes).await {
-                    ChunkEnd::At(end) => end,
+                let (end, prefetched) = match chunk_capped_end(&self.st, self.pos, t.bytes).await {
+                    ChunkEnd::At { end, body } => (end, body),
                     // Unreadable or not value-aligned: end the stream without
                     // advancing `pos`, exactly like a failed read below.
                     _ => {
@@ -2755,23 +2822,30 @@ impl SseSource {
                 // and fall back to a file read only when behind it.
                 let read_t0 = crate::telemetry::Timer::start();
                 let cache_hit;
-                let data = match self.st.tail_chunk_slice(self.pos, end) {
-                    Some(b) => {
-                        cache_hit = true;
-                        b
-                    }
-                    None => {
+                let data = match prefetched {
+                    // Already read while locating the batch's value boundary.
+                    Some(bytes) => {
                         cache_hit = false;
-                        match read_range_bytes(&self.st, self.pos, end).await {
-                            Ok(d) => d,
-                            // End the stream without advancing `pos`: the client
-                            // reconnects from its last offset, never skipping a gap.
-                            Err(_) => {
-                                self.done = true;
-                                return None;
+                        bytes
+                    }
+                    None => match self.st.tail_chunk_slice(self.pos, end) {
+                        Some(b) => {
+                            cache_hit = true;
+                            b
+                        }
+                        None => {
+                            cache_hit = false;
+                            match read_range_bytes(&self.st, self.pos, end).await {
+                                Ok(d) => d,
+                                // End the stream without advancing `pos`: the client
+                                // reconnects from its last offset, never skipping a gap.
+                                Err(_) => {
+                                    self.done = true;
+                                    return None;
+                                }
                             }
                         }
-                    }
+                    },
                 };
                 crate::telemetry::record_tail_cache(cache_hit, "sse");
                 crate::telemetry::record_read(read_t0.elapsed_secs(), "sse", cache_hit);
@@ -5386,6 +5460,78 @@ mod chunk_cap_tests {
             "a capped text frame must not split a UTF-8 character"
         );
         assert_eq!(text, payload, "the text stream reassembles exactly");
+    }
+
+    /// The boundary scan already materializes the page's bytes; serving the body
+    /// by resolving and reading the same range again doubles the I/O of every
+    /// capped JSON page (one extra range read per page on a cold tier).
+    #[tokio::test]
+    async fn capped_json_page_is_served_from_the_scanned_bytes() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(512);
+        let dir = tmp("json-single-read");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "c/once", "application/json").await;
+        for i in 0..40 {
+            append(
+                &store,
+                "c/once",
+                "application/json",
+                json_item(i, 60).as_bytes(),
+            )
+            .await;
+        }
+
+        let resp = read(&store, "c/once", None).await;
+        assert!(!up_to_date(&resp), "the page must be capped");
+        assert!(
+            matches!(resp.body, Body::Full(_)),
+            "a capped JSON page must be served from the bytes the boundary scan \
+             already read, not resolved and read a second time"
+        );
+        let values: Vec<serde_json::Value> =
+            serde_json::from_slice(&body_bytes(resp.body).await).unwrap();
+        assert_eq!(values[0]["i"], serde_json::json!(0));
+    }
+
+    /// A value larger than the cap must be located by scanning forward once.
+    /// Growing the window geometrically re-reads everything scanned so far, so a
+    /// 20 KiB value at a 1 KiB cap costs ~52 KiB of reads instead of ~21 KiB.
+    #[tokio::test]
+    async fn oversize_json_value_is_scanned_without_rereads() {
+        use std::sync::atomic::Ordering;
+        let _durability = test_support::DurabilityGuard::memory();
+        let cap = 1024;
+        let _guard = test_support::MaxChunkGuard::bytes(cap);
+        let dir = tmp("no-reread");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "c/reread", "application/json").await;
+        let big = json_item(0, 20_000);
+        append(&store, "c/reread", "application/json", big.as_bytes()).await;
+        for i in 1..5 {
+            append(
+                &store,
+                "c/reread",
+                "application/json",
+                json_item(i, 60).as_bytes(),
+            )
+            .await;
+        }
+
+        BOUNDARY_SCAN_BYTES.store(0, Ordering::Relaxed);
+        let resp = read(&store, "c/reread", None).await;
+        let page_wire = big.len() as u64 + 1;
+        assert_eq!(
+            next_offset(&resp),
+            page_wire,
+            "the oversize value is one page"
+        );
+        let scanned = BOUNDARY_SCAN_BYTES.load(Ordering::Relaxed);
+        assert!(
+            scanned <= page_wire + cap,
+            "the boundary scan must read each byte once: read {scanned} bytes for a \
+             {page_wire}-byte page at a {cap}-byte cap"
+        );
     }
 
     /// A long-poll that returns a backlog is a read like any other: the same cap

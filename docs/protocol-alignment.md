@@ -61,11 +61,16 @@ previous unlimited behavior for operators who want it.
 A capped page:
 
 - ends on a boundary that keeps the response well-formed. Byte streams cut at
-  any byte; JSON streams cut only just past a top-level value separator, using
-  the same `last_json_value_boundary` scanner the tiering path uses to seal
-  segments, so every page is a whole number of values and still parses as a JSON
-  array. A single value larger than the cap is returned whole rather than split —
-  a page with data available is never empty.
+  any byte — no read and no scan, so that path stays zero-copy. JSON streams cut
+  only just past a top-level value separator, using the same value-boundary
+  scanner the tiering path uses to seal segments, so every page is a whole number
+  of values and still parses as a JSON array. A single value larger than the cap
+  is returned whole rather than split — a page with data available is never
+  empty. Locating that boundary reads the page, so those bytes are the ones
+  served: a capped JSON page is read once, not once to scan and once to send
+  (which on a cold tier would be an extra range read per page), and the scan
+  walks forward in cap-sized windows so an oversize value is located without
+  re-reading what it already scanned.
 - reports the aligned end as `Stream-Next-Offset`, omits `Stream-Up-To-Date`, and
   omits `Stream-Closed` (a closed stream is closed *to the reader* only once the
   page that reaches the tail is delivered). The `ETag` covers the range actually

@@ -114,7 +114,7 @@ const COMMA: u8 = b',';
 pub fn last_json_value_boundary(data: &[u8], limit: u64) -> u64 {
     let limit = (limit as usize).min(data.len()) as u64;
     let mut last_boundary = 0u64;
-    scan_json_value_boundaries(data, |boundary| {
+    JsonValueBoundaryScan::new().feed(data, |boundary| {
         if boundary <= limit {
             last_boundary = boundary;
             true
@@ -125,15 +125,6 @@ pub fn last_json_value_boundary(data: &[u8], limit: u64) -> u64 {
         }
     });
     last_boundary
-}
-
-/// The SMALLEST cut length `k` such that `data[..k]` ends exactly on a top-level
-/// value separator — i.e. exactly one whole value. Returns 0 when `data` holds
-/// no complete value. Used by the read path to honour "never return an empty
-/// page when data exists": a single value larger than the response chunk cap is
-/// served whole rather than split (PROTOCOL.md §5.6).
-pub fn first_json_value_boundary(data: &[u8]) -> u64 {
-    nth_json_value_boundary(data, 1)
 }
 
 /// The cut length that ends just past the `n`th top-level value separator — i.e.
@@ -147,7 +138,7 @@ pub fn nth_json_value_boundary(data: &[u8], n: u64) -> u64 {
     }
     let mut seen = 0u64;
     let mut found = 0u64;
-    scan_json_value_boundaries(data, |boundary| {
+    JsonValueBoundaryScan::new().feed(data, |boundary| {
         seen += 1;
         if seen == n {
             found = boundary;
@@ -159,52 +150,66 @@ pub fn nth_json_value_boundary(data: &[u8], n: u64) -> u64 {
     found
 }
 
-/// Byte-level state machine over the JSON wire form: calls `on_boundary(k)` for
-/// each `k` where `data[..k]` ends just past a TOP-LEVEL `,` (commas, brackets
-/// and braces inside strings are ignored, backslash escapes honoured — exactly
-/// like stratovolt's boundary finder). Scanning stops when `on_boundary`
-/// returns `false`.
-fn scan_json_value_boundaries(data: &[u8], mut on_boundary: impl FnMut(u64) -> bool) {
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut pos = 0usize;
-    while pos < data.len() {
-        let b = data[pos];
-        if escape {
-            escape = false;
-            pos += 1;
-            continue;
-        }
-        if in_string {
-            if b == BACKSLASH {
-                escape = true;
-            } else if b == QUOTE {
-                in_string = false;
+/// Byte-level state machine over the JSON wire form, resumable across chunks:
+/// `feed` calls `on_boundary(k)` for each `k` where the range fed so far ends
+/// just past a TOP-LEVEL `,` (commas, brackets and braces inside strings are
+/// ignored, backslash escapes honoured — exactly like stratovolt's boundary
+/// finder). Being resumable lets a caller stream the range in windows and scan —
+/// and therefore read — each byte exactly once.
+#[derive(Default)]
+pub struct JsonValueBoundaryScan {
+    depth: i32,
+    in_string: bool,
+    escape: bool,
+    /// Bytes fed so far, so boundaries are reported relative to the first chunk.
+    consumed: u64,
+}
+
+impl JsonValueBoundaryScan {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Scan the next contiguous chunk. Returns `false` if `on_boundary` stopped
+    /// the scan, in which case the remaining bytes of `chunk` were not consumed
+    /// and the scanner must be discarded rather than fed again.
+    pub fn feed(&mut self, chunk: &[u8], mut on_boundary: impl FnMut(u64) -> bool) -> bool {
+        for (index, byte) in chunk.iter().enumerate() {
+            let byte = *byte;
+            if self.escape {
+                self.escape = false;
+                continue;
             }
-            pos += 1;
-            continue;
-        }
-        match b {
-            QUOTE => in_string = true,
-            OPEN_BRACE | OPEN_BRACKET => depth += 1,
-            CLOSE_BRACE | CLOSE_BRACKET => {
-                if depth > 0 {
-                    depth -= 1;
+            if self.in_string {
+                if byte == BACKSLASH {
+                    self.escape = true;
+                } else if byte == QUOTE {
+                    self.in_string = false;
                 }
+                continue;
             }
-            COMMA if depth == 0 => {
-                // `data[..pos+1]` ends just past this top-level comma — a clean
-                // value boundary. The callback decides whether later boundaries
-                // are still interesting.
-                let keep_scanning = on_boundary(pos as u64 + 1);
-                if !keep_scanning {
-                    return;
+            match byte {
+                QUOTE => self.in_string = true,
+                OPEN_BRACE | OPEN_BRACKET => self.depth += 1,
+                CLOSE_BRACE | CLOSE_BRACKET => {
+                    if self.depth > 0 {
+                        self.depth -= 1;
+                    }
                 }
+                COMMA if self.depth == 0 => {
+                    // The range up to and including this comma is a whole number
+                    // of values. The callback decides whether later boundaries
+                    // are still interesting.
+                    let keep_scanning = on_boundary(self.consumed + index as u64 + 1);
+                    if !keep_scanning {
+                        return false;
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
-        pos += 1;
+        self.consumed += chunk.len() as u64;
+        true
     }
 }
 
