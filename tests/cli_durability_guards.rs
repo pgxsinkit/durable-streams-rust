@@ -86,6 +86,55 @@ fn wal_args(dir: &std::path::Path, port: &str) -> Vec<String> {
     .collect()
 }
 
+/// A running server and the data directory it owns, for the lifetime of one
+/// test. Cleanup lives in `Drop` rather than in a tail after the assertions,
+/// because a panicking assertion skips the tail and leaks a process that keeps
+/// both the data-dir lock and its listening socket.
+struct ServerUnderTest {
+    child: Child,
+    dir: std::path::PathBuf,
+    port: u16,
+}
+
+impl ServerUnderTest {
+    /// Spawn a WAL server on an ephemeral port over an already-bootstrapped
+    /// directory, with `extra` appended to the standard WAL arguments.
+    fn wal(dir: &std::path::Path, extra: &[&str]) -> Self {
+        let port = unused_local_port();
+        let mut args = wal_args(dir, &port.to_string());
+        args.extend(extra.iter().map(|value| value.to_string()));
+        let child = server()
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server");
+        Self {
+            child,
+            dir: dir.to_path_buf(),
+            port,
+        }
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn request(&self, request: &str) -> String {
+        http_response(self.port, request)
+    }
+}
+
+impl Drop for ServerUnderTest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        // Reap it: a killed-but-unwaited child stays a zombie, and on a panicking
+        // unwind nothing else will collect it.
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 fn replace_arg(args: &mut [String], flag: &str, value: &str) {
     let index = args
         .iter()
@@ -573,16 +622,9 @@ fn readiness_is_attested_and_admin_paths_are_reserved() {
     let dir = std::env::temp_dir().join("ds-rust-cli-readiness");
     let _ = std::fs::remove_dir_all(&dir);
     bootstrap(&dir);
-    let mut child = server()
-        .args(wal_args(&dir, "14977"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("server");
-    let ready = http_response(
-        14977,
-        "GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
+    let server = ServerUnderTest::wal(&dir, &[]);
+    let ready = server
+        .request("GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     assert!(
         ready.starts_with("HTTP/1.1 200") || ready.starts_with("HTTP/1.1 503"),
         "{ready}"
@@ -606,11 +648,8 @@ fn readiness_is_attested_and_admin_paths_are_reserved() {
         );
         assert!(ready.contains("\"satisfied\":false"), "{ready}");
     }
-    let reserved = http_response(14977, "PUT /_admin/a-user-stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    let reserved = server.request("PUT /_admin/a-user-stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
     assert!(reserved.starts_with("HTTP/1.1 405"), "{reserved}");
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Readiness advertises a cap so a client can size its response buffer before
@@ -623,21 +662,11 @@ fn readiness_advertises_the_chunk_cap_reads_actually_apply() {
     let dir = std::env::temp_dir().join("ds-rust-cli-ready-chunk-cap");
     let _ = std::fs::remove_dir_all(&dir);
     bootstrap(&dir);
-    let port = unused_local_port();
-    let mut args = wal_args(&dir, &port.to_string());
-    args.push("--max-chunk-bytes".to_string());
-    args.push(CAP.to_string());
-    let mut child = server()
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("server");
+    let cap = CAP.to_string();
+    let server = ServerUnderTest::wal(&dir, &["--max-chunk-bytes", &cap]);
 
-    let ready = http_response(
-        port,
-        "GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
+    let ready = server
+        .request("GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     // 200 or 503: a test filesystem under the production 20 GiB reserve is not
     // ready, but the document it serves must still be complete.
     assert!(
@@ -649,24 +678,20 @@ fn readiness_advertises_the_chunk_cap_reads_actually_apply() {
         "readiness must publish the configured cap: {ready}"
     );
 
-    let created = http_response(
-        port,
+    let created = server.request(
         "PUT /capped HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: 0\r\n\r\n",
     );
     assert!(created.contains(" 201"), "create: {created}");
     let payload = "x".repeat(2000);
-    let appended = http_response(
-        port,
+    let appended = server.request(
         &format!(
             "POST /capped HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n{payload}",
             payload.len()
         ),
     );
     assert!(appended.contains(" 204"), "append: {appended}");
-    let read = http_response(
-        port,
-        "GET /capped HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
+    let read =
+        server.request("GET /capped HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     let page_end: u64 = read
         .lines()
         .find_map(|line| {
@@ -684,10 +709,6 @@ fn readiness_advertises_the_chunk_cap_reads_actually_apply() {
         page_end, CAP,
         "the advertised cap must be the one the read path applies"
     );
-
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `max_chunk_bytes` is a page target, not a hard bound on the response. A JSON
@@ -705,21 +726,11 @@ fn an_oversize_value_is_served_whole_and_readiness_bounds_it() {
     let dir = std::env::temp_dir().join("ds-rust-cli-oversize-value");
     let _ = std::fs::remove_dir_all(&dir);
     bootstrap(&dir);
-    let port = unused_local_port();
-    let mut args = wal_args(&dir, &port.to_string());
-    args.push("--max-chunk-bytes".to_string());
-    args.push(CAP.to_string());
-    let mut child = server()
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("server");
+    let cap = CAP.to_string();
+    let server = ServerUnderTest::wal(&dir, &["--max-chunk-bytes", &cap]);
 
-    let ready = http_response(
-        port,
-        "GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
+    let ready = server
+        .request("GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     assert!(
         ready.contains(&format!("\"max_chunk_bytes\":{CAP}")),
         "readiness must publish the nominal page cap: {ready}"
@@ -729,8 +740,7 @@ fn an_oversize_value_is_served_whole_and_readiness_bounds_it() {
         "readiness must publish the single-value bound: {ready}"
     );
 
-    let created = http_response(
-        port,
+    let created = server.request(
         "PUT /oversize HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n",
     );
     assert!(created.contains(" 201"), "create: {created}");
@@ -738,8 +748,7 @@ fn an_oversize_value_is_served_whole_and_readiness_bounds_it() {
     // page smaller than the whole value.
     let value = format!("{{\"m\":\"{}\"}}", "x".repeat(500));
     assert!(value.len() as u64 > CAP);
-    let appended = http_response(
-        port,
+    let appended = server.request(
         &format!(
             "POST /oversize HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{value}",
             value.len()
@@ -747,10 +756,8 @@ fn an_oversize_value_is_served_whole_and_readiness_bounds_it() {
     );
     assert!(appended.contains(" 204"), "append: {appended}");
 
-    let read = http_response(
-        port,
-        "GET /oversize HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
+    let read =
+        server.request("GET /oversize HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     let body = read
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
@@ -764,10 +771,36 @@ fn an_oversize_value_is_served_whole_and_readiness_bounds_it() {
         body.len() as u64 > CAP,
         "this test is only meaningful if the response overshoots the cap"
     );
+}
 
-    let _ = child.kill();
-    let _ = child.wait();
+/// The cleanup tail of a CLI test — `kill`, `wait`, `remove_dir_all` — is
+/// reachable only once every assertion has passed, which is exactly the run
+/// where cleanup matters least. A panicking assertion leaks a server that keeps
+/// the data-dir lock and its listening socket, contaminating later tests and
+/// reruns. Cleanup therefore belongs in `Drop`, and this pins that it runs.
+#[test]
+fn a_failing_assertion_still_reaps_the_server_and_its_data_dir() {
+    let dir = std::env::temp_dir().join("ds-rust-cli-guard-reaps");
     let _ = std::fs::remove_dir_all(&dir);
+    bootstrap(&dir);
+
+    let mut observed_port = None;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let server = ServerUnderTest::wal(&dir, &[]);
+        let ready = server
+            .request("GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        assert!(ready.contains("durable-streams-store-ready-v1"), "{ready}");
+        observed_port = Some(server.port());
+        panic!("a failing assertion, as a real test would");
+    }));
+
+    assert!(outcome.is_err(), "the body must have panicked");
+    let port = observed_port.expect("the server was listening before the panic");
+    assert!(
+        TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "the leaked server is still holding port {port}"
+    );
+    assert!(!dir.exists(), "the data directory was left behind: {dir:?}");
 }
 
 /// The explicit-data-dir guard is wal-only. Memory mode makes no WAL durability claim, so a
