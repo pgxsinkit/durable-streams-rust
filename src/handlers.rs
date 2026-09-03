@@ -888,31 +888,31 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
         let fork_point = match sub_offset.unwrap_or(0) {
             0 => anchor,
             sub if src.is_json => {
-                // Sub-offset counts messages past the anchor; each message ends with ','.
+                // Sub-offset counts MESSAGES past the anchor. In the JSON wire
+                // form (`value,value,…,`) a message boundary is a TOP-LEVEL
+                // comma, so the count goes through the same value-boundary
+                // scanner the tier's sealing path and the read chunk cap use.
+                // Counting raw commas instead also counts commas inside strings
+                // and nested objects/arrays, which places the fork point INSIDE a
+                // value: every later read of that fork then starts mid-value, so
+                // it serves malformed JSON and the chunk cap's boundary scanner
+                // (which assumes a range of whole top-level values) can find no
+                // boundary at all.
+                //
                 // NOTE: this materializes the whole `[anchor, src_tail)` range to
-                // scan for the Nth comma, even for a small `sub` over a huge stream
-                // — O(tail) memory. Acceptable here: fork-create is a cold control
-                // op, not a hot path. A bounded-window scan would remove the cost.
+                // scan for the Nth boundary, even for a small `sub` over a huge
+                // stream — O(tail) memory. Acceptable here: fork-create is a cold
+                // control op, not a hot path. A bounded-window scan would remove
+                // the cost.
                 let data = match read_range_bytes(&src, anchor, src_tail).await {
                     Ok(d) => d,
                     // A short/cold read must not be miscounted as a value boundary.
                     Err(_) => return text_response(503, "fork source read failed"),
                 };
-                let mut remaining = sub;
-                let mut adv = 0u64;
-                for (i, b) in data.iter().enumerate() {
-                    if *b == b',' {
-                        remaining -= 1;
-                        if remaining == 0 {
-                            adv = i as u64 + 1;
-                            break;
-                        }
-                    }
+                match crate::tier::nth_json_value_boundary(&data, sub) {
+                    0 => return text_response(400, "sub-offset overshoots message count"),
+                    adv => anchor + adv,
                 }
-                if remaining > 0 {
-                    return text_response(400, "sub-offset overshoots message count");
-                }
-                anchor + adv
             }
             sub => {
                 if anchor + sub > src_tail {
@@ -2050,6 +2050,23 @@ async fn read_range_body(
     }
 }
 
+/// Outcome of sizing one read response.
+enum ChunkEnd {
+    /// Serve `[start, end)`. `end == tail` means nothing was capped.
+    At(u64),
+    /// A JSON range that does not decompose into whole top-level values: the
+    /// requested offset is not a value boundary (only a client-fabricated offset
+    /// can be — server-minted offsets, fork points and tier cuts all land on
+    /// boundaries). Serving it would emit malformed JSON, and serving it
+    /// UNCAPPED — the old fallback — would also silently defeat the chunk cap
+    /// and mark an unbounded response up-to-date. Fail closed instead.
+    NotAValueBoundary,
+    /// The boundary window could not be read (a cold-storage error or a short
+    /// read). The bytes behind the response are unavailable, so the response is
+    /// refused rather than framed around a range that cannot be served.
+    ReadFailed,
+}
+
 /// Cap a read of `[start, tail)` at the configured maximum chunk size
 /// (PROTOCOL.md §5.6: "up to a server-defined maximum chunk size"), returning
 /// the end offset the response should actually carry. `tail` means nothing was
@@ -2068,22 +2085,23 @@ async fn read_range_body(
 /// window before the body itself is served — bounded by the cap, so it scales
 /// with the response, never with the stream. When one value is larger than the
 /// cap there is no in-cap boundary: rather than return an empty page, the window
-/// grows until that value completes and the single oversize value is served.
-async fn chunk_capped_end(st: &Arc<StreamState>, start: u64, tail: u64) -> u64 {
+/// grows until that value completes and the single oversize value is served. A
+/// window that reaches the tail with NO top-level boundary anywhere is not an
+/// oversize value — the range itself is inconsistent — and is reported as
+/// `NotAValueBoundary`.
+async fn chunk_capped_end(st: &Arc<StreamState>, start: u64, tail: u64) -> ChunkEnd {
     let cap = max_chunk_bytes();
     if cap == 0 || tail.saturating_sub(start) <= cap {
-        return tail;
+        return ChunkEnd::At(tail);
     }
     if !st.is_json {
-        return start + cap;
+        return ChunkEnd::At(start + cap);
     }
     let mut window = cap;
     loop {
         let window_end = (start + window).min(tail);
-        // A short/failed read must not be mistaken for "no boundary here": fall
-        // back to the uncapped tail and let the body read report the failure.
         let Ok(data) = read_range_bytes(st, start, window_end).await else {
-            return tail;
+            return ChunkEnd::ReadFailed;
         };
         let boundary = if window == cap {
             crate::tier::last_json_value_boundary(&data, cap)
@@ -2092,12 +2110,33 @@ async fn chunk_capped_end(st: &Arc<StreamState>, start: u64, tail: u64) -> u64 {
             crate::tier::first_json_value_boundary(&data)
         };
         if boundary > 0 {
-            return start + boundary;
+            return ChunkEnd::At(start + boundary);
         }
         if window_end >= tail {
-            return tail;
+            // The whole remainder holds no top-level value separator, but the
+            // tail always sits just past one — so `start` is not a boundary.
+            tracing::warn!(
+                stream = %st.path,
+                start,
+                tail,
+                "JSON read offset is not a value boundary; refusing to serve a malformed page"
+            );
+            return ChunkEnd::NotAValueBoundary;
         }
         window = window.saturating_mul(2);
+    }
+}
+
+/// Map a failed sizing decision onto its response. Kept next to `ChunkEnd` so
+/// both read paths refuse identically.
+fn chunk_end_error(outcome: ChunkEnd) -> Resp {
+    match outcome {
+        ChunkEnd::At(_) => unreachable!("only failures reach here"),
+        ChunkEnd::NotAValueBoundary => text_response(
+            400,
+            "offset is not a JSON message boundary; re-read from a server-issued offset",
+        ),
+        ChunkEnd::ReadFailed => text_response(503, "stream read failed"),
     }
 }
 
@@ -2371,7 +2410,10 @@ async fn handle_catchup(
     // maximum chunk size (PROTOCOL.md §5.6); `Stream-Next-Offset` is the cursor
     // for the client's next request. In sentinel mode the range is empty, so the
     // cap is a no-op there.
-    let end = chunk_capped_end(&st, start, t.bytes).await;
+    let end = match chunk_capped_end(&st, start, t.bytes).await {
+        ChunkEnd::At(end) => end,
+        failure => return chunk_end_error(failure),
+    };
     let partial = end < t.bytes;
     // §5.6: `Stream-Up-To-Date` MUST be present only when the response includes
     // all data available at that moment, and SHOULD NOT be present when data is
@@ -2514,7 +2556,10 @@ async fn long_poll_data(
     // exists for, since a woken consumer is often the furthest behind. The
     // client already advances by `Stream-Next-Offset`, and omitting
     // `Stream-Up-To-Date` tells it to come straight back for the rest.
-    let end = chunk_capped_end(st, from, t.bytes).await;
+    let end = match chunk_capped_end(st, from, t.bytes).await {
+        ChunkEnd::At(end) => end,
+        failure => return chunk_end_error(failure),
+    };
     let partial = end < t.bytes;
     let up_to_date = !partial;
     let closed = t.closed && !partial;
@@ -4715,7 +4760,7 @@ mod chunk_cap_tests {
         header(resp, H_UP_TO_DATE) == Some("true")
     }
 
-    fn body_bytes(body: Body) -> Vec<u8> {
+    async fn body_bytes(body: Body) -> Vec<u8> {
         match body {
             Body::Empty => Vec::new(),
             Body::Full(b) => b.to_vec(),
@@ -4728,6 +4773,19 @@ mod chunk_cap_tests {
                 let mut out = prefix.to_vec();
                 out.extend_from_slice(&crate::store::materialize_segments(&segments));
                 out.extend_from_slice(suffix);
+                out
+            }
+            // Cold/mixed ranges stream their framed slices over a channel.
+            Body::Channel(stream) => {
+                let mut rx = stream.rx;
+                let mut out = Vec::new();
+                while let Some(chunk) = rx.recv().await {
+                    out.extend_from_slice(&chunk);
+                }
+                assert!(
+                    !stream.failed.load(std::sync::atomic::Ordering::Acquire),
+                    "the streamed body must not abort"
+                );
                 out
             }
             _ => panic!("unexpected streaming body for a catch-up read"),
@@ -4800,7 +4858,7 @@ mod chunk_cap_tests {
             assert!(pages < 100, "paging must terminate");
             let done = up_to_date(&resp);
             let at = next_offset(&resp);
-            let body = body_bytes(resp.body);
+            let body = body_bytes(resp.body).await;
             let parsed: Vec<serde_json::Value> = serde_json::from_slice(&body)
                 .unwrap_or_else(|e| panic!("page must be a valid JSON array: {e}"));
             seen.extend(parsed);
@@ -4835,7 +4893,7 @@ mod chunk_cap_tests {
         let first = read(&store, "c/bytes", None).await;
         assert_eq!(next_offset(&first), 256);
         assert!(!up_to_date(&first));
-        let head = body_bytes(first.body);
+        let head = body_bytes(first.body).await;
         assert_eq!(head, payload[..256], "the page is the first cap bytes");
 
         let mut all = head;
@@ -4844,7 +4902,7 @@ mod chunk_cap_tests {
             let resp = read(&store, "c/bytes", Some(offset)).await;
             let done = up_to_date(&resp);
             offset = next_offset(&resp);
-            all.extend_from_slice(&body_bytes(resp.body));
+            all.extend_from_slice(&body_bytes(resp.body).await);
             if done {
                 break;
             }
@@ -4866,7 +4924,7 @@ mod chunk_cap_tests {
         let resp = read(&store, "c/unlimited", None).await;
         assert!(up_to_date(&resp), "an uncapped read is up to date");
         assert_eq!(next_offset(&resp), 100_000);
-        assert_eq!(body_bytes(resp.body).len(), 100_000);
+        assert_eq!(body_bytes(resp.body).await.len(), 100_000);
     }
 
     /// A single JSON value larger than the cap has no in-cap value boundary. The
@@ -4897,7 +4955,7 @@ mod chunk_cap_tests {
             "the cut lands just past the oversize value's separator"
         );
         let parsed: Vec<serde_json::Value> =
-            serde_json::from_slice(&body_bytes(resp.body)).unwrap();
+            serde_json::from_slice(&body_bytes(resp.body).await).unwrap();
         assert_eq!(parsed.len(), 1, "exactly the oversize value is returned");
         assert_eq!(parsed[0]["i"], serde_json::json!(0));
     }
@@ -4979,6 +5037,181 @@ mod chunk_cap_tests {
         );
     }
 
+    fn fork_req(path: &str, source: &str, offset: u64, sub_offset: u64) -> Req {
+        Req {
+            method: Method::Put,
+            path: path.to_string(),
+            query: None,
+            headers: vec![
+                ("content-type".into(), "application/json".into()),
+                ("stream-forked-from".into(), source.to_string()),
+                ("stream-fork-offset".into(), format_offset(offset)),
+                ("stream-fork-sub-offset".into(), sub_offset.to_string()),
+            ],
+            body: Bytes::new(),
+        }
+    }
+
+    /// Read a whole stream by paging, asserting every page is a valid JSON array
+    /// and that only the final page claims up-to-date.
+    async fn drain_json(store: &Arc<Store>, path: &str) -> Vec<serde_json::Value> {
+        let mut values = Vec::new();
+        let mut offset = None;
+        for _ in 0..200 {
+            let resp = read(store, path, offset).await;
+            assert_eq!(resp.status, 200, "page of {path}");
+            let done = up_to_date(&resp);
+            let at = next_offset(&resp);
+            let page: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes(resp.body).await)
+                .unwrap_or_else(|e| panic!("page of {path} must be a valid JSON array: {e}"));
+            values.extend(page);
+            offset = Some(at);
+            if done {
+                return values;
+            }
+        }
+        panic!("paging {path} did not terminate")
+    }
+
+    /// A `Stream-Fork-Sub-Offset` counts MESSAGES, so it must be resolved with the
+    /// top-level value scanner. Counting raw commas puts the fork point inside a
+    /// value (here, inside `[1,2]`), which makes every later read of the fork
+    /// malformed JSON and leaves the chunk cap's scanner with no boundary to find.
+    #[tokio::test]
+    async fn fork_sub_offset_counts_top_level_values_not_raw_commas() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let dir = tmp("fork-sub-offset");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "f/parent", "application/json").await;
+        let first = r#"{"a":[1,2],"b":"x,y"}"#;
+        append(&store, "f/parent", "application/json", first.as_bytes()).await;
+        append(&store, "f/parent", "application/json", br#"{"c":3}"#).await;
+
+        let resp = handle(Arc::clone(&store), fork_req("f/child", "f/parent", 0, 1)).await;
+        assert_eq!(resp.status, 201, "fork create");
+        let child = store.streams.get("f/child").unwrap().clone();
+        assert_eq!(
+            child.base_offset,
+            first.len() as u64 + 1,
+            "the fork point must be one whole value in, not one raw comma in"
+        );
+
+        let values = drain_json(&store, "f/child").await;
+        assert_eq!(
+            values,
+            vec![serde_json::from_str::<serde_json::Value>(first).unwrap()]
+        );
+    }
+
+    /// A fork read that crosses both the fork point and the chunk cap still pages
+    /// as valid JSON: inherited parent values and the fork's own values arrive
+    /// once each, in order.
+    #[tokio::test]
+    async fn fork_reads_page_across_the_cap() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(512);
+        let dir = tmp("fork-cap");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "f/src", "application/json").await;
+        for i in 0..20 {
+            append(
+                &store,
+                "f/src",
+                "application/json",
+                json_item(i, 60).as_bytes(),
+            )
+            .await;
+        }
+        let resp = handle(Arc::clone(&store), fork_req("f/fork", "f/src", 0, 20)).await;
+        assert_eq!(resp.status, 201, "fork create");
+        for i in 20..40 {
+            append(
+                &store,
+                "f/fork",
+                "application/json",
+                json_item(i, 60).as_bytes(),
+            )
+            .await;
+        }
+
+        let values = drain_json(&store, "f/fork").await;
+        assert_eq!(
+            values.len(),
+            40,
+            "inherited + own values, each exactly once"
+        );
+        for (i, value) in values.iter().enumerate() {
+            assert_eq!(value["i"], serde_json::json!(i as i64));
+        }
+    }
+
+    /// The cold path: with sealed/offloaded segments under the read, capped pages
+    /// still cut on value boundaries and reassemble exactly.
+    #[tokio::test]
+    async fn cold_tier_pages_are_valid_json() {
+        use crate::tier::TierKind;
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(512);
+        let dir = tmp("cold-cap");
+        let tier = TierConfig {
+            kind: TierKind::Local,
+            segment_bytes: 1024,
+            local_dir: Some(dir.join("cold")),
+            ..Default::default()
+        };
+        let store = Arc::new(Store::new_with_tier(dir.clone(), tier).unwrap());
+        create(&store, "cold/json", "application/json").await;
+        for i in 0..60 {
+            append(
+                &store,
+                "cold/json",
+                "application/json",
+                json_item(i, 60).as_bytes(),
+            )
+            .await;
+        }
+        let st = store.streams.get("cold/json").unwrap().clone();
+        store.maybe_seal(&st).await;
+        assert!(
+            st.tier.manifest.lock().unwrap().sealed_offset > 0,
+            "the test must actually seal a cold prefix"
+        );
+
+        let values = drain_json(&store, "cold/json").await;
+        assert_eq!(values.len(), 60);
+        for (i, value) in values.iter().enumerate() {
+            assert_eq!(value["i"], serde_json::json!(i as i64));
+        }
+    }
+
+    /// A client-fabricated offset that lands inside a JSON value has no top-level
+    /// boundary to cut on. The cap must fail closed rather than fall back to the
+    /// whole tail — that would serve an unbounded, malformed page and mark it
+    /// up-to-date.
+    #[tokio::test]
+    async fn mid_value_offset_fails_closed_instead_of_serving_the_tail() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(256);
+        let dir = tmp("mid-value");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "c/strings", "application/json").await;
+        // Comma-free string values: a scan starting inside one never sees a
+        // top-level separator, so the range is provably not value-aligned.
+        for _ in 0..8 {
+            let value = format!("\"{}\"", "a".repeat(200));
+            append(&store, "c/strings", "application/json", value.as_bytes()).await;
+        }
+        let resp = read(&store, "c/strings", Some(3)).await;
+        assert_eq!(
+            resp.status, 400,
+            "a mid-value offset must be refused, not served as a malformed page"
+        );
+
+        // The same stream read from a server-issued offset still pages fine.
+        let values = drain_json(&store, "c/strings").await;
+        assert_eq!(values.len(), 8);
+    }
+
     /// A long-poll that returns a backlog is a read like any other: the same cap
     /// applies, so one wake cannot deliver a whole stream.
     #[tokio::test]
@@ -5004,6 +5237,6 @@ mod chunk_cap_tests {
         assert_eq!(resp.status, 200);
         assert_eq!(next_offset(&resp), 256);
         assert!(!up_to_date(&resp), "a capped long-poll page is partial");
-        assert_eq!(body_bytes(resp.body).len(), 256);
+        assert_eq!(body_bytes(resp.body).await.len(), 256);
     }
 }

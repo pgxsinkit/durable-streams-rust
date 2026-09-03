@@ -133,12 +133,30 @@ pub fn last_json_value_boundary(data: &[u8], limit: u64) -> u64 {
 /// page when data exists": a single value larger than the response chunk cap is
 /// served whole rather than split (PROTOCOL.md §5.6).
 pub fn first_json_value_boundary(data: &[u8]) -> u64 {
-    let mut first_boundary = 0u64;
+    nth_json_value_boundary(data, 1)
+}
+
+/// The cut length that ends just past the `n`th top-level value separator — i.e.
+/// the length of the first `n` whole values. Returns 0 when `data` holds fewer
+/// than `n` complete values. This is the only correct way to count messages in
+/// the JSON wire form: a raw comma count also counts commas inside strings and
+/// nested objects/arrays, which would place an offset INSIDE a value.
+pub fn nth_json_value_boundary(data: &[u8], n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut seen = 0u64;
+    let mut found = 0u64;
     scan_json_value_boundaries(data, |boundary| {
-        first_boundary = boundary;
-        false
+        seen += 1;
+        if seen == n {
+            found = boundary;
+            false
+        } else {
+            true
+        }
     });
-    first_boundary
+    found
 }
 
 /// Byte-level state machine over the JSON wire form: calls `on_boundary(k)` for

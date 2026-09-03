@@ -71,6 +71,23 @@ A capped page:
   page that reaches the tail is delivered). The `ETag` covers the range actually
   returned, so a partial page and a later full-tail page never share a validator.
 
+Two invariants the cut depends on:
+
+- **A read range starts on a value boundary.** Server-minted offsets, tier cuts
+  and fork points all do. `Stream-Fork-Sub-Offset` counts *messages*, so it is
+  resolved with the same top-level value scanner rather than by counting raw
+  commas — a comma inside a string or a nested array is not a message boundary,
+  and a fork point placed inside a value would make every later read of that
+  fork malformed JSON.
+- **A range that provably is not value-aligned is refused, not served.** If the
+  scanner reaches the tail of a JSON range without finding a single top-level
+  separator, the requested offset is inside a value (§8 leaves client-fabricated
+  offsets undefined). Falling back to the uncapped tail — serving an unbounded,
+  malformed page and marking it up to date — is exactly the failure the cap
+  exists to prevent, so the request is refused with `400` and logged instead. A
+  window that cannot be read (cold-storage error) is refused with `503` rather
+  than framed around bytes that cannot be served.
+
 The cap applies to long-poll responses too: chunk semantics are a property of a
 read, and a woken long-poll consumer is often the one furthest behind. The
 client already advances by `Stream-Next-Offset`, and the omitted
