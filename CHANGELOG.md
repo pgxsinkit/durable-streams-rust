@@ -16,6 +16,11 @@
   previous unlimited behaviour. New `ds.read.chunk_capped` counter reports capped
   responses by live mode.
 
+  SSE catch-up is bounded by the same cap: a subscriber starting at `offset=0` or
+  reconnecting far behind the tail now receives the backlog as successive
+  data/control pairs instead of one event framing the whole remainder. Capped
+  `text/*` frames are cut on UTF-8 character boundaries.
+
 ## 0.1.5
 
 ### Patch Changes

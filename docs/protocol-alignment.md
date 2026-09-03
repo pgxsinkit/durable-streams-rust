@@ -91,8 +91,18 @@ Two invariants the cut depends on:
 The cap applies to long-poll responses too: chunk semantics are a property of a
 read, and a woken long-poll consumer is often the one furthest behind. The
 client already advances by `Stream-Next-Offset`, and the omitted
-`Stream-Up-To-Date` tells it to come straight back for the remainder. SSE is
-unaffected — it is already an incremental framing.
+`Stream-Up-To-Date` tells it to come straight back for the remainder.
+
+SSE is already an incremental framing, but its catch-up is a read like any
+other: a subscriber starting at `offset=0`, or reconnecting far behind the tail,
+used to materialize and encode the whole backlog into one event (the inline
+producer read `[pos, tail)`; the Linux reactor allocated `tail - write_off`
+before its pending-size check). Both paths now emit the backlog as successive
+data/control pairs of at most the cap, with `upToDate` false until the frame
+that reaches the tail — so `--max-chunk-bytes` bounds read memory on every read
+path, which is what the flag claims. A capped `text/*` frame is additionally
+backed off to a UTF-8 character boundary, because that encoding is lossy and a
+split multi-byte character would corrupt both halves.
 
 CI runs the published conformance suite once more with `--max-chunk-bytes 4096`
 (the `wal-small-chunk` matrix entry) so the contract is exercised with chunking

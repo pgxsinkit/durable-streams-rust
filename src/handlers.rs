@@ -2645,6 +2645,21 @@ pub(crate) fn sse_encode_data(out: &mut String, data: &[u8], encoding: SseEncodi
     }
 }
 
+/// Largest prefix of `data` that does not end in the middle of a UTF-8 sequence.
+/// A `text/*` SSE frame is encoded with `from_utf8_lossy`, so a chunk-capped cut
+/// through a multi-byte character would turn it into replacement characters on
+/// BOTH sides of the split. Bytes that are invalid for other reasons keep
+/// today's lossy behaviour.
+pub(crate) fn utf8_safe_end(data: &[u8]) -> usize {
+    match std::str::from_utf8(data) {
+        Ok(_) => data.len(),
+        // A truncated final sequence (`error_len() == None`) is exactly the cut
+        // we are allowed to move; anything else is pre-existing invalid input.
+        Err(error) if error.error_len().is_none() => error.valid_up_to(),
+        Err(_) => data.len(),
+    }
+}
+
 /// Write `payload` as one SSE `data` event, splitting on line terminators to
 /// prevent `data:` injection.
 pub(crate) fn sse_data_event(out: &mut String, payload: &str) {
@@ -2716,19 +2731,38 @@ impl SseSource {
             }
             let t = *self.rxw.borrow_and_update();
             if t.bytes > self.pos {
+                // One event carries at most the read chunk cap. SSE is already an
+                // incremental framing, but a subscriber starting at `offset=0` (or
+                // reconnecting far behind the tail) would otherwise materialize
+                // and encode the whole backlog in one frame — the same unbounded
+                // read memory the cap exists to prevent. A capped batch simply
+                // leaves `pos` short of the tail, so `up_to_date`/`closed_now`
+                // stay false and the next call emits the following batch.
+                let end = match chunk_capped_end(&self.st, self.pos, t.bytes).await {
+                    ChunkEnd::At(end) => end,
+                    // Unreadable or not value-aligned: end the stream without
+                    // advancing `pos`, exactly like a failed read below.
+                    _ => {
+                        self.done = true;
+                        return None;
+                    }
+                };
+                if end < t.bytes {
+                    crate::telemetry::record_chunk_capped("sse");
+                }
                 // Read new range and emit data + control. Caught-up subscribers
                 // share the resident tail chunk — one read for all of them —
                 // and fall back to a file read only when behind it.
                 let read_t0 = crate::telemetry::Timer::start();
                 let cache_hit;
-                let data = match self.st.tail_chunk_slice(self.pos, t.bytes) {
+                let data = match self.st.tail_chunk_slice(self.pos, end) {
                     Some(b) => {
                         cache_hit = true;
                         b
                     }
                     None => {
                         cache_hit = false;
-                        match read_range_bytes(&self.st, self.pos, t.bytes).await {
+                        match read_range_bytes(&self.st, self.pos, end).await {
                             Ok(d) => d,
                             // End the stream without advancing `pos`: the client
                             // reconnects from its last offset, never skipping a gap.
@@ -2741,9 +2775,21 @@ impl SseSource {
                 };
                 crate::telemetry::record_tail_cache(cache_hit, "sse");
                 crate::telemetry::record_read(read_t0.elapsed_secs(), "sse", cache_hit);
+                // A capped `text/*` frame must not split a UTF-8 character.
+                let (data, end) = match self.encoding {
+                    SseEncoding::Text if end < t.bytes => {
+                        let safe = utf8_safe_end(&data);
+                        if safe == 0 {
+                            (data, end)
+                        } else {
+                            (data.slice(..safe), self.pos + safe as u64)
+                        }
+                    }
+                    _ => (data, end),
+                };
                 let mut ev = String::new();
                 sse_encode_data(&mut ev, &data, self.encoding);
-                self.pos = t.bytes;
+                self.pos = end;
                 let up_to_date = self.pos >= self.st.tail().bytes;
                 // If the stream closed atomically with this final data, fold the
                 // close into this control event (streamClosed:true) rather than
@@ -5210,6 +5256,136 @@ mod chunk_cap_tests {
         // The same stream read from a server-issued offset still pages fine.
         let values = drain_json(&store, "c/strings").await;
         assert_eq!(values.len(), 8);
+    }
+
+    /// SSE catch-up is bounded by the same cap. A subscriber starting at
+    /// `offset=0` on a large stream used to materialize and encode the whole
+    /// backlog in one frame; it now arrives as several data/control pairs, with
+    /// `upToDate` only on the last.
+    #[tokio::test]
+    async fn sse_catch_up_is_delivered_in_capped_frames() {
+        let _durability = test_support::DurabilityGuard::memory();
+        let _cap = test_support::MaxChunkGuard::bytes(512);
+        let dir = tmp("sse-cap");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "sse/json", "application/json").await;
+        for i in 0..40 {
+            append(
+                &store,
+                "sse/json",
+                "application/json",
+                json_item(i, 60).as_bytes(),
+            )
+            .await;
+        }
+
+        let resp = handle(
+            Arc::clone(&store),
+            Req {
+                method: Method::Get,
+                path: "sse/json".into(),
+                query: Some(format!("live=sse&offset={}", format_offset(0))),
+                headers: vec![],
+                body: Bytes::new(),
+            },
+        )
+        .await;
+        let Body::Sse(mut source) = resp.body else {
+            panic!("expected an inline SSE source")
+        };
+
+        let mut values: Vec<serde_json::Value> = Vec::new();
+        let mut frames = 0;
+        loop {
+            let chunk = source
+                .next_chunk()
+                .await
+                .expect("SSE must reach up-to-date");
+            let frame = String::from_utf8(chunk.to_vec()).unwrap();
+            frames += 1;
+            assert!(frames < 50, "SSE catch-up must terminate");
+            for line in frame.lines() {
+                if let Some(payload) = line.strip_prefix("data:[") {
+                    let page: Vec<serde_json::Value> =
+                        serde_json::from_str(&format!("[{payload}")).expect("valid JSON array");
+                    assert!(
+                        payload.len() < 512 + 64,
+                        "an SSE data frame must respect the cap"
+                    );
+                    values.extend(page);
+                }
+            }
+            if frame.contains("\"upToDate\":true") {
+                break;
+            }
+        }
+        assert!(frames > 1, "the backlog must be split across frames");
+        assert_eq!(values.len(), 40, "every value arrives exactly once");
+        for (i, value) in values.iter().enumerate() {
+            assert_eq!(value["i"], serde_json::json!(i as i64));
+        }
+    }
+
+    /// A capped `text/*` SSE frame is encoded lossily, so the cut must not land
+    /// inside a multi-byte character.
+    #[tokio::test]
+    async fn capped_text_sse_frames_do_not_split_utf8() {
+        let _durability = test_support::DurabilityGuard::memory();
+        // 100 is not a multiple of 3, so an unaligned cut would land inside one
+        // of the three-byte characters below.
+        let _cap = test_support::MaxChunkGuard::bytes(100);
+        let dir = tmp("sse-utf8");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        create(&store, "sse/text", "text/plain").await;
+        let payload = "★".repeat(200);
+        append(&store, "sse/text", "text/plain", payload.as_bytes()).await;
+
+        let resp = handle(
+            Arc::clone(&store),
+            Req {
+                method: Method::Get,
+                path: "sse/text".into(),
+                query: Some(format!("live=sse&offset={}", format_offset(0))),
+                headers: vec![],
+                body: Bytes::new(),
+            },
+        )
+        .await;
+        let Body::Sse(mut source) = resp.body else {
+            panic!("expected an inline SSE source")
+        };
+
+        let mut text = String::new();
+        let mut frames = 0;
+        for _ in 0..50 {
+            let chunk = source
+                .next_chunk()
+                .await
+                .expect("SSE must reach up-to-date");
+            let frame = String::from_utf8(chunk.to_vec()).unwrap();
+            frames += 1;
+            // One chunk carries a `data` event followed by its `control` event;
+            // only the former holds stream bytes.
+            let mut in_data = false;
+            for line in frame.lines() {
+                if let Some(kind) = line.strip_prefix("event: ") {
+                    in_data = kind == "data";
+                } else if in_data {
+                    if let Some(data) = line.strip_prefix("data:") {
+                        text.push_str(data);
+                    }
+                }
+            }
+            if frame.contains("\"upToDate\":true") {
+                break;
+            }
+        }
+        assert!(frames > 1, "the text backlog must be split across frames");
+        assert!(
+            !text.contains('\u{fffd}'),
+            "a capped text frame must not split a UTF-8 character"
+        );
+        assert_eq!(text, payload, "the text stream reassembles exactly");
     }
 
     /// A long-poll that returns a backlog is a read like any other: the same cap
