@@ -613,6 +613,83 @@ fn readiness_is_attested_and_admin_paths_are_reserved() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Readiness advertises a cap so a client can size its response buffer before
+/// its first read; the number is only worth publishing if it is the same one
+/// the read path applies. This drives both through the real process: what
+/// `/_admin/ready` says, and where a read of a larger backlog actually stops.
+#[test]
+fn readiness_advertises_the_chunk_cap_reads_actually_apply() {
+    const CAP: u64 = 128;
+    let dir = std::env::temp_dir().join("ds-rust-cli-ready-chunk-cap");
+    let _ = std::fs::remove_dir_all(&dir);
+    bootstrap(&dir);
+    let port = unused_local_port();
+    let mut args = wal_args(&dir, &port.to_string());
+    args.push("--max-chunk-bytes".to_string());
+    args.push(CAP.to_string());
+    let mut child = server()
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("server");
+
+    let ready = http_response(
+        port,
+        "GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    // 200 or 503: a test filesystem under the production 20 GiB reserve is not
+    // ready, but the document it serves must still be complete.
+    assert!(
+        ready.starts_with("HTTP/1.1 200") || ready.starts_with("HTTP/1.1 503"),
+        "{ready}"
+    );
+    assert!(
+        ready.contains(&format!("\"max_chunk_bytes\":{CAP}")),
+        "readiness must publish the configured cap: {ready}"
+    );
+
+    let created = http_response(
+        port,
+        "PUT /capped HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(created.contains(" 201"), "create: {created}");
+    let payload = "x".repeat(2000);
+    let appended = http_response(
+        port,
+        &format!(
+            "POST /capped HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(appended.contains(" 204"), "append: {appended}");
+    let read = http_response(
+        port,
+        "GET /capped HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    let page_end: u64 = read
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("stream-next-offset:")
+                .map(|value| value.trim().to_string())
+        })
+        .unwrap_or_else(|| panic!("no Stream-Next-Offset in: {read}"))
+        .rsplit('_')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("numeric offset");
+    assert_eq!(
+        page_end, CAP,
+        "the advertised cap must be the one the read path applies"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The explicit-data-dir guard is wal-only. Memory mode makes no WAL durability claim, so a
 /// defaulted temp data dir remains coherent; it is still lifetime-locked once selected.
 #[test]
