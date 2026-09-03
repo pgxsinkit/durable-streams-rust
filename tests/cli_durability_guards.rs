@@ -820,7 +820,7 @@ fn the_readiness_document_is_never_served_from_a_cache() {
     assert!(
         ready
             .lines()
-            .any(|line| line.to_ascii_lowercase() == "cache-control: no-store"),
+            .any(|line| line.eq_ignore_ascii_case("cache-control: no-store")),
         "readiness must be uncacheable so a reconnect revalidates the bound: {ready}"
     );
 }
