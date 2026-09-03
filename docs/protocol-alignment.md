@@ -154,13 +154,19 @@ body limit is below `max_value_bytes` is not misconfigured — a 1 GiB limit is 
 a reasonable ask — but it should expect that a single oversize message will fail
 its read, and say so in the error rather than blaming the page cap.
 
-The field is **always present**, and `0` means uncapped. An absent field and a
-`0` would otherwise be indistinguishable to a reader, and the two are not the
-same claim: absent means "this store predates the field", `0` means "this store
-will hand you the whole remainder in one response". A consumer that sizes its
-own response buffer from readiness — the Electric Circuits engine checks it once
-at boot and falls back to a larger client-side body cap when the store says
-nothing — can then tell an older store from a deliberately uncapped one.
+Both fields are **always present**, and `0` means unbounded. An absent field and
+a `0` are not the same claim — absent means "this store predates the field", `0`
+means "this store will hand you the whole remainder in one response" — so the
+wire keeps them distinct and this server never omits either.
+
+That distinction is available to a reader, not yet used by one. The Electric
+Circuits engine decodes `max_chunk_bytes` as `Option<u64>` and its
+`assess_page_cap` deliberately folds both `None` and `Some(0)` into a single
+`Unknown` verdict with one "uncapped or older store" warning, because its
+response is the same either way: fall back to the larger client-side body cap.
+The wire preserving the distinction is what lets a consumer separate the two
+later — report an old store as a deployment gap and an uncapped one as a
+configuration choice — without a second contract change.
 
 `contract_version` stays `durable-streams-store-ready-v1`. The change is
 additive: it adds a field to the document and removes none, so a reader written
