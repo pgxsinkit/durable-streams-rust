@@ -107,7 +107,6 @@ pub(crate) mod test_support {
     use tokio::sync::Notify;
 
     static MODE_LOCK: Mutex<()> = Mutex::new(());
-    static CHUNK_LOCK: Mutex<()> = Mutex::new(());
     static APPEND_HOOK: Mutex<Option<Arc<AppendHook>>> = Mutex::new(None);
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +182,11 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Exclusive access to the process-wide server settings a test may change:
+    /// the durability mode and the read chunk cap. Both are globals, so they
+    /// share ONE lock — a cap set under a lock of its own could be observed by
+    /// an unrelated test that holds only the durability guard. Dropping the
+    /// guard restores both defaults.
     pub(crate) struct DurabilityGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
 
     impl DurabilityGuard {
@@ -197,28 +201,18 @@ pub(crate) mod test_support {
             set_durability(DurabilityMode::Memory);
             DurabilityGuard(g)
         }
+
+        /// Memory mode with the read chunk cap pinned for the guard's lifetime.
+        pub(crate) fn memory_with_max_chunk(cap: u64) -> Self {
+            let guard = Self::memory();
+            set_max_chunk_bytes(cap);
+            guard
+        }
     }
 
     impl Drop for DurabilityGuard {
         fn drop(&mut self) {
             set_durability(DurabilityMode::Wal);
-        }
-    }
-
-    /// Pins the process-wide read chunk cap for one test (it is a global, like
-    /// the durability mode) and restores the default on drop.
-    pub(crate) struct MaxChunkGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
-
-    impl MaxChunkGuard {
-        pub(crate) fn bytes(cap: u64) -> Self {
-            let g = CHUNK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            set_max_chunk_bytes(cap);
-            MaxChunkGuard(g)
-        }
-    }
-
-    impl Drop for MaxChunkGuard {
-        fn drop(&mut self) {
             set_max_chunk_bytes(DEFAULT_MAX_CHUNK_BYTES);
         }
     }
@@ -4939,8 +4933,7 @@ mod chunk_cap_tests {
     /// follow-up read from its `Stream-Next-Offset` returns the rest.
     #[tokio::test]
     async fn json_pages_are_valid_arrays_and_resume_from_next_offset() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(512);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
         let dir = tmp("json-pages");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "c/json", "application/json").await;
@@ -5002,8 +4995,7 @@ mod chunk_cap_tests {
     /// A byte stream may be cut at any byte: the page is exactly the cap.
     #[tokio::test]
     async fn byte_stream_is_cut_at_the_cap() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(256);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(256);
         let dir = tmp("bytes-cut");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "c/bytes", "application/octet-stream").await;
@@ -5033,8 +5025,7 @@ mod chunk_cap_tests {
     /// `--max-chunk-bytes 0` restores the uncapped single-response behaviour.
     #[tokio::test]
     async fn cap_zero_is_unlimited() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(0);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(0);
         let dir = tmp("cap-zero");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "c/unlimited", "application/octet-stream").await;
@@ -5051,8 +5042,7 @@ mod chunk_cap_tests {
     /// page must never come back empty: the oversize value is served whole.
     #[tokio::test]
     async fn oversize_json_value_is_served_whole() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(64);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(64);
         let dir = tmp("oversize-json");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "c/big", "application/json").await;
@@ -5084,8 +5074,7 @@ mod chunk_cap_tests {
     /// delivered: intermediate pages must not claim `Stream-Closed` (§5.6).
     #[tokio::test]
     async fn closed_is_reported_only_on_the_final_page() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(128);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(128);
         let dir = tmp("closed-pages");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "c/closed", "application/octet-stream").await;
@@ -5127,8 +5116,7 @@ mod chunk_cap_tests {
     /// for a capped page answers 304 with the same partial-page headers.
     #[tokio::test]
     async fn conditional_request_matches_the_partial_page() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(128);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(128);
         let dir = tmp("partial-etag");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "c/etag", "application/octet-stream").await;
@@ -5228,8 +5216,7 @@ mod chunk_cap_tests {
     /// once each, in order.
     #[tokio::test]
     async fn fork_reads_page_across_the_cap() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(512);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
         let dir = tmp("fork-cap");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "f/src", "application/json").await;
@@ -5270,8 +5257,7 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn cold_tier_pages_are_valid_json() {
         use crate::tier::TierKind;
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(512);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
         let dir = tmp("cold-cap");
         let tier = TierConfig {
             kind: TierKind::Local,
@@ -5310,8 +5296,7 @@ mod chunk_cap_tests {
     /// up-to-date.
     #[tokio::test]
     async fn mid_value_offset_fails_closed_instead_of_serving_the_tail() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(256);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(256);
         let dir = tmp("mid-value");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "c/strings", "application/json").await;
@@ -5338,8 +5323,7 @@ mod chunk_cap_tests {
     /// `upToDate` only on the last.
     #[tokio::test]
     async fn sse_catch_up_is_delivered_in_capped_frames() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(512);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
         let dir = tmp("sse-cap");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "sse/json", "application/json").await;
@@ -5404,10 +5388,9 @@ mod chunk_cap_tests {
     /// inside a multi-byte character.
     #[tokio::test]
     async fn capped_text_sse_frames_do_not_split_utf8() {
-        let _durability = test_support::DurabilityGuard::memory();
         // 100 is not a multiple of 3, so an unaligned cut would land inside one
         // of the three-byte characters below.
-        let _cap = test_support::MaxChunkGuard::bytes(100);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(100);
         let dir = tmp("sse-utf8");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "sse/text", "text/plain").await;
@@ -5467,8 +5450,7 @@ mod chunk_cap_tests {
     /// capped JSON page (one extra range read per page on a cold tier).
     #[tokio::test]
     async fn capped_json_page_is_served_from_the_scanned_bytes() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(512);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
         let dir = tmp("json-single-read");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "c/once", "application/json").await;
@@ -5500,9 +5482,8 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn oversize_json_value_is_scanned_without_rereads() {
         use std::sync::atomic::Ordering;
-        let _durability = test_support::DurabilityGuard::memory();
         let cap = 1024;
-        let _guard = test_support::MaxChunkGuard::bytes(cap);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(cap);
         let dir = tmp("no-reread");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "c/reread", "application/json").await;
@@ -5534,12 +5515,39 @@ mod chunk_cap_tests {
         );
     }
 
+    /// The chunk cap is a process-wide global, exactly like the durability mode,
+    /// so its test guard must hold the SAME lock. With a lock of its own, a test
+    /// holding only the durability guard can be running while a chunk test sets a
+    /// 128-byte cap — and unrelated reads then page unexpectedly.
+    #[test]
+    fn the_chunk_cap_guard_shares_the_durability_lock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let held = test_support::DurabilityGuard::memory();
+        let worker = std::thread::spawn(move || {
+            let _capped = test_support::DurabilityGuard::memory_with_max_chunk(128);
+            let _ = tx.send(max_chunk_bytes());
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let observed = rx.recv_timeout(Duration::from_millis(250));
+        assert!(
+            observed.is_err(),
+            "the cap must not change while another test holds the durability lock; observed {observed:?}"
+        );
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(
+            max_chunk_bytes(),
+            DEFAULT_MAX_CHUNK_BYTES,
+            "dropping the guard restores the default cap"
+        );
+    }
+
     /// A long-poll that returns a backlog is a read like any other: the same cap
     /// applies, so one wake cannot deliver a whole stream.
     #[tokio::test]
     async fn long_poll_backlog_is_capped() {
-        let _durability = test_support::DurabilityGuard::memory();
-        let _cap = test_support::MaxChunkGuard::bytes(256);
+        let _durability = test_support::DurabilityGuard::memory_with_max_chunk(256);
         let dir = tmp("long-poll-cap");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         create(&store, "c/lp", "application/octet-stream").await;
