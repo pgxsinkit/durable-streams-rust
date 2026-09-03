@@ -67,6 +67,7 @@ jobs:
           - { name: wal-resident-cache, args: '--tail-cache-bytes 65536' }
           - { name: wal-read-offload-always, args: '--read-offload always' }
           - { name: memory, args: '--durability memory' }
+          - { name: wal-small-chunk, args: '--max-chunk-bytes 4096' }
     steps:
       - uses: actions/checkout@v4
 

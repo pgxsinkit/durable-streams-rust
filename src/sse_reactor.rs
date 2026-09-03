@@ -408,16 +408,22 @@ impl Reactor {
                     frame_terminator(&mut sub.pending);
                     return;
                 }
-                let want = (tail - sub.write_off) as usize;
-                let mut data = vec![0u8; want];
-                if pread_exact(&file, sub.write_off - file_base, &mut data).is_err() {
+                // Bounded by the read chunk cap: a subscriber reconnecting far
+                // behind the tail must not allocate and frame the whole backlog
+                // in one event. The loop below continues, so the catch-up is
+                // delivered as several data/control pairs (with `up_to_date`
+                // false until the last one), and `backlog(sub) > PENDING_CAP`
+                // still governs a subscriber that cannot keep up.
+                let Some((end, data)) =
+                    read_capped_frame(&file, file_base, sub.write_off, tail, sub.encoding)
+                else {
                     sub.done = true;
                     frame_terminator(&mut sub.pending);
                     return;
-                }
+                };
                 let mut ev = String::new();
                 crate::handlers::sse_encode_data(&mut ev, &data, sub.encoding);
-                sub.write_off = tail;
+                sub.write_off = end;
                 let cur = sub.st.tail();
                 let up_to_date = sub.write_off >= cur.bytes;
                 let closed_now = closed && sub.write_off >= tail;
@@ -662,6 +668,56 @@ fn push_frame(pending: &mut Vec<u8>, sent: &mut usize, frame: &[u8]) {
 /// Append the terminating chunk (`0\r\n\r\n`) that ends a chunked SSE response.
 fn frame_terminator(pending: &mut Vec<u8>) {
     pending.extend_from_slice(b"0\r\n\r\n");
+}
+
+/// Read the next catch-up frame for a subscriber from the live data file,
+/// bounded by the configured read chunk cap (`--max-chunk-bytes`, PROTOCOL.md
+/// §5.6). For JSON streams the frame must also end on a top-level value boundary
+/// so `sse_encode_data` can wrap it as `[ … ]`; when a single value is larger
+/// than the cap the window grows until that value completes, because there is no
+/// smaller well-formed frame. Returns the new write offset and its bytes, or
+/// `None` if the file read failed.
+fn read_capped_frame(
+    file: &std::fs::File,
+    file_base: u64,
+    write_off: u64,
+    tail: u64,
+    encoding: SseEncoding,
+) -> Option<(u64, Vec<u8>)> {
+    let remaining = tail - write_off;
+    let cap = crate::handlers::max_chunk_bytes();
+    let json = matches!(encoding, SseEncoding::Json);
+    let mut window = if cap == 0 {
+        remaining
+    } else {
+        cap.min(remaining)
+    };
+    loop {
+        let end = write_off + window;
+        let mut data = vec![0u8; window as usize];
+        pread_exact(file, write_off - file_base, &mut data).ok()?;
+        if end >= tail {
+            return Some((end, data));
+        }
+        if !json {
+            // A capped `text/*` frame must not split a UTF-8 character (it is
+            // encoded lossily); byte streams are base64 and cut anywhere.
+            if matches!(encoding, SseEncoding::Text) {
+                let safe = crate::handlers::utf8_safe_end(&data);
+                if safe > 0 && safe < data.len() {
+                    data.truncate(safe);
+                    return Some((write_off + safe as u64, data));
+                }
+            }
+            return Some((end, data));
+        }
+        let boundary = crate::tier::last_json_value_boundary(&data, window);
+        if boundary > 0 {
+            data.truncate(boundary as usize);
+            return Some((write_off + boundary, data));
+        }
+        window = window.saturating_mul(2).min(remaining);
+    }
 }
 
 fn pread_exact(file: &std::fs::File, mut off: u64, mut buf: &mut [u8]) -> std::io::Result<()> {

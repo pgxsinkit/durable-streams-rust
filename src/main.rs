@@ -248,6 +248,11 @@ fn main() {
     let mut minimum_free_inodes = DEFAULT_MINIMUM_FREE_INODES;
     let mut stream_lanes: Option<u32> = None;
     let mut expiry_reaper = ExpiryReaperConfig::default();
+    // `--max-chunk-bytes N` (env fallback `DS_MAX_CHUNK_BYTES`): the server-defined
+    // maximum chunk size a catch-up / long-poll read response may carry
+    // (PROTOCOL.md §5.6). `None` ⇒ the 4 MiB default; `0` ⇒ unlimited (one response
+    // per remaining byte range, the pre-cap behaviour).
+    let mut max_chunk_bytes: Option<u64> = None;
     let mut args = raw_args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -279,6 +284,12 @@ fn main() {
             }
             "--long-poll-timeout-ms" => {
                 handlers::set_long_poll_timeout(parse_val(args.next(), "--long-poll-timeout-ms"));
+            }
+            // Maximum bytes one read response may carry (PROTOCOL.md §5.6);
+            // `0` = unlimited. Applied after the loop so the flag wins over
+            // `DS_MAX_CHUNK_BYTES`.
+            "--max-chunk-bytes" => {
+                max_chunk_bytes = Some(parse_val(args.next(), "--max-chunk-bytes"));
             }
             "--expiry-reaper-mode" => {
                 let value = val(args.next(), "--expiry-reaper-mode");
@@ -485,6 +496,18 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+
+    // Flag wins; otherwise honour the env fallback. An unparseable env value is a
+    // misconfiguration, not something to silently ignore.
+    let max_chunk_bytes = max_chunk_bytes.or_else(|| match std::env::var("DS_MAX_CHUNK_BYTES") {
+        Ok(raw) => Some(raw.parse::<u64>().unwrap_or_else(|_| {
+            exit_usage(format!("DS_MAX_CHUNK_BYTES got an invalid value: {raw:?}"))
+        })),
+        Err(_) => None,
+    });
+    if let Some(bytes) = max_chunk_bytes {
+        handlers::set_max_chunk_bytes(bytes);
     }
 
     if expiry_reaper.mode == ExpiryReaperMode::Delete && tier.kind == tier::TierKind::S3 {
