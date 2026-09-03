@@ -690,6 +690,86 @@ fn readiness_advertises_the_chunk_cap_reads_actually_apply() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `max_chunk_bytes` is a page target, not a hard bound on the response. A JSON
+/// stream cuts only on a top-level value boundary, so a single value larger than
+/// the cap is framed whole — a consumer that treated the page cap as an upper
+/// bound would reject a response the server is entitled to send. Readiness
+/// therefore publishes the other half of the bound, and this pins both halves
+/// against a server that actually overshoots.
+#[test]
+fn an_oversize_value_is_served_whole_and_readiness_bounds_it() {
+    const CAP: u64 = 128;
+    /// `crate::api::MAX_BODY_BYTES`, the largest request body the server accepts
+    /// and therefore the largest single message it can be made to emit whole.
+    const VALUE_BOUND: u64 = 1024 * 1024 * 1024;
+    let dir = std::env::temp_dir().join("ds-rust-cli-oversize-value");
+    let _ = std::fs::remove_dir_all(&dir);
+    bootstrap(&dir);
+    let port = unused_local_port();
+    let mut args = wal_args(&dir, &port.to_string());
+    args.push("--max-chunk-bytes".to_string());
+    args.push(CAP.to_string());
+    let mut child = server()
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("server");
+
+    let ready = http_response(
+        port,
+        "GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        ready.contains(&format!("\"max_chunk_bytes\":{CAP}")),
+        "readiness must publish the nominal page cap: {ready}"
+    );
+    assert!(
+        ready.contains(&format!("\"max_value_bytes\":{VALUE_BOUND}")),
+        "readiness must publish the single-value bound: {ready}"
+    );
+
+    let created = http_response(
+        port,
+        "PUT /oversize HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(created.contains(" 201"), "create: {created}");
+    // One JSON value, comfortably larger than the cap: there is no well-formed
+    // page smaller than the whole value.
+    let value = format!("{{\"m\":\"{}\"}}", "x".repeat(500));
+    assert!(value.len() as u64 > CAP);
+    let appended = http_response(
+        port,
+        &format!(
+            "POST /oversize HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{value}",
+            value.len()
+        ),
+    );
+    assert!(appended.contains(" 204"), "append: {appended}");
+
+    let read = http_response(
+        port,
+        "GET /oversize HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    let body = read
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or_else(|| panic!("no body in: {read}"));
+    assert_eq!(
+        body,
+        format!("[{value}]"),
+        "the oversize value must be framed whole, not split"
+    );
+    assert!(
+        body.len() as u64 > CAP,
+        "this test is only meaningful if the response overshoots the cap"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The explicit-data-dir guard is wal-only. Memory mode makes no WAL durability claim, so a
 /// defaulted temp data dir remains coherent; it is still lifetime-locked once selected.
 #[test]

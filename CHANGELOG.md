@@ -21,13 +21,18 @@
   data/control pairs instead of one event framing the whole remainder. Capped
   `text/*` frames are cut on UTF-8 character boundaries.
 
-- Advertise the effective read chunk cap in the store readiness document.
+- Advertise the read response bound in the store readiness document.
 
   `GET /_admin/ready` now carries a top-level `max_chunk_bytes` (the effective
-  `--max-chunk-bytes`, `0` when reads are uncapped). The field is always present, so a
-  client reading readiness at boot can size its own response buffer against the page the
-  store will actually serve instead of guessing — previously the cap was unobservable
-  and a consumer could only assume an unbounded response.
+  `--max-chunk-bytes`, `0` when reads are uncapped) and `max_value_bytes` (the largest
+  single message the server accepts). Both are always present, so a client reading
+  readiness at boot can size its own response buffer instead of guessing — previously
+  the bound was unobservable and a consumer could only assume an unbounded response.
+
+  `max_chunk_bytes` is a page *target*, not the response bound: a JSON page cuts only on
+  a top-level value boundary, so a single value larger than the target is framed whole.
+  A response body is at most `max(max_chunk_bytes, max_value_bytes)` plus the 2-byte JSON
+  array framing (byte streams cut at any byte, so the target alone bounds them).
 
 ## 0.1.5
 

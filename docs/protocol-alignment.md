@@ -128,9 +128,31 @@ A cap the client cannot see is a cap the client has to guess at. `GET
   "manifest": { "...": "..." },
   "recovery": { "...": "..." },
   "reserve": { "...": "..." },
-  "max_chunk_bytes": 4194304
+  "max_chunk_bytes": 4194304,
+  "max_value_bytes": 1073741824
 }
 ```
+
+**`max_chunk_bytes` is a page target, not the response bound.** A JSON page cuts
+only on a top-level value boundary, and a single value larger than the target is
+framed whole because there is no smaller well-formed page (above). So a consumer
+that sized a body limit from `max_chunk_bytes` alone would reject a response this
+server is entitled to send. `max_value_bytes` is the other half of the bound: the
+largest single message the store accepts on append (`MAX_BODY_BYTES`, 1 GiB), and
+therefore the largest it can be required to emit whole.
+
+The exact contract is:
+
+> A read response body is at most `max(max_chunk_bytes, max_value_bytes)` plus
+> framing, where framing is the 2-byte `[`/`]` array wrapper on an
+> `application/json` stream and nothing on a byte stream. `max_chunk_bytes` of
+> `0` means unbounded and the formula does not apply.
+
+Byte streams cut at any byte, so for them `max_chunk_bytes` alone is a hard
+bound; only JSON streams can overshoot, and only by one value. A consumer whose
+body limit is below `max_value_bytes` is not misconfigured — a 1 GiB limit is not
+a reasonable ask — but it should expect that a single oversize message will fail
+its read, and say so in the error rather than blaming the page cap.
 
 The field is **always present**, and `0` means uncapped. An absent field and a
 `0` would otherwise be indistinguishable to a reader, and the two are not the

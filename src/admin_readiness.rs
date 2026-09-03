@@ -28,11 +28,20 @@ struct ReadyResponse<'a> {
     manifest: &'a StoreManifestV1,
     recovery: Recovery,
     reserve: Reserve,
-    /// Effective `--max-chunk-bytes`: the largest body one read response may
-    /// carry (PROTOCOL.md §5.6). Always present, `0` when reads are uncapped,
-    /// so a client can size its own response buffer from the readiness
-    /// document instead of guessing.
+    /// Effective `--max-chunk-bytes`: the per-response page *target* the read
+    /// path aims for (PROTOCOL.md §5.6). Always present, `0` when reads are
+    /// uncapped. Not on its own an upper bound on the response — see
+    /// `max_value_bytes`.
     max_chunk_bytes: u64,
+    /// The largest single message the store accepts, and therefore the largest
+    /// it can be required to emit whole: a JSON page cuts only on a top-level
+    /// value boundary, so one value larger than the page target is framed whole
+    /// rather than split into malformed halves. A response body is at most
+    /// `max(max_chunk_bytes, max_value_bytes)` plus framing (the 2-byte `[`/`]`
+    /// array wrapper on a JSON stream, nothing on a byte stream). `0` would mean
+    /// unbounded. Byte streams cut at any byte, so the page target alone bounds
+    /// them.
+    max_value_bytes: u64,
 }
 #[derive(Serialize)]
 struct Recovery {
@@ -129,6 +138,7 @@ impl AdminReadiness {
                 satisfied: reserve_ok,
             },
             max_chunk_bytes: crate::handlers::max_chunk_bytes(),
+            max_value_bytes: crate::api::MAX_BODY_BYTES as u64,
         })
         .expect("ready response serializes");
         (if completed && reserve_ok { 200 } else { 503 }, body)
@@ -221,6 +231,31 @@ mod tests {
             "an uncapped store must still publish the field: {body}"
         );
         assert_eq!(body["max_chunk_bytes"], 0);
+    }
+
+    /// `max_chunk_bytes` is a page *target*, not a hard response bound: a JSON
+    /// stream cuts only on a top-level value boundary, so a single value larger
+    /// than the cap is served whole (there is no smaller well-formed page). A
+    /// consumer sizing a body limit needs the other half of that bound — the
+    /// largest single message the store will accept.
+    #[test]
+    fn readiness_advertises_the_single_value_bound_beside_the_page_cap() {
+        let _settings = crate::handlers::test_support::DurabilityGuard::memory_with_max_chunk(128);
+        let readiness = AdminReadiness::new(
+            manifest(),
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            0,
+            0,
+        );
+        readiness.ready();
+        let (_, body) = readiness.json(std::path::Path::new("."));
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["max_chunk_bytes"], 128);
+        assert_eq!(
+            body["max_value_bytes"],
+            crate::api::MAX_BODY_BYTES as u64,
+            "the value bound is the largest append the store accepts: {body}"
+        );
     }
 
     #[test]
