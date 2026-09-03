@@ -34,6 +34,12 @@
   A response body is at most `max(max_chunk_bytes, max_value_bytes)` plus the 2-byte JSON
   array framing (byte streams cut at any byte, so the target alone bounds them).
 
+  Both are startup properties rather than store identity, so a consumer must re-read
+  readiness on every reconnect: a restart with a different `--max-chunk-bytes` changes
+  the bound under an unchanged `store_id`/`store_generation`/`artifact_digest`. The
+  readiness response is now served `Cache-Control: no-store` so that re-read cannot be
+  answered from a stored copy.
+
 ## 0.1.5
 
 ### Patch Changes

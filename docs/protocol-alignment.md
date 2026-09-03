@@ -167,6 +167,25 @@ additive: it adds a field to the document and removes none, so a reader written
 against the earlier v1 shape still parses this one. Reserving a version bump for
 a breaking change is what keeps the version meaningful.
 
+**Consumers MUST re-read readiness on every reconnect.** Both numbers are
+startup properties, not store identity. `--max-chunk-bytes` is a flag: the same
+store restarted with a different value serves a different bound under an
+unchanged `store_id`, `store_generation` and `artifact_digest`, so nothing a
+consumer already caches would tell it the bound moved. A consumer that read
+readiness once at first connect and kept the verdict will, after such a restart,
+either refuse pages the store is now entitled to send or accept a bound it can
+no longer honour.
+
+There is deliberately no config-generation field to watch instead.
+`store_generation` is the store's persisted identity, validated against the
+on-disk manifest on every boot — encoding a runtime flag in it would make a flag
+change look like a different store. `artifact_digest` attests the binary, and the
+binary does not change when a flag does. Re-reading the document is the check.
+
+The readiness response is therefore served `Cache-Control: no-store`: a
+revalidation that an intermediary may answer from a stored copy is not a
+revalidation.
+
 ## Production behavior beyond the published fixture
 
 The six upstream subscription cases do not exercise restart and deployment

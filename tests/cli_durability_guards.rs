@@ -803,6 +803,28 @@ fn a_failing_assertion_still_reaps_the_server_and_its_data_dir() {
     assert!(!dir.exists(), "the data directory was left behind: {dir:?}");
 }
 
+/// The advertised bound is a startup property, not part of the store identity:
+/// the same store restarted with a different `--max-chunk-bytes` serves a
+/// different document under an unchanged `store_id`, `store_generation` and
+/// `artifact_digest`. A consumer's only defence is to re-read readiness on every
+/// reconnect, which is worth nothing if an intermediary may answer that re-read
+/// from a copy. So the document must not be storable.
+#[test]
+fn the_readiness_document_is_never_served_from_a_cache() {
+    let dir = std::env::temp_dir().join("ds-rust-cli-readiness-no-store");
+    let _ = std::fs::remove_dir_all(&dir);
+    bootstrap(&dir);
+    let server = ServerUnderTest::wal(&dir, &[]);
+    let ready = server
+        .request("GET /_admin/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert!(
+        ready
+            .lines()
+            .any(|line| line.to_ascii_lowercase() == "cache-control: no-store"),
+        "readiness must be uncacheable so a reconnect revalidates the bound: {ready}"
+    );
+}
+
 /// The explicit-data-dir guard is wal-only. Memory mode makes no WAL durability claim, so a
 /// defaulted temp data dir remains coherent; it is still lifetime-locked once selected.
 #[test]
