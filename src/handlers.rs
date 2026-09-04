@@ -414,6 +414,13 @@ async fn dispatch(
                 response
                     .headers
                     .push(("content-type", "application/json".to_string()));
+                // The document reports live state (recovery, reserve) and a
+                // startup-configured bound that a restart may change under an
+                // unchanged store identity. A consumer revalidates by re-reading
+                // it, so a stored copy would defeat the only defence it has.
+                response
+                    .headers
+                    .push(("cache-control", "no-store".to_string()));
                 response.body = full(body);
                 response
             }

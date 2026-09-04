@@ -28,6 +28,20 @@ struct ReadyResponse<'a> {
     manifest: &'a StoreManifestV1,
     recovery: Recovery,
     reserve: Reserve,
+    /// Effective `--max-chunk-bytes`: the per-response page *target* the read
+    /// path aims for (PROTOCOL.md §5.6). Always present, `0` when reads are
+    /// uncapped. Not on its own an upper bound on the response — see
+    /// `max_value_bytes`.
+    max_chunk_bytes: u64,
+    /// The largest single message the store accepts, and therefore the largest
+    /// it can be required to emit whole: a JSON page cuts only on a top-level
+    /// value boundary, so one value larger than the page target is framed whole
+    /// rather than split into malformed halves. A response body is at most
+    /// `max(max_chunk_bytes, max_value_bytes)` plus framing (the 2-byte `[`/`]`
+    /// array wrapper on a JSON stream, nothing on a byte stream). `0` would mean
+    /// unbounded. Byte streams cut at any byte, so the page target alone bounds
+    /// them.
+    max_value_bytes: u64,
 }
 #[derive(Serialize)]
 struct Recovery {
@@ -123,6 +137,8 @@ impl AdminReadiness {
                 minimum_free_inodes: self.minimum_free_inodes,
                 satisfied: reserve_ok,
             },
+            max_chunk_bytes: crate::handlers::max_chunk_bytes(),
+            max_value_bytes: crate::api::MAX_BODY_BYTES as u64,
         })
         .expect("ready response serializes");
         (if completed && reserve_ok { 200 } else { 503 }, body)
@@ -176,6 +192,72 @@ mod tests {
             creation_time: "2026-08-27T19:00:00Z".into(),
         }
     }
+    /// The readiness document is how a client learns the store's read page
+    /// budget before its first read. `--max-chunk-bytes` is what the read path
+    /// applies, so that is the number readiness must publish.
+    #[test]
+    fn readiness_advertises_the_configured_read_chunk_cap() {
+        let _settings =
+            crate::handlers::test_support::DurabilityGuard::memory_with_max_chunk(65_536);
+        let readiness = AdminReadiness::new(
+            manifest(),
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            0,
+            0,
+        );
+        readiness.ready();
+        let (_, body) = readiness.json(std::path::Path::new("."));
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["max_chunk_bytes"], 65_536);
+    }
+
+    /// `--max-chunk-bytes 0` (unlimited) must be advertised as `0`, not by
+    /// omitting the field: a client cannot distinguish an absent field from an
+    /// older store that does not publish one, so the field is always present.
+    #[test]
+    fn uncapped_reads_are_advertised_as_zero_rather_than_omitted() {
+        let _settings = crate::handlers::test_support::DurabilityGuard::memory_with_max_chunk(0);
+        let readiness = AdminReadiness::new(
+            manifest(),
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            0,
+            0,
+        );
+        readiness.ready();
+        let (_, body) = readiness.json(std::path::Path::new("."));
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body.as_object().unwrap().contains_key("max_chunk_bytes"),
+            "an uncapped store must still publish the field: {body}"
+        );
+        assert_eq!(body["max_chunk_bytes"], 0);
+    }
+
+    /// `max_chunk_bytes` is a page *target*, not a hard response bound: a JSON
+    /// stream cuts only on a top-level value boundary, so a single value larger
+    /// than the cap is served whole (there is no smaller well-formed page). A
+    /// consumer sizing a body limit needs the other half of that bound — the
+    /// largest single message the store will accept.
+    #[test]
+    fn readiness_advertises_the_single_value_bound_beside_the_page_cap() {
+        let _settings = crate::handlers::test_support::DurabilityGuard::memory_with_max_chunk(128);
+        let readiness = AdminReadiness::new(
+            manifest(),
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            0,
+            0,
+        );
+        readiness.ready();
+        let (_, body) = readiness.json(std::path::Path::new("."));
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["max_chunk_bytes"], 128);
+        assert_eq!(
+            body["max_value_bytes"],
+            crate::api::MAX_BODY_BYTES as u64,
+            "the value bound is the largest append the store accepts: {body}"
+        );
+    }
+
     #[test]
     fn reserve_failed_readiness_is_503_and_never_ready() {
         *TEST_FILESYSTEM_FREE.lock().unwrap() = Some((1, 1));

@@ -14,5 +14,7 @@
     "creation_time": "2026-08-27T19:00:00Z"
   },
   "recovery": { "completed": true, "wal_shards": [{ "shard": 0, "durable_lsn": 0, "checkpoint_lsn": 0 }, { "shard": 1, "durable_lsn": 0, "checkpoint_lsn": 0 }] },
-  "reserve": { "free_bytes": 1, "free_inodes": 1, "minimum_free_bytes": 21474836480, "minimum_free_inodes": 10000, "satisfied": false }
+  "reserve": { "free_bytes": 1, "free_inodes": 1, "minimum_free_bytes": 21474836480, "minimum_free_inodes": 10000, "satisfied": false },
+  "max_chunk_bytes": 4194304,
+  "max_value_bytes": 1073741824
 }

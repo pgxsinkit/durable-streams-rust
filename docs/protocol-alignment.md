@@ -113,6 +113,85 @@ CI runs the published conformance suite once more with `--max-chunk-bytes 4096`
 (the `wal-small-chunk` matrix entry) so the contract is exercised with chunking
 forced on nearly every read.
 
+### The cap is advertised in the readiness document
+
+A cap the client cannot see is a cap the client has to guess at. `GET
+/_admin/ready` therefore carries the effective value as a top-level
+`max_chunk_bytes` (integer bytes) alongside `manifest`, `recovery` and
+`reserve`:
+
+```json
+{
+  "contract_version": "durable-streams-store-ready-v1",
+  "status": "ready",
+  "artifact_digest": "sha256:...",
+  "manifest": { "...": "..." },
+  "recovery": { "...": "..." },
+  "reserve": { "...": "..." },
+  "max_chunk_bytes": 4194304,
+  "max_value_bytes": 1073741824
+}
+```
+
+**`max_chunk_bytes` is a page target, not the response bound.** A JSON page cuts
+only on a top-level value boundary, and a single value larger than the target is
+framed whole because there is no smaller well-formed page (above). So a consumer
+that sized a body limit from `max_chunk_bytes` alone would reject a response this
+server is entitled to send. `max_value_bytes` is the other half of the bound: the
+largest single message the store accepts on append (`MAX_BODY_BYTES`, 1 GiB), and
+therefore the largest it can be required to emit whole.
+
+The exact contract is:
+
+> A read response body is at most `max(max_chunk_bytes, max_value_bytes)` plus
+> framing, where framing is the 2-byte `[`/`]` array wrapper on an
+> `application/json` stream and nothing on a byte stream. `max_chunk_bytes` of
+> `0` means unbounded and the formula does not apply.
+
+Byte streams cut at any byte, so for them `max_chunk_bytes` alone is a hard
+bound; only JSON streams can overshoot, and only by one value. A consumer whose
+body limit is below `max_value_bytes` is not misconfigured — a 1 GiB limit is not
+a reasonable ask — but it should expect that a single oversize message will fail
+its read, and say so in the error rather than blaming the page cap.
+
+Both fields are **always present**, and `0` means unbounded. An absent field and
+a `0` are not the same claim — absent means "this store predates the field", `0`
+means "this store will hand you the whole remainder in one response" — so the
+wire keeps them distinct and this server never omits either.
+
+That distinction is available to a reader, not yet used by one. The Electric
+Circuits engine decodes `max_chunk_bytes` as `Option<u64>` and its
+`assess_page_cap` deliberately folds both `None` and `Some(0)` into a single
+`Unknown` verdict with one "uncapped or older store" warning, because its
+response is the same either way: fall back to the larger client-side body cap.
+The wire preserving the distinction is what lets a consumer separate the two
+later — report an old store as a deployment gap and an uncapped one as a
+configuration choice — without a second contract change.
+
+`contract_version` stays `durable-streams-store-ready-v1`. The change is
+additive: it adds a field to the document and removes none, so a reader written
+against the earlier v1 shape still parses this one. Reserving a version bump for
+a breaking change is what keeps the version meaningful.
+
+**Consumers MUST re-read readiness on every reconnect.** Both numbers are
+startup properties, not store identity. `--max-chunk-bytes` is a flag: the same
+store restarted with a different value serves a different bound under an
+unchanged `store_id`, `store_generation` and `artifact_digest`, so nothing a
+consumer already caches would tell it the bound moved. A consumer that read
+readiness once at first connect and kept the verdict will, after such a restart,
+either refuse pages the store is now entitled to send or accept a bound it can
+no longer honour.
+
+There is deliberately no config-generation field to watch instead.
+`store_generation` is the store's persisted identity, validated against the
+on-disk manifest on every boot — encoding a runtime flag in it would make a flag
+change look like a different store. `artifact_digest` attests the binary, and the
+binary does not change when a flag does. Re-reading the document is the check.
+
+The readiness response is therefore served `Cache-Control: no-store`: a
+revalidation that an intermediary may answer from a stored copy is not a
+revalidation.
+
 ## Production behavior beyond the published fixture
 
 The six upstream subscription cases do not exercise restart and deployment
