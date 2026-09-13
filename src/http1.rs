@@ -276,7 +276,15 @@ pub(crate) async fn decode_chunked<R: AsyncRead + Unpin>(
         }
         // Guard against overflow from a hostile chunk-size line.
         let need = match size.checked_add(2) {
-            Some(v) if out.len().checked_add(size).map(|t| t <= MAX_BODY_BYTES).unwrap_or(false) => v,
+            Some(v)
+                if out
+                    .len()
+                    .checked_add(size)
+                    .map(|t| t <= MAX_BODY_BYTES)
+                    .unwrap_or(false) =>
+            {
+                v
+            }
             _ => return Ok(None),
         };
         while buf.len() < need {
@@ -360,7 +368,9 @@ mod tests {
     #[tokio::test]
     async fn chunked_single() {
         assert_eq!(
-            decode_all_steps(b"5\r\nhello\r\n0\r\n\r\n").await.as_deref(),
+            decode_all_steps(b"5\r\nhello\r\n0\r\n\r\n")
+                .await
+                .as_deref(),
             Some(&b"hello"[..])
         );
     }
@@ -377,7 +387,10 @@ mod tests {
 
     #[tokio::test]
     async fn chunked_empty_body() {
-        assert_eq!(decode_all_steps(b"0\r\n\r\n").await.as_deref(), Some(&b""[..]));
+        assert_eq!(
+            decode_all_steps(b"0\r\n\r\n").await.as_deref(),
+            Some(&b""[..])
+        );
     }
 
     #[tokio::test]
@@ -443,7 +456,9 @@ mod tests {
         let mut reader = ChunkedReader::new(b"x", 1);
         let mut buf = BytesMut::new();
         assert_eq!(
-            read_sized(&mut reader, &mut buf, MAX_BODY_BYTES + 1).await.unwrap(),
+            read_sized(&mut reader, &mut buf, MAX_BODY_BYTES + 1)
+                .await
+                .unwrap(),
             None
         );
     }
@@ -474,13 +489,19 @@ mod tests {
     }
     #[test]
     fn non_numeric_content_length_rejected() {
-        assert!(parse_rejected(b"POST /s HTTP/1.1\r\nContent-Length: 5x\r\n\r\n"));
+        assert!(parse_rejected(
+            b"POST /s HTTP/1.1\r\nContent-Length: 5x\r\n\r\n"
+        ));
     }
     #[test]
     fn non_chunked_transfer_encoding_rejected() {
-        assert!(parse_rejected(b"POST /s HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n"));
+        assert!(parse_rejected(
+            b"POST /s HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n"
+        ));
         // substring `chunked` must not satisfy the framing check
-        assert!(parse_rejected(b"POST /s HTTP/1.1\r\nTransfer-Encoding: x-chunked\r\n\r\n"));
+        assert!(parse_rejected(
+            b"POST /s HTTP/1.1\r\nTransfer-Encoding: x-chunked\r\n\r\n"
+        ));
     }
     #[test]
     fn plain_chunked_and_single_cl_accepted() {

@@ -29,7 +29,8 @@ const H_FORKED_FROM: &str = "stream-forked-from";
 const H_FORK_OFFSET: &str = "stream-fork-offset";
 const H_FORK_SUB_OFFSET: &str = "stream-fork-sub-offset";
 
-static LONG_POLL_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30_000);
+static LONG_POLL_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(30_000);
 
 pub fn set_long_poll_timeout(ms: u64) {
     LONG_POLL_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
@@ -252,7 +253,12 @@ pub async fn handle(store: Arc<Store>, req: Req) -> Resp {
     // full Req (bodies/Bytes), and the raw path — only bounded attributes are
     // recorded. The span is always compiled; it is exported only when the
     // `telemetry` feature is on and a subscriber is installed.
-    let span = tracing::info_span!("ds.request", http.method = method, route = route, status_class = tracing::field::Empty);
+    let span = tracing::info_span!(
+        "ds.request",
+        http.method = method,
+        route = route,
+        status_class = tracing::field::Empty
+    );
     let resp = dispatch(store, req).instrument(span.clone()).await;
     span.record("status_class", status_class(resp.status));
     crate::telemetry::record_request(method, status_class(resp.status));
@@ -304,7 +310,11 @@ fn parse_rfc3339(s: &str) -> Result<SystemTime, ()> {
         }
         part.parse().map_err(|_| ())
     };
-    if b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b't') || b[13] != b':' || b[16] != b':'
+    if b[4] != b'-'
+        || b[7] != b'-'
+        || (b[10] != b'T' && b[10] != b't')
+        || b[13] != b':'
+        || b[16] != b':'
     {
         return Err(());
     }
@@ -400,10 +410,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
     let fork_offset_raw = header_str(&req, H_FORK_OFFSET).map(|s| s.to_string());
     let sub_offset_raw = header_str(&req, H_FORK_SUB_OFFSET).map(|s| s.to_string());
     if forked_from.is_none() && (fork_offset_raw.is_some() || sub_offset_raw.is_some()) {
-        return text_response(
-            400,
-            "fork headers require Stream-Forked-From",
-        );
+        return text_response(400, "fork headers require Stream-Forked-From");
     }
     let sub_offset: Option<u64> = match &sub_offset_raw {
         None => None,
@@ -413,20 +420,12 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             }
             match v.parse() {
                 Ok(n) => Some(n),
-                Err(_) => {
-                    return text_response(
-                        400,
-                        "malformed Stream-Fork-Sub-Offset",
-                    )
-                }
+                Err(_) => return text_response(400, "malformed Stream-Fork-Sub-Offset"),
             }
         }
     };
     if sub_offset.unwrap_or(0) > 0 && fork_offset_raw.is_none() {
-        return text_response(
-            400,
-            "Stream-Fork-Sub-Offset requires Stream-Fork-Offset",
-        );
+        return text_response(400, "Stream-Fork-Sub-Offset requires Stream-Fork-Offset");
     }
 
     // Resolve the fork source and the fork point (logical byte offset).
@@ -454,10 +453,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
         }
         let src_tail = src.tail().bytes;
         if sub_offset_raw.is_some() && src_tail == 0 {
-            return text_response(
-                400,
-                "sub-offset on empty source stream",
-            );
+            return text_response(400, "sub-offset on empty source stream");
         }
         // Fork-Offset omitted → divergence at the source's current tail.
         let anchor = match parse_offset(fork_offset_raw.as_deref()) {
@@ -466,10 +462,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             Ok(ParsedOffset::Now) => src_tail,
             Ok(ParsedOffset::At(b)) => {
                 if b > src_tail {
-                    return text_response(
-                        400,
-                        "fork offset beyond stream length",
-                    );
+                    return text_response(400, "fork offset beyond stream length");
                 }
                 b
             }
@@ -500,19 +493,13 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                     }
                 }
                 if remaining > 0 {
-                    return text_response(
-                        400,
-                        "sub-offset overshoots message count",
-                    );
+                    return text_response(400, "sub-offset overshoots message count");
                 }
                 anchor + adv
             }
             sub => {
                 if anchor + sub > src_tail {
-                    return text_response(
-                        400,
-                        "sub-offset overshoots message length",
-                    );
+                    return text_response(400, "sub-offset overshoots message length");
                 }
                 anchor + sub
             }
@@ -623,7 +610,14 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             }
             let t = st.tail();
             let mut b = ResponseBuilder::new(201)
-                .h("location", format!("http://{}{}", host.as_deref().unwrap_or("localhost"), st.path))
+                .h(
+                    "location",
+                    format!(
+                        "http://{}{}",
+                        host.as_deref().unwrap_or("localhost"),
+                        st.path
+                    ),
+                )
                 .h("content-type", st.config.content_type.clone())
                 .h(H_NEXT_OFFSET, format_offset(t.bytes));
             if t.closed {
@@ -638,15 +632,18 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
 
 /// Convert a request body into the contiguous wire-byte representation.
 /// JSON: each message is the raw value followed by a `,`; arrays flatten one level.
-fn encode_wire(body: &Bytes, is_json: bool, allow_empty_array: bool) -> Result<Bytes, &'static str> {
+fn encode_wire(
+    body: &Bytes,
+    is_json: bool,
+    allow_empty_array: bool,
+) -> Result<Bytes, &'static str> {
     if !is_json {
         return Ok(body.clone());
     }
     let text = std::str::from_utf8(body).map_err(|_| "invalid UTF-8 in JSON body")?;
     let trimmed = text.trim_start();
     if trimmed.starts_with('[') {
-        let elems: Vec<&RawValue> =
-            serde_json::from_str(text).map_err(|_| "invalid JSON body")?;
+        let elems: Vec<&RawValue> = serde_json::from_str(text).map_err(|_| "invalid JSON body")?;
         if elems.is_empty() {
             if allow_empty_array {
                 return Ok(Bytes::new());
@@ -715,7 +712,10 @@ fn stage_for_durability(
     if durability() == DurabilityMode::Memory {
         return Ok(None);
     }
-    let wal = store.wal.get().expect("WAL must be attached before serving");
+    let wal = store
+        .wal
+        .get()
+        .expect("WAL must be attached before serving");
     let shard = wal.shard_for(st.id);
     // Register the touched per-stream file into the shard's dirty set
     // (spec §7) BEFORE staging the WAL record — see the full ordering note in
@@ -734,7 +734,10 @@ fn stage_for_durability(
 /// appender lock — only the LSN reservation (`stage_for_durability`) needs the
 /// lock; the fsync wait must not serialize same-stream appenders.
 async fn wait_durable_lsn(store: &Arc<Store>, st: &Arc<StreamState>, lsn: u64) {
-    let wal = store.wal.get().expect("WAL must be attached before serving");
+    let wal = store
+        .wal
+        .get()
+        .expect("WAL must be attached before serving");
     let shard = wal.shard_for(st.id);
     shard.wait_durable(lsn).await;
 }
@@ -795,7 +798,10 @@ fn publish_durable_tail(st: &StreamState, tail: u64, wire: &Bytes) {
     // instead of racing ahead and falling back to a file read. The chunk spans
     // [tail - wire.len(), tail).
     st.set_last_chunk(tail - wire.len() as u64, wire.clone());
-    st.tail_tx.send_replace(Tail { bytes: tail, closed });
+    st.tail_tx.send_replace(Tail {
+        bytes: tail,
+        closed,
+    });
     // Wake any reactor-served subscribers of this stream (no-op when none).
     #[cfg(target_os = "linux")]
     crate::sse_reactor::wake_stream(st);
@@ -916,7 +922,11 @@ async fn handle_append(store: Arc<Store>, req: Req, path: String) -> Resp {
     resp
 }
 
-async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp, AppendOutcome, bool) {
+async fn handle_append_inner(
+    store: Arc<Store>,
+    req: Req,
+    path: String,
+) -> (Resp, AppendOutcome, bool) {
     use AppendOutcome::*;
     // Load-telemetry probe: bumps the in-flight gauge and records service time on
     // drop (covers every return path). No-op unless `--server-stats` is on.
@@ -1239,7 +1249,10 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
             s.closed_durable = true;
             s.durable_tail
         };
-        st.tail_tx.send_replace(Tail { bytes: tail, closed: true });
+        st.tail_tx.send_replace(Tail {
+            bytes: tail,
+            closed: true,
+        });
         #[cfg(target_os = "linux")]
         crate::sse_reactor::wake_stream(&st);
     } else if staged_lsn.is_some() {
@@ -1262,7 +1275,8 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
         // rewrite here — dropping it removes the O(touched) `write_meta_sync` calls
         // that dominate the checkpoint's meta phase at high stream cardinality.
         if meta_persist_needed {
-            st.meta_dirty.store(true, std::sync::atomic::Ordering::Release);
+            st.meta_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     } else if meta_persist_needed {
         // No WAL record staged (memory durability): no checkpoint will flush
@@ -1308,7 +1322,6 @@ fn closed_conflict(tail: u64) -> Resp {
         .h(H_NEXT_OFFSET, format_offset(tail))
         .body(full("stream is closed"))
 }
-
 
 // ---------- reading bodies from the data file ----------
 
@@ -1424,11 +1437,10 @@ fn stream_resolved_body(
                             file_start: seg.file_start + off,
                             len: n,
                         };
-                        let bytes = tokio::task::spawn_blocking(move || {
-                            materialize_segments(&[win])
-                        })
-                        .await
-                        .unwrap_or_default();
+                        let bytes =
+                            tokio::task::spawn_blocking(move || materialize_segments(&[win]))
+                                .await
+                                .unwrap_or_default();
                         // A short read means we cannot honour the content — abort
                         // (set the flag) so the engine drops the connection rather
                         // than emitting a clean-but-truncated response.
@@ -1493,11 +1505,10 @@ async fn materialize_resolved(
             }
             ResolvedSlice::Local(seg) => {
                 let want = seg.len;
-                let bytes = tokio::task::spawn_blocking(move || {
-                    crate::store::materialize_segments(&[seg])
-                })
-                .await
-                .unwrap_or_default();
+                let bytes =
+                    tokio::task::spawn_blocking(move || crate::store::materialize_segments(&[seg]))
+                        .await
+                        .unwrap_or_default();
                 // A short local read must not be forwarded as complete.
                 if bytes.len() as u64 != want {
                     return Err(Error::new(ErrorKind::UnexpectedEof, "short local read"));
@@ -1513,7 +1524,10 @@ async fn materialize_resolved(
                     // forwarded as if complete.
                     Ok(b) if b.len() as u64 == len => out.put_slice(&b),
                     Ok(_) => {
-                        return Err(Error::new(ErrorKind::UnexpectedEof, "truncated cold object"))
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "truncated cold object",
+                        ))
                     }
                     Err(e) => return Err(e),
                 }
@@ -1662,7 +1676,11 @@ async fn handle_catchup(
         .hs(H_UP_TO_DATE, "true")
         .h(
             "cache-control",
-            if now_mode { "no-store".into() } else { CACHEABLE.to_string() },
+            if now_mode {
+                "no-store".into()
+            } else {
+                CACHEABLE.to_string()
+            },
         );
     if let Some(etag) = etag {
         b = b.h("etag", etag);
@@ -1815,9 +1833,10 @@ pub(crate) fn sse_encode_data(out: &mut String, data: &[u8], encoding: SseEncodi
             sse_data_event(out, &payload);
         }
         SseEncoding::Text => sse_data_event(out, &String::from_utf8_lossy(data)),
-        SseEncoding::Base64 => {
-            sse_data_event(out, &crate::api::base64_encode(data, crate::api::BASE64_STD, true))
-        }
+        SseEncoding::Base64 => sse_data_event(
+            out,
+            &crate::api::base64_encode(data, crate::api::BASE64_STD, true),
+        ),
     }
 }
 
@@ -1833,7 +1852,13 @@ pub(crate) fn sse_data_event(out: &mut String, payload: &str) {
     out.push('\n');
 }
 
-pub(crate) fn sse_control_event(out: &mut String, next: u64, cursor: u64, up_to_date: bool, closed: bool) {
+pub(crate) fn sse_control_event(
+    out: &mut String,
+    next: u64,
+    cursor: u64,
+    up_to_date: bool,
+    closed: bool,
+) {
     out.push_str("event: control\n");
     out.push_str("data:{\"streamNextOffset\":\"");
     out.push_str(&format_offset(next));
@@ -1930,7 +1955,13 @@ impl SseSource {
             }
             if t.closed && self.pos >= t.bytes {
                 let mut ev = String::new();
-                sse_control_event(&mut ev, self.pos, compute_cursor(self.client_cursor), true, true);
+                sse_control_event(
+                    &mut ev,
+                    self.pos,
+                    compute_cursor(self.client_cursor),
+                    true,
+                    true,
+                );
                 self.done = true;
                 return Some(Bytes::from(ev));
             }
@@ -1942,7 +1973,13 @@ impl SseSource {
                 && self.pos == self.st.tail().bytes
             {
                 let mut ev = String::new();
-                sse_control_event(&mut ev, self.pos, compute_cursor(self.client_cursor), true, false);
+                sse_control_event(
+                    &mut ev,
+                    self.pos,
+                    compute_cursor(self.client_cursor),
+                    true,
+                    false,
+                );
                 self.sent_initial = true;
                 return Some(Bytes::from(ev));
             }
@@ -2045,11 +2082,7 @@ fn handle_sse(st: Arc<StreamState>, offset: ParsedOffset, client_cursor: Option<
 /// Read a logical byte range fully into memory (SSE batches are small).
 /// Returns `Err` if the range could not be fully materialized (a short local
 /// read or a cold-storage error/truncation) so callers never advance past a gap.
-async fn read_range_bytes(
-    st: &Arc<StreamState>,
-    start: u64,
-    end: u64,
-) -> std::io::Result<Bytes> {
+async fn read_range_bytes(st: &Arc<StreamState>, start: u64, end: u64) -> std::io::Result<Bytes> {
     let want = end.saturating_sub(start) as usize;
     let mut slices = Vec::new();
     crate::store::resolve_range(st, start, end, &mut slices);
@@ -2157,7 +2190,10 @@ mod bug1_tests {
                 match mode {
                     Mode::Full => Ok(bytes::Bytes::from(vec![b'x'; len as usize])),
                     // one byte short of the requested length
-                    Mode::Truncate => Ok(bytes::Bytes::from(vec![b'x'; len.saturating_sub(1) as usize])),
+                    Mode::Truncate => Ok(bytes::Bytes::from(vec![
+                        b'x';
+                        len.saturating_sub(1) as usize
+                    ])),
                     Mode::Error => Err(std::io::Error::other("cold backend boom")),
                 }
             })
@@ -2226,20 +2262,29 @@ mod bug1_tests {
     #[tokio::test]
     async fn cold_read_full_is_not_flagged() {
         let (n, failed) = run(Mode::Full).await;
-        assert!(!failed, "a full-length cold read must not be flagged failed");
+        assert!(
+            !failed,
+            "a full-length cold read must not be flagged failed"
+        );
         assert_eq!(n, 100, "the full body is delivered");
     }
 
     #[tokio::test]
     async fn cold_read_truncated_aborts() {
         let (_n, failed) = run(Mode::Truncate).await;
-        assert!(failed, "a truncated cold read must set the abort flag (BUG-1)");
+        assert!(
+            failed,
+            "a truncated cold read must set the abort flag (BUG-1)"
+        );
     }
 
     #[tokio::test]
     async fn cold_read_error_aborts() {
         let (_n, failed) = run(Mode::Error).await;
-        assert!(failed, "a cold-read backend error must set the abort flag (BUG-1)");
+        assert!(
+            failed,
+            "a cold-read backend error must set the abort flag (BUG-1)"
+        );
     }
 
     /// H4: the buffered cold-read path (`materialize_resolved` via
@@ -2310,7 +2355,10 @@ mod memory_mode_tests {
         let p = std::env::temp_dir().join(format!(
             "ds-mem-{tag}-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&p);
         p
@@ -2340,13 +2388,15 @@ mod memory_mode_tests {
     async fn memory_mode_append_acks_without_wal() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
         let dir = tmp("mem-append");
-        let store = Arc::new(
-            Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
         // NOTE: no WAL attached (store.wal not set) — memory mode must not touch it.
 
         // Create the stream (PUT).
-        let resp = handle(Arc::clone(&store), put_req("m/s", "application/octet-stream")).await;
+        let resp = handle(
+            Arc::clone(&store),
+            put_req("m/s", "application/octet-stream"),
+        )
+        .await;
         assert!(
             (200..300).contains(&resp.status),
             "create stream expected 2xx, got {}",
@@ -2385,11 +2435,13 @@ mod memory_mode_tests {
     async fn memory_append_defers_sidecar_to_store_sweep() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
         let dir = tmp("mem-sweep");
-        let store = Arc::new(
-            Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
 
-        let resp = handle(Arc::clone(&store), put_req("m/s", "application/octet-stream")).await;
+        let resp = handle(
+            Arc::clone(&store),
+            put_req("m/s", "application/octet-stream"),
+        )
+        .await;
         assert!((200..300).contains(&resp.status), "create: {}", resp.status);
 
         // Append with a producer so the pending sidecar change is observable.
@@ -2442,10 +2494,13 @@ mod memory_mode_tests {
     async fn memory_plain_append_skips_sidecar_flush() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
         let dir = tmp("mem-plain-noflush");
-        let store =
-            Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
 
-        let resp = handle(Arc::clone(&store), put_req("m/p", "application/octet-stream")).await;
+        let resp = handle(
+            Arc::clone(&store),
+            put_req("m/p", "application/octet-stream"),
+        )
+        .await;
         assert!((200..300).contains(&resp.status), "create: {}", resp.status);
         // Drain anything the create queued so we measure only the append's effect.
         let store2 = Arc::clone(&store);
@@ -2490,7 +2545,11 @@ mod memory_mode_tests {
         let dir = tmp("lp-race");
         let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
 
-        let resp = handle(Arc::clone(&store), put_req("lp/r", "application/octet-stream")).await;
+        let resp = handle(
+            Arc::clone(&store),
+            put_req("lp/r", "application/octet-stream"),
+        )
+        .await;
         assert!((200..300).contains(&resp.status), "create: {}", resp.status);
 
         let next_offset = |r: &crate::api::Resp| -> u64 {
@@ -2514,8 +2573,7 @@ mod memory_mode_tests {
                 },
             ));
             // ...and race an append onto the deadline (spread over the window).
-            tokio::time::sleep(std::time::Duration::from_millis(15 + (i % 10) as u64))
-                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(15 + (i % 10) as u64)).await;
             let ar = handle(
                 Arc::clone(&store),
                 post_req("lp/r", "application/octet-stream", b"x"),
@@ -2554,4 +2612,3 @@ mod memory_mode_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

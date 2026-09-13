@@ -393,7 +393,13 @@ impl Store {
             return Ok(());
         }
         // Separate acquisitions (never nest manifest+shared — see seal_loop note).
-        let sealed = st.tier.manifest.lock().unwrap().sealed_offset.max(st.base_offset);
+        let sealed = st
+            .tier
+            .manifest
+            .lock()
+            .unwrap()
+            .sealed_offset
+            .max(st.base_offset);
         let file_base = st.shared.read().unwrap().file_base;
         if sealed <= file_base || sealed - file_base < threshold {
             return Ok(());
@@ -868,7 +874,11 @@ impl TierTask {
 /// zero-copy) or a remote object range (fetched via the BlobStore).
 pub enum ResolvedSlice {
     Local(Segment),
-    Remote { key: String, offset: u64, len: u64 },
+    Remote {
+        key: String,
+        offset: u64,
+        len: u64,
+    },
     /// A slice whose backing local chunk could not be opened (missing/EIO).
     /// Poison: any read resolving this must ERROR, never serve around it —
     /// omitting it would produce a well-formed 200 missing interior bytes.
@@ -1002,7 +1012,6 @@ fn resolve_sealed(st: &Arc<StreamState>, lo: u64, hi: u64, out: &mut Vec<Resolve
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

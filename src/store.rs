@@ -684,7 +684,8 @@ impl Store {
                 // NOT treat it as an orphan data file — that would delete the
                 // durable residual before recovery can promote it.
             } else if name.ends_with(".meta") {
-                let data_path = PathBuf::from(p.as_os_str().to_str().unwrap().trim_end_matches(".meta"));
+                let data_path =
+                    PathBuf::from(p.as_os_str().to_str().unwrap().trim_end_matches(".meta"));
                 if data_path.exists() {
                     match std::fs::read(&p) {
                         Ok(bytes) => {
@@ -881,7 +882,10 @@ impl Store {
             base_offset: meta.base_offset,
             parent,
             boot_meta_durable_tail: meta.durable_tail,
-            appender: AsyncMutex::new(Appender { file: file.clone(), written }),
+            appender: AsyncMutex::new(Appender {
+                file: file.clone(),
+                written,
+            }),
             shared: RwLock::new(Shared {
                 tail,
                 // Recovered/opened tail is durable by definition.
@@ -1009,8 +1013,7 @@ impl Store {
                 });
             }
         } else {
-            self.streams
-                .remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
+            self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
             // Reclaim this stream's offloaded segments (remote objects + any
             // staged local chunk files) — safe only here, on a true hard delete
             // with no remaining fork references.
@@ -1108,7 +1111,10 @@ impl Store {
             // Live-created stream: the durable frontier IS the initial tail (the
             // create meta below persists it). Only consulted by boot recovery.
             boot_meta_durable_tail: Some(base_offset),
-            appender: AsyncMutex::new(Appender { file: file.clone(), written: 0 }),
+            appender: AsyncMutex::new(Appender {
+                file: file.clone(),
+                written: 0,
+            }),
             shared: RwLock::new(Shared {
                 tail: base_offset,
                 durable_tail: base_offset,
@@ -1204,7 +1210,11 @@ fn config_matches(existing: &StreamState, requested: &StreamConfig) -> bool {
 }
 
 pub fn media_type(ct: &str) -> String {
-    ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+    ct.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 pub fn is_json_content_type(ct: &str) -> bool {
@@ -1251,7 +1261,11 @@ pub fn materialize_segments(segments: &[Segment]) -> bytes::Bytes {
     let mut at = 0;
     for seg in segments {
         let n = seg.len as usize;
-        if seg.file.read_exact_at(&mut buf[at..at + n], seg.file_start).is_err() {
+        if seg
+            .file
+            .read_exact_at(&mut buf[at..at + n], seg.file_start)
+            .is_err()
+        {
             return bytes::Bytes::new();
         }
         at += n;
@@ -1300,7 +1314,6 @@ fn build_blobstore(
 // placement-aware read resolver live in `tier.rs`. Re-export the read API here so
 // callers keep a single `store::` facade for resolving a logical range.
 pub use crate::tier::{into_local_segments, resolve_range, ResolvedSlice};
-
 
 // ---------------- metadata persistence & recovery ----------------
 
@@ -1371,7 +1384,9 @@ pub struct MetaSegment {
 }
 
 fn unix_secs(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl Meta {
@@ -1512,8 +1527,7 @@ impl Store {
     /// call from a blocking context. Errors are ignored exactly like the
     /// debounced flush ignored them (the sidecar is non-durable by contract).
     pub fn sweep_meta_once(&self) -> usize {
-        let drained: Vec<Arc<StreamState>> =
-            std::mem::take(&mut *self.meta_sweep.lock().unwrap());
+        let drained: Vec<Arc<StreamState>> = std::mem::take(&mut *self.meta_sweep.lock().unwrap());
         let mut n = 0;
         for st in drained {
             // A hard-deleted stream's files are already unlinked — flushing
@@ -1605,7 +1619,10 @@ mod tier_tests {
         let p = std::env::temp_dir().join(format!(
             "ds-tier-test-{tag}-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&p);
         p
@@ -1644,11 +1661,9 @@ mod tier_tests {
         for sl in slices {
             match sl {
                 ResolvedSlice::Local(seg) => {
-                    let b = tokio::task::spawn_blocking(move || {
-                        materialize_segments(&[seg])
-                    })
-                    .await
-                    .unwrap();
+                    let b = tokio::task::spawn_blocking(move || materialize_segments(&[seg]))
+                        .await
+                        .unwrap();
                     out.extend_from_slice(&b);
                 }
                 ResolvedSlice::Remote { key, offset, len } => {
@@ -1674,9 +1689,8 @@ mod tier_tests {
     #[tokio::test]
     async fn round_trip_through_cold_storage() {
         let dir = tmp_dir("roundtrip");
-        let store = Arc::new(
-            Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap(),
-        );
+        let store =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
         let cfg = StreamConfig {
             content_type: "application/octet-stream".into(),
             ttl_seconds: None,
@@ -1774,11 +1788,21 @@ mod tier_tests {
             let s = st.shared.read().unwrap();
             (s.tail, s.file_base)
         };
-        assert!(sealed >= 128 * 1024, "expected a reclaimable sealed prefix, got {sealed}");
-        assert_eq!(file_base, sealed, "file_base advanced to the sealed watermark");
+        assert!(
+            sealed >= 128 * 1024,
+            "expected a reclaimable sealed prefix, got {sealed}"
+        );
+        assert_eq!(
+            file_base, sealed,
+            "file_base advanced to the sealed watermark"
+        );
 
         let live_size = std::fs::metadata(&st.file_path).unwrap().len();
-        assert_eq!(live_size, tail - sealed, "live file holds only the hot tail");
+        assert_eq!(
+            live_size,
+            tail - sealed,
+            "live file holds only the hot tail"
+        );
         assert!(
             live_size < total as u64,
             "live file ({live_size}) must be smaller than the full stream ({total})"
@@ -2027,12 +2051,18 @@ mod tier_tests {
         // No offset skew: file_base maps to the sealed watermark (the residual's
         // logical start), and the tail is the frozen full tail — both from the
         // durable temp, not the short old file.
-        assert_eq!(rfb, sealed, "file_base recovered to sealed watermark, no skew");
+        assert_eq!(
+            rfb, sealed,
+            "file_base recovered to sealed watermark, no skew"
+        );
         assert_eq!(rtail, tail, "tail recovered to the frozen full value");
         let live_size = std::fs::metadata(&st.file_path).unwrap().len();
         assert_eq!(live_size, tail - sealed, "live file is the full residual");
         let got = read_logical(&st, 0, total as u64).await;
-        assert_eq!(got, payload, "full read exact after fast crash-before-rename");
+        assert_eq!(
+            got, payload,
+            "full read exact after fast crash-before-rename"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2064,7 +2094,11 @@ mod tier_tests {
             let s = parent.shared.read().unwrap();
             (m.sealed_offset, s.tail)
         };
-        assert_eq!(parent.shared.read().unwrap().file_base, sealed, "parent compacted");
+        assert_eq!(
+            parent.shared.read().unwrap().file_base,
+            sealed,
+            "parent compacted"
+        );
 
         // Fork at the parent's tail: the fork inherits all of [0, ptail).
         let fork = match store
@@ -2081,7 +2115,11 @@ mod tier_tests {
 
         // A sub-range entirely inside the parent's compacted (sealed) region.
         let got2 = read_logical(&fork, 100, sealed).await;
-        assert_eq!(got2, payload[100..sealed as usize], "fork sub-range in cold region");
+        assert_eq!(
+            got2,
+            payload[100..sealed as usize],
+            "fork sub-range in cold region"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2143,7 +2181,11 @@ mod tier_tests {
         // Sanity: the stream is intact and fully readable end to end.
         let tail = st.shared.read().unwrap().tail;
         let got = read_logical(&st, 0, tail).await;
-        assert_eq!(got.len() as u64, tail, "full read-back length after concurrent load");
+        assert_eq!(
+            got.len() as u64,
+            tail,
+            "full read-back length after concurrent load"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2173,7 +2215,10 @@ mod tier_tests {
         ) -> crate::blobstore::BoxFuture<'a, std::io::Result<Option<u64>>> {
             Box::pin(async { Ok(None) })
         }
-        fn delete<'a>(&'a self, _key: &'a str) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
+        fn delete<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> crate::blobstore::BoxFuture<'a, std::io::Result<()>> {
             Box::pin(async { Ok(()) })
         }
     }
@@ -2232,7 +2277,10 @@ mod tier_tests {
         // And it reads back byte-identical (from the chunk file, not a missing
         // remote object).
         let got = read_logical(&st, 0, total as u64).await;
-        assert_eq!(got, payload, "sealed-Local read must return the staged bytes");
+        assert_eq!(
+            got, payload,
+            "sealed-Local read must return the staged bytes"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2241,9 +2289,7 @@ mod tier_tests {
     async fn json_seal_lands_on_value_boundary() {
         let dir = tmp_dir("json");
         // Small segment so a handful of values trigger a seal.
-        let store = Arc::new(
-            Store::new_with_tier(dir.clone(), local_tier(&dir, 1024)).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 1024)).unwrap());
         let cfg = StreamConfig {
             content_type: "application/json".into(),
             ttl_seconds: None,
@@ -2303,9 +2349,8 @@ mod tier_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_reads_during_seal_are_consistent() {
         let dir = tmp_dir("concurrent");
-        let store = Arc::new(
-            Store::new_with_tier(dir.clone(), local_tier(&dir, 32 * 1024)).unwrap(),
-        );
+        let store =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 32 * 1024)).unwrap());
         let cfg = StreamConfig {
             content_type: "application/octet-stream".into(),
             ttl_seconds: None,
@@ -2351,9 +2396,8 @@ mod tier_tests {
     async fn manifest_survives_recovery() {
         let dir = tmp_dir("recovery");
         {
-            let store = Arc::new(
-                Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap(),
-            );
+            let store =
+                Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
             let cfg = StreamConfig {
                 content_type: "application/octet-stream".into(),
                 ttl_seconds: None,
@@ -2376,9 +2420,8 @@ mod tier_tests {
         }
         // Re-open the store; the manifest must rehydrate from the sidecar and
         // cold reads must still work.
-        let store2 = Arc::new(
-            Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap(),
-        );
+        let store2 =
+            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
         let st = store2.get("s/rec").expect("stream recovered");
         let sealed = st.tier.manifest.lock().unwrap().sealed_offset;
         assert!(sealed >= 64 * 1024, "manifest not recovered");
@@ -2535,7 +2578,10 @@ mod tier_tests {
         {
             let m = st.tier.manifest.lock().unwrap();
             assert_eq!(m.segments.len(), 0, "seal staged segments despite deleted");
-            assert_eq!(m.sealed_offset, 0, "seal advanced watermark despite deleted");
+            assert_eq!(
+                m.sealed_offset, 0,
+                "seal advanced watermark despite deleted"
+            );
         }
         let seg_files = std::fs::read_dir(dir.join("segments"))
             .map(|rd| rd.count())
@@ -2557,7 +2603,10 @@ mod meta_sweep_tests {
         let p = std::env::temp_dir().join(format!(
             "ds-meta-sweep-{tag}-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&p);
         p
@@ -2596,11 +2645,13 @@ mod meta_sweep_tests {
         let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
         let st = create(&store, "s");
 
-        st.shared
-            .write()
-            .unwrap()
-            .producers
-            .insert("p1".into(), ProducerState { epoch: 1, last_seq: 3 });
+        st.shared.write().unwrap().producers.insert(
+            "p1".into(),
+            ProducerState {
+                epoch: 1,
+                last_seq: 3,
+            },
+        );
         store.mark_meta_dirty(&st);
         store.mark_meta_dirty(&st); // second mark while pending: deduped
 
@@ -2610,7 +2661,10 @@ mod meta_sweep_tests {
         );
         assert_eq!(store.sweep_meta_once(), 1, "one dirty stream, one flush");
         let meta = disk_meta(&st);
-        let p = meta.producers.get("p1").expect("sweep persists the pending producer state");
+        let p = meta
+            .producers
+            .get("p1")
+            .expect("sweep persists the pending producer state");
         assert_eq!((p.epoch, p.last_seq), (1, 3));
         assert!(
             !st.meta_dirty.load(Ordering::Acquire),
@@ -2631,7 +2685,10 @@ mod meta_sweep_tests {
 
         store.mark_meta_dirty(&st);
         store.delete_or_soft_delete_durable(&st).unwrap();
-        assert!(!meta_path(&st.file_path).exists(), "hard delete unlinked the sidecar");
+        assert!(
+            !meta_path(&st.file_path).exists(),
+            "hard delete unlinked the sidecar"
+        );
 
         assert_eq!(store.sweep_meta_once(), 0, "deleted stream is skipped");
         assert!(

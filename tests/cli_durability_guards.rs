@@ -37,7 +37,11 @@ fn wal_without_an_explicit_data_dir_refuses_to_start() {
         .output()
         .expect("spawn");
 
-    assert_eq!(out.status.code(), Some(2), "wal with a defaulted --data-dir must exit 2");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "wal with a defaulted --data-dir must exit 2"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("--data-dir"),

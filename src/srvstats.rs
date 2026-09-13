@@ -48,7 +48,9 @@ impl AppendProbe {
             return None;
         }
         INFLIGHT.fetch_add(1, Ordering::Relaxed);
-        Some(Self { start: Instant::now() })
+        Some(Self {
+            start: Instant::now(),
+        })
     }
 }
 impl Drop for AppendProbe {

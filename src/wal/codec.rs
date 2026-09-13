@@ -151,7 +151,15 @@ pub(crate) fn encode_header_into(
     payload_crc: u32,
 ) {
     let kind_byte = kind as u8;
-    let crc = header_crc(lsn, kind_byte, stream_id, stream_offset, len, flags, payload_crc);
+    let crc = header_crc(
+        lsn,
+        kind_byte,
+        stream_id,
+        stream_offset,
+        len,
+        flags,
+        payload_crc,
+    );
     buf.reserve(HEADER_LEN);
     buf.extend_from_slice(&len.to_le_bytes()); // [0..4)
     buf.extend_from_slice(&crc.to_le_bytes()); // [4..8)
@@ -206,7 +214,16 @@ pub fn decode_at(seg: &[u8], off: usize) -> Decoded {
 
     // Validate the header CRC. A torn/partially-written header fails here. The
     // CRC covers flags + payload_crc too, so a garbled flag/CRC field is caught.
-    if header_crc(lsn, kind_byte, stream_id, stream_offset, len, flags, payload_crc) != crc {
+    if header_crc(
+        lsn,
+        kind_byte,
+        stream_id,
+        stream_offset,
+        len,
+        flags,
+        payload_crc,
+    ) != crc
+    {
         return Decoded::Torn;
     }
 
@@ -261,8 +278,8 @@ mod tests {
     fn bug1_torn_checksummed_payload_rejected() {
         let len: usize = 8192; // > 1 page, so a partial page writeback can tear it
         let prefix: usize = 4096; // bytes that "made it" before the crash
-        // The CRC the writer would have stamped is over the FULL intended payload
-        // (all 0xAB), but only `prefix` real bytes made it before the crash.
+                                  // The CRC the writer would have stamped is over the FULL intended payload
+                                  // (all 0xAB), but only `prefix` real bytes made it before the crash.
         let full_payload = vec![0xABu8; len];
         let payload_crc = crc32c::crc32c(&full_payload);
 
@@ -303,34 +320,55 @@ mod tests {
         encode_into(&mut b, &r); // sets PAYLOAD_CHECKSUMMED + correct payload_crc
         b.extend(std::iter::repeat(0u8).take(64)); // fallocate'd tail
         match decode_at(&b, 0) {
-            Decoded::Record { payload_off, len, .. } => {
+            Decoded::Record {
+                payload_off, len, ..
+            } => {
                 assert_eq!(&b[payload_off..payload_off + len], b"checksummed-payload");
             }
             other => panic!("expected Record, got {other:?}"),
         }
     }
 
-
     #[test]
     fn encode_decode_roundtrip_and_torn() {
         let mut b = Vec::new();
-        let r = Record { lsn: 7, kind: RecordKind::Append, stream_id: 3, stream_offset: 100, payload: b"hello" };
+        let r = Record {
+            lsn: 7,
+            kind: RecordKind::Append,
+            stream_id: 3,
+            stream_offset: 100,
+            payload: b"hello",
+        };
         encode_into(&mut b, &r);
         match decode_at(&b, 0) {
-            Decoded::Record { lsn, kind, stream_id, stream_offset, payload_off, len, total } => {
+            Decoded::Record {
+                lsn,
+                kind,
+                stream_id,
+                stream_offset,
+                payload_off,
+                len,
+                total,
+            } => {
                 assert_eq!((lsn, stream_id, stream_offset, len), (7, 3, 100, 5));
                 assert!(matches!(kind, RecordKind::Append));
-                assert_eq!(&b[payload_off..payload_off+len], b"hello");
+                assert_eq!(&b[payload_off..payload_off + len], b"hello");
                 assert_eq!(total, HEADER_LEN + 5);
             }
             _ => panic!("expected Record"),
         }
         // torn payload: drop last byte → header says len=5 but only 4 present
-        let torn = &b[..b.len()-1];
+        let torn = &b[..b.len() - 1];
         assert!(matches!(decode_at(torn, 0), Decoded::Torn));
         // torn header (partial) and all-zero (fallocate) → not a Record
-        assert!(matches!(decode_at(&b[..HEADER_LEN-1], 0), Decoded::Incomplete | Decoded::Torn));
-        assert!(matches!(decode_at(&[0u8; HEADER_LEN+5], 0), Decoded::Incomplete | Decoded::Torn));
+        assert!(matches!(
+            decode_at(&b[..HEADER_LEN - 1], 0),
+            Decoded::Incomplete | Decoded::Torn
+        ));
+        assert!(matches!(
+            decode_at(&[0u8; HEADER_LEN + 5], 0),
+            Decoded::Incomplete | Decoded::Torn
+        ));
     }
 
     #[test]
@@ -338,13 +376,33 @@ mod tests {
         // Encode two records into one buffer; decode_at must read the first at
         // off=0 and the second at off=t1 (exercises off>0 decode, the Task-1 gap).
         let mut b = Vec::new();
-        let r1 = Record { lsn: 1, kind: RecordKind::Append, stream_id: 10, stream_offset: 0, payload: b"first" };
-        let r2 = Record { lsn: 2, kind: RecordKind::StreamCreate, stream_id: 11, stream_offset: 5, payload: b"second-payload" };
+        let r1 = Record {
+            lsn: 1,
+            kind: RecordKind::Append,
+            stream_id: 10,
+            stream_offset: 0,
+            payload: b"first",
+        };
+        let r2 = Record {
+            lsn: 2,
+            kind: RecordKind::StreamCreate,
+            stream_id: 11,
+            stream_offset: 5,
+            payload: b"second-payload",
+        };
         encode_into(&mut b, &r1);
         encode_into(&mut b, &r2);
 
         let t1 = match decode_at(&b, 0) {
-            Decoded::Record { lsn, kind, stream_id, stream_offset, payload_off, len, total } => {
+            Decoded::Record {
+                lsn,
+                kind,
+                stream_id,
+                stream_offset,
+                payload_off,
+                len,
+                total,
+            } => {
                 assert_eq!((lsn, stream_id, stream_offset, len), (1, 10, 0, 5));
                 assert!(matches!(kind, RecordKind::Append));
                 assert_eq!(&b[payload_off..payload_off + len], b"first");
@@ -355,7 +413,15 @@ mod tests {
         };
 
         match decode_at(&b, t1) {
-            Decoded::Record { lsn, kind, stream_id, stream_offset, payload_off, len, total } => {
+            Decoded::Record {
+                lsn,
+                kind,
+                stream_id,
+                stream_offset,
+                payload_off,
+                len,
+                total,
+            } => {
                 assert_eq!((lsn, stream_id, stream_offset, len), (2, 11, 5, 14));
                 assert!(matches!(kind, RecordKind::StreamCreate));
                 assert_eq!(&b[payload_off..payload_off + len], b"second-payload");

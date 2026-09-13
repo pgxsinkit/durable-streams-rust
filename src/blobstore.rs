@@ -154,8 +154,8 @@ pub use s3::S3BlobStore;
 mod s3 {
     use super::*;
     use object_store::aws::AmazonS3Builder;
-    use object_store::{GetOptions, GetRange, ObjectStore};
     use object_store::path::Path as ObjPath;
+    use object_store::{GetOptions, GetRange, ObjectStore};
 
     /// A generic S3-compatible BlobStore over `object_store`. Configured with a
     /// custom endpoint + path-style addressing so it targets any S3-compatible
@@ -185,7 +185,9 @@ mod s3 {
                 b = b.with_allow_http(true);
             }
             if let (Some(k), Some(s)) = (&cfg.access_key_id, &cfg.secret_access_key) {
-                b = b.with_access_key_id(k.clone()).with_secret_access_key(s.clone());
+                b = b
+                    .with_access_key_id(k.clone())
+                    .with_secret_access_key(s.clone());
             }
             let inner = b.build().map_err(io::Error::other)?;
             Ok(S3BlobStore { inner })
@@ -290,9 +292,7 @@ mod tests {
             kind: crate::tier::TierKind::S3,
             endpoint: Some("http://127.0.0.1:9000".into()),
             region: Some("us-east-1".into()),
-            bucket: Some(
-                std::env::var("DS_S3_BUCKET").unwrap_or_else(|_| "ds-tier-test".into()),
-            ),
+            bucket: Some(std::env::var("DS_S3_BUCKET").unwrap_or_else(|_| "ds-tier-test".into())),
             path_style: true,
             allow_http: true,
             access_key_id: std::env::var("DS_S3_ACCESS_KEY_ID").ok(),
@@ -303,7 +303,10 @@ mod tests {
         let key = "stream-test/0000000000000042";
         let payload = Bytes::from_static(b"the quick brown fox jumps over the lazy dog");
         bs.put(key, payload.clone()).await.expect("put");
-        assert_eq!(bs.head(key).await.expect("head"), Some(payload.len() as u64));
+        assert_eq!(
+            bs.head(key).await.expect("head"),
+            Some(payload.len() as u64)
+        );
         let got = bs.get_range(key, 4, 5).await.expect("get_range");
         assert_eq!(&got[..], b"quick");
         bs.delete(key).await.expect("delete");

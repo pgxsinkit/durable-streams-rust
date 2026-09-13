@@ -289,7 +289,9 @@ fn main() {
                 match v.parse::<u64>() {
                     Ok(bytes) => wal::shard::set_checkpoint_wal_bytes(bytes),
                     _ => {
-                        eprintln!("--wal-checkpoint-wal-bytes must be a non-negative integer (bytes)");
+                        eprintln!(
+                            "--wal-checkpoint-wal-bytes must be a non-negative integer (bytes)"
+                        );
                         std::process::exit(2);
                     }
                 }
@@ -364,9 +366,11 @@ fn main() {
             .ok();
     }
 
-    let workers = worker_threads.unwrap_or_else(|| std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4));
+    let workers = worker_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
@@ -427,9 +431,9 @@ fn main() {
         let mut wal_for_shutdown: Option<Arc<wal::walset::WalSet>> = None;
         if handlers::durability() == handlers::DurabilityMode::Wal {
             let open_res = match wal_segment_bytes {
-                Some(sz) => wal::walset::WalSet::open_with_segment_size(
-                    &data_dir, wal_shards, workers, sz,
-                ),
+                Some(sz) => {
+                    wal::walset::WalSet::open_with_segment_size(&data_dir, wal_shards, workers, sz)
+                }
                 None => wal::walset::WalSet::open(&data_dir, wal_shards, workers),
             };
             let walset = open_res.unwrap_or_else(|e| {
@@ -521,8 +525,7 @@ const CHECKPOINT_POLL: std::time::Duration = std::time::Duration::from_millis(25
 /// checkpoints for that shard only.
 fn spawn_checkpoint_ticker(walset: Arc<wal::walset::WalSet>) {
     tokio::spawn(async move {
-        let interval =
-            std::time::Duration::from_millis(wal::shard::checkpoint_interval_ms());
+        let interval = std::time::Duration::from_millis(wal::shard::checkpoint_interval_ms());
         let wal_bytes = wal::shard::checkpoint_wal_bytes();
         let n = walset.shards().len();
         let mut last_done: Vec<std::time::Instant> = vec![std::time::Instant::now(); n];

@@ -237,7 +237,10 @@ mod tests {
         let p = std::env::temp_dir().join(format!(
             "ds-wal-seg-test-{tag}-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&p);
         p

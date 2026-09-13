@@ -438,7 +438,10 @@ impl Shard {
     /// cheaply.
     ///
     /// [`WalSet::open_with_segment_size`]: super::walset::WalSet::open_with_segment_size
-    pub fn open_with_segment_size(dir: PathBuf, segment_size: u64) -> io::Result<std::sync::Arc<Shard>> {
+    pub fn open_with_segment_size(
+        dir: PathBuf,
+        segment_size: u64,
+    ) -> io::Result<std::sync::Arc<Shard>> {
         std::fs::create_dir_all(&dir)?;
         // Boot must be NON-DESTRUCTIVE (spec §9: recover-before-clobber): the
         // on-disk segments are the durable log recovery is about to replay.
@@ -476,15 +479,12 @@ impl Shard {
         existing.sort_by_key(|(s, _)| *s);
         let (seg_start_lsn, active) = match existing.pop() {
             Some((start, path)) => (start, Arc::new(FileSegment::open_existing(path)?)),
-            None => (
-                1,
-                {
-                    let seg = Arc::new(FileSegment::create(seg_path(&dir, 1), segment_size)?);
-                    // Durable dirent for the fresh segment (see roll-site note).
-                    crate::store::fsync_parent_dir(&seg_path(&dir, 1))?;
-                    seg
-                },
-            ),
+            None => (1, {
+                let seg = Arc::new(FileSegment::create(seg_path(&dir, 1), segment_size)?);
+                // Durable dirent for the fresh segment (see roll-site note).
+                crate::store::fsync_parent_dir(&seg_path(&dir, 1))?;
+                seg
+            }),
         };
         Ok(std::sync::Arc::new(Shard {
             inner: Mutex::new(ShardInner {
@@ -617,7 +617,10 @@ impl Shard {
         // below), so a reserved-but-unwritten gap is unreachable in production —
         // the hook models the reachable outcome (a clean Err, no lsn consumed).
         #[cfg(test)]
-        if self.fail_next_write.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(io::Error::other("injected WAL stage failure"));
         }
 
@@ -725,9 +728,14 @@ impl Shard {
         let mut buf = Vec::with_capacity(total as usize);
         encode_into(
             &mut buf,
-            &Record { lsn, kind, stream_id, stream_offset, payload },
+            &Record {
+                lsn,
+                kind,
+                stream_id,
+                stream_offset,
+                payload,
+            },
         );
-
 
         // A failed positioned WRITE is soundly retryable (unlike fsync: the
         // encoded bytes are still in hand) — but an UNRECOVERED failure leaves a
@@ -983,8 +991,7 @@ impl Shard {
             //     so when recycle deletes the WAL records below the floor,
             //     recovery can still truncate a recycled stream's torn
             //     per-stream-file tail to its durable tail.
-            let tails: Vec<(u64, u64)> =
-                touched.iter().map(|(id, tail, _)| (*id, *tail)).collect();
+            let tails: Vec<(u64, u64)> = touched.iter().map(|(id, tail, _)| (*id, *tail)).collect();
             let n_tails = this.persist_durable_tails(&tails)?;
             let t_tails = t_start.elapsed();
 
@@ -1245,7 +1252,12 @@ impl Shard {
                 // into their per-stream files — skip, but keep advancing so we
                 // reach the live (post-checkpoint) tail.
                 if lsn >= checkpoint_lsn {
-                    f(kind, stream_id, stream_offset, &raw[payload_off..payload_off + len]);
+                    f(
+                        kind,
+                        stream_id,
+                        stream_offset,
+                        &raw[payload_off..payload_off + len],
+                    );
                 }
                 off += total;
                 // A perfectly packed segment ends right at its decodable extent;
@@ -1390,7 +1402,10 @@ impl Shard {
         let g = self.inner.lock().unwrap();
         (
             Arc::clone(&g.active),
-            g.sealed_pending.iter().map(|(_, s)| Arc::clone(s)).collect(),
+            g.sealed_pending
+                .iter()
+                .map(|(_, s)| Arc::clone(s))
+                .collect(),
         )
     }
 
@@ -1519,9 +1534,7 @@ impl Shard {
                                 Ok(Some(_)) => continue,
                                 Ok(None) => break,
                                 Err(e) => {
-                                    eprintln!(
-                                        "WAL committer final-drain fdatasync failed: {e}"
-                                    );
+                                    eprintln!("WAL committer final-drain fdatasync failed: {e}");
                                     break;
                                 }
                             }
@@ -1564,9 +1577,8 @@ impl Shard {
                 // strictly better than the frozen half-life. A normal return
                 // (stop-signal shutdown drain) is NOT a failure.
                 let dir = me.dir.clone();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    me.run_committer()
-                }));
+                let r =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.run_committer()));
                 if r.is_err() {
                     eprintln!(
                         "FATAL: WAL committer thread for shard {dir:?} panicked. \
@@ -1667,7 +1679,10 @@ mod tests {
         let p = std::env::temp_dir().join(format!(
             "ds-wal-shard-test-{tag}-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&p);
         p
@@ -1718,7 +1733,9 @@ mod tests {
         let payload = vec![b'x'; 200 - crate::wal::codec::HEADER_LEN];
         let mut last = 0;
         for i in 0..80u64 {
-            last = sh.reserve_and_stage(RecordKind::Append, 1, i * 200, &payload).unwrap();
+            last = sh
+                .reserve_and_stage(RecordKind::Append, 1, i * 200, &payload)
+                .unwrap();
         }
         sh.wait_durable(last).await;
         h.stop();
@@ -1744,7 +1761,11 @@ mod tests {
                         break;
                     }
                 }
-                assert_eq!(off, raw.len(), "sealed segment is EXACTLY packed (no zero tail)");
+                assert_eq!(
+                    off,
+                    raw.len(),
+                    "sealed segment is EXACTLY packed (no zero tail)"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1761,10 +1782,16 @@ mod tests {
         let payload = vec![b'y'; 150];
         let mut last = 0;
         for i in 0..100u64 {
-            last = sh.reserve_and_stage(RecordKind::Append, 2, i, &payload).unwrap();
+            last = sh
+                .reserve_and_stage(RecordKind::Append, 2, i, &payload)
+                .unwrap();
         }
         sh.wait_durable(last).await;
-        assert_eq!(sh.durable_lsn(), last, "every record across rolls is durable");
+        assert_eq!(
+            sh.durable_lsn(),
+            last,
+            "every record across rolls is durable"
+        );
         assert!(segs_on_disk(&dir).len() >= 3, "spanned ≥3 segments");
         h.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1783,7 +1810,9 @@ mod tests {
         for i in 0..120u64 {
             // ~150-byte framed records ⇒ ~27 per 4 KiB segment ⇒ 120 ⇒ ≥4 segments.
             let p = format!("rec-{i:04}-{}", "p".repeat(120)).into_bytes();
-            last = sh.reserve_and_stage(RecordKind::Append, 3, i * 7, &p).unwrap();
+            last = sh
+                .reserve_and_stage(RecordKind::Append, 3, i * 7, &p)
+                .unwrap();
             expect.push((last, i * 7, p));
         }
         sh.wait_durable(last).await;
@@ -1798,7 +1827,11 @@ mod tests {
             got.push((stream_offset, payload.to_vec()));
         })
         .unwrap();
-        assert_eq!(got.len(), expect.len(), "every record replayed across rolls");
+        assert_eq!(
+            got.len(),
+            expect.len(),
+            "every record replayed across rolls"
+        );
         for (i, (off, p)) in got.iter().enumerate() {
             assert_eq!(*off, expect[i].1, "record {i} stream_offset");
             assert_eq!(p, &expect[i].2, "record {i} payload byte-identical");
@@ -1817,7 +1850,9 @@ mod tests {
         let payload = vec![b'z'; 180];
         let mut last = 0;
         for i in 0..120u64 {
-            last = sh.reserve_and_stage(RecordKind::Append, 4, i, &payload).unwrap();
+            last = sh
+                .reserve_and_stage(RecordKind::Append, 4, i, &payload)
+                .unwrap();
         }
         sh.wait_durable(last).await;
 
@@ -1831,9 +1866,16 @@ mod tests {
         assert_eq!(ckpt, last);
 
         let after = segs_on_disk(&dir);
-        assert_eq!(after.len(), 1, "all sealed segments recycled below the floor");
+        assert_eq!(
+            after.len(),
+            1,
+            "all sealed segments recycled below the floor"
+        );
         assert_eq!(after[0].0, active_start, "the active segment is retained");
-        assert!(seg_path(&dir, active_start).exists(), "active segment file remains");
+        assert!(
+            seg_path(&dir, active_start).exists(),
+            "active segment file remains"
+        );
         h.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1857,7 +1899,9 @@ mod tests {
         // the new seg. r5 rolls again.
         let mut last = 0;
         for i in 0..5u64 {
-            last = sh.reserve_and_stage(RecordKind::Append, 5, i, &payload).unwrap();
+            last = sh
+                .reserve_and_stage(RecordKind::Append, 5, i, &payload)
+                .unwrap();
         }
         sh.wait_durable(last).await;
         h.stop();
@@ -1865,8 +1909,16 @@ mod tests {
         let segs = segs_on_disk(&dir);
         assert_eq!(segs.len(), 3, "r1r2 | r3r4 | r5 ⇒ 3 segments");
         // seg0 sealed at exactly 128 (2 records, exact fill — no premature roll).
-        assert_eq!(std::fs::metadata(&segs[0].1).unwrap().len(), 128, "exact-fill seg packed at 128");
-        assert_eq!(std::fs::metadata(&segs[1].1).unwrap().len(), 128, "second sealed seg packed at 128");
+        assert_eq!(
+            std::fs::metadata(&segs[0].1).unwrap().len(),
+            128,
+            "exact-fill seg packed at 128"
+        );
+        assert_eq!(
+            std::fs::metadata(&segs[1].1).unwrap().len(),
+            128,
+            "second sealed seg packed at 128"
+        );
 
         // Replay reconstructs all 5 records.
         let mut got = 0usize;
@@ -1876,7 +1928,10 @@ mod tests {
             got += 1;
         })
         .unwrap();
-        assert_eq!(got, 5, "all 5 records across exact-fill+overflow boundaries replayed");
+        assert_eq!(
+            got, 5,
+            "all 5 records across exact-fill+overflow boundaries replayed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1889,7 +1944,10 @@ mod tests {
         let sh = Shard::open_with_segment_size(dir.clone(), SEG).unwrap();
         let huge = vec![b'!'; 512];
         let res = sh.reserve_and_stage(RecordKind::Append, 6, 0, &huge);
-        assert!(res.is_err(), "a record larger than segment_size must error, not overflow");
+        assert!(
+            res.is_err(),
+            "a record larger than segment_size must error, not overflow"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1899,15 +1957,25 @@ mod tests {
         // The committer must NOT advance durable_lsn past the gap, even though l3's bytes
         // are on disk — durable_lsn may reach l1 but MUST stay < l3 until l2 is written.
         let sh = Shard::open(tmp("shard")).unwrap();
-        let l1 = sh.reserve_and_stage(RecordKind::Append, 1, 0, b"a").unwrap();
+        let l1 = sh
+            .reserve_and_stage(RecordKind::Append, 1, 0, b"a")
+            .unwrap();
         let _l2 = sh.reserve_only(); // #[cfg(test)] hook: assigns lsn, no write
-        let l3 = sh.reserve_and_stage(RecordKind::Append, 1, 2, b"c").unwrap();
+        let l3 = sh
+            .reserve_and_stage(RecordKind::Append, 1, 2, b"c")
+            .unwrap();
         let h = sh.spawn_committer();
         sh.wait_durable(l1).await;
         // give the committer a beat to (incorrectly) over-advance if the watermark is broken
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(sh.durable_lsn() >= l1, "l1 (and its contiguous prefix) is durable");
-        assert!(sh.durable_lsn() < l3, "MUST NOT advance past the unwritten l2 gap to l3");
+        assert!(
+            sh.durable_lsn() >= l1,
+            "l1 (and its contiguous prefix) is durable"
+        );
+        assert!(
+            sh.durable_lsn() < l3,
+            "MUST NOT advance past the unwritten l2 gap to l3"
+        );
         h.stop();
     }
 
@@ -1924,13 +1992,21 @@ mod tests {
 
         sh.fail_next_write();
         let err = sh.reserve_and_stage(RecordKind::Append, 1, 0, b"boom");
-        assert!(err.is_err(), "an injected stage failure must return Err, not panic");
+        assert!(
+            err.is_err(),
+            "an injected stage failure must return Err, not panic"
+        );
 
-        let l1 = sh.reserve_and_stage(RecordKind::Append, 1, 0, b"ok").unwrap();
+        let l1 = sh
+            .reserve_and_stage(RecordKind::Append, 1, 0, b"ok")
+            .unwrap();
         assert_eq!(l1, 1, "the failed stage consumed no lsn");
         let h = sh.spawn_committer();
         sh.wait_durable(l1).await;
-        assert!(sh.durable_lsn() >= l1, "the shard is fully functional after the error");
+        assert!(
+            sh.durable_lsn() >= l1,
+            "the shard is fully functional after the error"
+        );
         h.stop();
     }
 
@@ -1948,7 +2024,8 @@ mod tests {
         // Lay down several whole old records, then drop & re-open (non-destructive
         // open keeps the bytes — exactly the production crash-restart situation).
         for i in 0..6u64 {
-            sh.reserve_and_stage(RecordKind::Append, 1, i * 8, b"old-data").unwrap();
+            sh.reserve_and_stage(RecordKind::Append, 1, i * 8, b"old-data")
+                .unwrap();
         }
         std::fs::write(dir.join("checkpoint"), "3").unwrap();
         let old_len_on_disk = {
@@ -1969,7 +2046,11 @@ mod tests {
         // (fresh fallocate) — no stale record decodes at offset 0 anymore.
         assert!(!dir.join("checkpoint").exists(), "stale checkpoint removed");
         let raw = std::fs::read(seg_path(&dir, 1)).unwrap();
-        assert_eq!(raw.len(), old_len_on_disk, "segment re-created at full size");
+        assert_eq!(
+            raw.len(),
+            old_len_on_disk,
+            "segment re-created at full size"
+        );
         assert!(
             raw.iter().all(|&b| b == 0),
             "segment is fully zeroed — no stale framed records survive the reset"
@@ -1982,12 +2063,20 @@ mod tests {
         // A new append now lands at lsn 1 / offset 0 into the clean segment; the
         // committer makes it durable and nothing past it decodes as a record.
         let h = sh.spawn_committer();
-        let lsn = sh.reserve_and_stage(RecordKind::Append, 1, 0, b"new").unwrap();
+        let lsn = sh
+            .reserve_and_stage(RecordKind::Append, 1, 0, b"new")
+            .unwrap();
         assert_eq!(lsn, 1, "fresh WAL starts at lsn 1");
         sh.wait_durable(lsn).await;
         let raw = std::fs::read(seg_path(&dir, 1)).unwrap();
         match decode_at(&raw, 0) {
-            Decoded::Record { lsn: l, total, payload_off, len, .. } => {
+            Decoded::Record {
+                lsn: l,
+                total,
+                payload_off,
+                len,
+                ..
+            } => {
                 assert_eq!(l, 1);
                 assert_eq!(&raw[payload_off..payload_off + len], b"new");
                 // Right after the only live record we hit fallocate zeros = clean
@@ -2013,12 +2102,13 @@ mod tests {
 
         // Build a real stream via the store so the dirty set can hold its
         // `Arc<StreamState>` (checkpoint reads `Shared.tail` + `Shared.file`).
-        let store = crate::store::Store::new_with_tier(
-            dir.clone(),
-            crate::tier::TierConfig::default(),
-        )
-        .unwrap();
-        let st = match store.create("dirty-stream", ckpt_test_cfg(), None, 0).unwrap() {
+        let store =
+            crate::store::Store::new_with_tier(dir.clone(), crate::tier::TierConfig::default())
+                .unwrap();
+        let st = match store
+            .create("dirty-stream", ckpt_test_cfg(), None, 0)
+            .unwrap()
+        {
             crate::store::CreateResult::Created(s) => s,
             _ => panic!("create failed"),
         };
@@ -2028,8 +2118,12 @@ mod tests {
         // Stage a couple of records and write the per-stream bytes WITHOUT fsync,
         // then register the stream. checkpoint() must fdatasync its file (we assert
         // the bytes land) and record its durable tail.
-        let l1 = sh.reserve_and_stage(RecordKind::Append, sid, 0, b"hello").unwrap();
-        let l2 = sh.reserve_and_stage(RecordKind::Append, sid, 5, b"world").unwrap();
+        let l1 = sh
+            .reserve_and_stage(RecordKind::Append, sid, 0, b"hello")
+            .unwrap();
+        let l2 = sh
+            .reserve_and_stage(RecordKind::Append, sid, 5, b"world")
+            .unwrap();
         {
             let f = Arc::clone(&st.shared.read().unwrap().file);
             use std::io::Write;
@@ -2070,7 +2164,10 @@ mod tests {
 
         // (c) the stale segment fully below checkpoint_lsn is unlinked; the active
         // segment (`1.wal`) remains.
-        assert!(!stale.exists(), "segment fully below checkpoint_lsn recycled");
+        assert!(
+            !stale.exists(),
+            "segment fully below checkpoint_lsn recycled"
+        );
         assert!(seg_path(&dir, 1).exists(), "active segment never recycled");
 
         let _ = l1;
@@ -2090,7 +2187,9 @@ mod tests {
         let size_before = sh.wal_size_bytes();
         let mut last = 0;
         for i in 0..16u64 {
-            last = sh.reserve_and_stage(RecordKind::Append, 7, i * 5, b"abcde").unwrap();
+            last = sh
+                .reserve_and_stage(RecordKind::Append, 7, i * 5, b"abcde")
+                .unwrap();
         }
         // Acks resolve with NO checkpoint having run.
         tokio::time::timeout(std::time::Duration::from_secs(5), sh.wait_durable(last))
@@ -2102,7 +2201,10 @@ mod tests {
             sh.wal_size_bytes() >= size_before,
             "WAL size does not shrink without a checkpoint"
         );
-        assert!(seg_path(&dir, 1).exists(), "WAL segment retained (not recycled)");
+        assert!(
+            seg_path(&dir, 1).exists(),
+            "WAL segment retained (not recycled)"
+        );
 
         h.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2120,9 +2222,15 @@ mod tests {
         // single not-yet-durable batch above durable_lsn (0).
         let mut last = 0;
         for i in 0..K {
-            last = sh.reserve_and_stage(RecordKind::Append, 7, i * 4, b"data").unwrap();
+            last = sh
+                .reserve_and_stage(RecordKind::Append, 7, i * 4, b"data")
+                .unwrap();
         }
-        assert_eq!(sh.durable_lsn_now(), 0, "nothing durable until the committer runs");
+        assert_eq!(
+            sh.durable_lsn_now(),
+            0,
+            "nothing durable until the committer runs"
+        );
 
         // Now run the committer: one fdatasync should make all K durable at once.
         let h = sh.spawn_committer();
@@ -2130,10 +2238,20 @@ mod tests {
         h.stop();
 
         let snap = sh.stats_snapshot();
-        assert_eq!(snap.fsync_count, 1, "a single fdatasync committed the whole batch");
-        assert_eq!(snap.last_batch, K, "last_batch == records made durable by that fsync");
+        assert_eq!(
+            snap.fsync_count, 1,
+            "a single fdatasync committed the whole batch"
+        );
+        assert_eq!(
+            snap.last_batch, K,
+            "last_batch == records made durable by that fsync"
+        );
         assert_eq!(snap.records_committed, K);
-        assert_eq!(snap.avg(), K as f64, "avg == records_committed / fsync_count");
+        assert_eq!(
+            snap.avg(),
+            K as f64,
+            "avg == records_committed / fsync_count"
+        );
         assert_eq!(snap.max(), K);
         assert_eq!(sh.tail_lsn(), K, "tail_lsn == highest assigned lsn");
 
@@ -2155,13 +2273,18 @@ mod tests {
         let mut payloads = Vec::new();
         for i in 0..K {
             let p = format!("payload-{i}").into_bytes();
-            let lsn = sh.reserve_and_stage(RecordKind::Append, 7, i * 10, &p).unwrap();
+            let lsn = sh
+                .reserve_and_stage(RecordKind::Append, 7, i * 10, &p)
+                .unwrap();
             lsns.push(lsn);
             payloads.push(p);
         }
         let last = *lsns.last().unwrap();
         sh.wait_durable(last).await;
-        assert!(sh.durable_lsn() >= last, "durable_lsn reached the last staged lsn");
+        assert!(
+            sh.durable_lsn() >= last,
+            "durable_lsn reached the last staged lsn"
+        );
         h.stop();
 
         // Every record's bytes are on disk and decode correctly, back-to-back.
@@ -2169,11 +2292,22 @@ mod tests {
         let mut off = 0usize;
         for (idx, expect_payload) in payloads.iter().enumerate() {
             match decode_at(&raw, off) {
-                Decoded::Record { lsn, stream_id, stream_offset, payload_off, len, total, .. } => {
+                Decoded::Record {
+                    lsn,
+                    stream_id,
+                    stream_offset,
+                    payload_off,
+                    len,
+                    total,
+                    ..
+                } => {
                     assert_eq!(lsn, lsns[idx]);
                     assert_eq!(stream_id, 7);
                     assert_eq!(stream_offset, idx as u64 * 10);
-                    assert_eq!(&raw[payload_off..payload_off + len], expect_payload.as_slice());
+                    assert_eq!(
+                        &raw[payload_off..payload_off + len],
+                        expect_payload.as_slice()
+                    );
                     off += total;
                 }
                 other => panic!("record {idx} did not decode: {other:?}"),
@@ -2195,10 +2329,15 @@ mod tests {
         // (a) Records made durable while the committer thread runs.
         let mut last = 0;
         for i in 0..10u64 {
-            last = sh.reserve_and_stage(RecordKind::Append, 1, i, b"live").unwrap();
+            last = sh
+                .reserve_and_stage(RecordKind::Append, 1, i, b"live")
+                .unwrap();
         }
         sh.wait_durable(last).await;
-        assert!(sh.durable_lsn() >= last, "records durable while committer runs");
+        assert!(
+            sh.durable_lsn() >= last,
+            "records durable while committer runs"
+        );
 
         // (b) Stage a final batch, then stop WITHOUT awaiting durability — the
         // committer's final drain must still make them durable before it exits.
@@ -2242,12 +2381,13 @@ mod tests {
 
         // Build a real stream via the store so register_dirty gets a proper
         // Arc<StreamState> (same as the production maybe_sync_on_ack path does).
-        let store = crate::store::Store::new_with_tier(
-            dir.clone(),
-            crate::tier::TierConfig::default(),
-        )
-        .unwrap();
-        let st = match store.create("order-stream", ckpt_test_cfg(), None, 0).unwrap() {
+        let store =
+            crate::store::Store::new_with_tier(dir.clone(), crate::tier::TierConfig::default())
+                .unwrap();
+        let st = match store
+            .create("order-stream", ckpt_test_cfg(), None, 0)
+            .unwrap()
+        {
             crate::store::CreateResult::Created(s) => s,
             _ => panic!("create failed"),
         };
@@ -2278,7 +2418,8 @@ mod tests {
         // Mimic maybe_sync_on_ack: register_dirty BEFORE reserve_and_stage.
         // This is the exact production ordering the CQ-1 invariant mandates.
         sh.register_dirty(stream_id, Arc::clone(&st));
-        sh.reserve_and_stage(RecordKind::Append, stream_id, 0, b"cq1-probe").unwrap();
+        sh.reserve_and_stage(RecordKind::Append, stream_id, 0, b"cq1-probe")
+            .unwrap();
 
         // THE INVARIANT: the hook must have fired and seen is_dirty == true.
         assert!(
@@ -2294,7 +2435,10 @@ mod tests {
         );
 
         // The stream remains dirty after the stage (checkpoint hasn't run yet).
-        assert!(sh.is_dirty(stream_id), "stream stays dirty until checkpoint drains it");
+        assert!(
+            sh.is_dirty(stream_id),
+            "stream stays dirty until checkpoint drains it"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2308,12 +2452,13 @@ mod tests {
     async fn register_dirty_is_idempotent_within_an_epoch() {
         let dir = tmp("dirty-idem");
         let sh = Shard::open(dir.clone()).unwrap();
-        let store = crate::store::Store::new_with_tier(
-            dir.clone(),
-            crate::tier::TierConfig::default(),
-        )
-        .unwrap();
-        let st = match store.create("idem-stream", ckpt_test_cfg(), None, 0).unwrap() {
+        let store =
+            crate::store::Store::new_with_tier(dir.clone(), crate::tier::TierConfig::default())
+                .unwrap();
+        let st = match store
+            .create("idem-stream", ckpt_test_cfg(), None, 0)
+            .unwrap()
+        {
             crate::store::CreateResult::Created(s) => s,
             _ => panic!("create failed"),
         };
@@ -2337,7 +2482,10 @@ mod tests {
         );
 
         // A DIFFERENT stream in the same epoch is a distinct first-touch → one push.
-        let st2 = match store.create("idem-stream-2", ckpt_test_cfg(), None, 0).unwrap() {
+        let st2 = match store
+            .create("idem-stream-2", ckpt_test_cfg(), None, 0)
+            .unwrap()
+        {
             crate::store::CreateResult::Created(s) => s,
             _ => panic!("create failed"),
         };
@@ -2357,12 +2505,13 @@ mod tests {
         let dir = tmp("dirty-next");
         let sh = Shard::open(dir.clone()).unwrap();
         let h = sh.spawn_committer();
-        let store = crate::store::Store::new_with_tier(
-            dir.clone(),
-            crate::tier::TierConfig::default(),
-        )
-        .unwrap();
-        let st = match store.create("next-stream", ckpt_test_cfg(), None, 0).unwrap() {
+        let store =
+            crate::store::Store::new_with_tier(dir.clone(), crate::tier::TierConfig::default())
+                .unwrap();
+        let st = match store
+            .create("next-stream", ckpt_test_cfg(), None, 0)
+            .unwrap()
+        {
             crate::store::CreateResult::Created(s) => s,
             _ => panic!("create failed"),
         };
@@ -2373,7 +2522,9 @@ mod tests {
         // Interval 1: append + register, make the record durable so checkpoint has
         // a non-zero floor, then checkpoint (drains the stream, bumps the epoch).
         sh.register_dirty(sid, Arc::clone(&st));
-        let l1 = sh.reserve_and_stage(RecordKind::Append, sid, 0, b"first").unwrap();
+        let l1 = sh
+            .reserve_and_stage(RecordKind::Append, sid, 0, b"first")
+            .unwrap();
         // Reflect a logical tail so checkpoint records it (file already exists).
         st.shared.write().unwrap().tail = 5;
         sh.wait_durable(l1).await;
@@ -2395,15 +2546,24 @@ mod tests {
             sh.is_dirty(sid),
             "a stream touched after the drain re-registers (not lost)"
         );
-        assert_eq!(sh.dirty_len(), 1, "re-registered into the next interval's set");
+        assert_eq!(
+            sh.dirty_len(),
+            1,
+            "re-registered into the next interval's set"
+        );
 
         // The next checkpoint drains it again — proving the post-drain append is
         // covered, never dropped.
-        let l2 = sh.reserve_and_stage(RecordKind::Append, sid, 5, b"second").unwrap();
+        let l2 = sh
+            .reserve_and_stage(RecordKind::Append, sid, 5, b"second")
+            .unwrap();
         st.shared.write().unwrap().tail = 11;
         sh.wait_durable(l2).await;
         sh.checkpoint().await.unwrap();
-        assert!(!sh.is_dirty(sid), "second checkpoint drained the re-registration");
+        assert!(
+            !sh.is_dirty(sid),
+            "second checkpoint drained the re-registration"
+        );
         assert_eq!(sh.dirty_epoch_now(), epoch0 + 2, "epoch bumped again");
 
         h.stop();
@@ -2425,8 +2585,15 @@ mod tests {
         });
         // Let it register and park.
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(sh.waiter_count(), 1, "waiter parked while durable (0) < lsn (10)");
-        assert!(!waiter.is_finished(), "waiter must not be woken before its lsn");
+        assert_eq!(
+            sh.waiter_count(),
+            1,
+            "waiter parked while durable (0) < lsn (10)"
+        );
+        assert!(
+            !waiter.is_finished(),
+            "waiter must not be woken before its lsn"
+        );
 
         // Advance durable BELOW the waiter's lsn: must NOT wake it.
         sh.publish_durable(9);
@@ -2478,7 +2645,11 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!hi.is_finished(), "lsn=8 stays parked above the watermark");
-        assert_eq!(sh.waiter_count(), 1, "only the unsatisfied (lsn=8) waiter remains");
+        assert_eq!(
+            sh.waiter_count(),
+            1,
+            "only the unsatisfied (lsn=8) waiter remains"
+        );
 
         // Coalescing proof: this commit woke exactly the 2 satisfied waiters, not
         // all 3 parked subscribers (the old broadcast would have recorded 3).

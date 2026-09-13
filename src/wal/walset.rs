@@ -71,7 +71,12 @@ impl WalSet {
         requested_n: Option<usize>,
         default_n: usize,
     ) -> io::Result<Arc<WalSet>> {
-        WalSet::open_with_segment_size(data_dir, requested_n, default_n, super::segment::SEGMENT_BYTES)
+        WalSet::open_with_segment_size(
+            data_dir,
+            requested_n,
+            default_n,
+            super::segment::SEGMENT_BYTES,
+        )
     }
 
     /// Like [`WalSet::open`] but with an explicit per-shard `segment_size` (the
@@ -183,8 +188,7 @@ impl WalSet {
     /// second call finds the handle list empty). Called from the process shutdown
     /// path (`main.rs`, after `engine_raw::drain`).
     pub fn stop_committers(&self) {
-        let handles: Vec<CommitterHandle> =
-            std::mem::take(&mut *self.committers.lock().unwrap());
+        let handles: Vec<CommitterHandle> = std::mem::take(&mut *self.committers.lock().unwrap());
         // Signal all, then join all, so a slow shard's final drain overlaps the
         // others rather than serializing shutdown.
         for h in &handles {
@@ -229,7 +233,10 @@ mod tests {
         let p = std::env::temp_dir().join(format!(
             "ds-wal-walset-test-{tag}-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&p);
         p
