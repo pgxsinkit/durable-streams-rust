@@ -1146,6 +1146,12 @@ async fn handle_append_inner(
         producer.is_some() || seq_header.is_some() || st.config.ttl_seconds.is_some();
     {
         let mut s = st.shared.write().unwrap();
+        // A body append refreshes last_access in write_wire. A close-only POST
+        // has no wire bytes, but it is still a successful write operation and
+        // therefore MUST slide a Stream-TTL window as well.
+        if close_req && wire.is_empty() {
+            s.last_access = SystemTime::now();
+        }
         if let Some(p) = &producer {
             s.producers.insert(
                 p.id.clone(),
@@ -2609,6 +2615,48 @@ mod memory_mode_tests {
         }
 
         crate::handlers::set_long_poll_timeout(30_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1: PROTOCOL.md §6.2 — every successful write slides a `Stream-TTL`
+    /// window. A close-only POST carries no body, so it never reaches
+    /// `write_wire` (which is where a body append refreshes `last_access`), but
+    /// it is still a write: the stream must not keep the expiry deadline it had
+    /// before the close.
+    #[tokio::test]
+    async fn close_only_post_slides_the_ttl() {
+        let _guard = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = tmp("ttl-close");
+        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+
+        let mut req = put_req("m/ttl", "application/octet-stream");
+        req.headers.push(("stream-ttl".into(), "3600".into()));
+        let resp = handle(Arc::clone(&store), req).await;
+        assert!((200..300).contains(&resp.status), "create: {}", resp.status);
+
+        // Back-date the stream so an unrefreshed deadline is unmistakable.
+        let st = store.get("m/ttl").unwrap();
+        let stale = SystemTime::now() - Duration::from_secs(600);
+        st.shared.write().unwrap().last_access = stale;
+
+        let mut req = post_req("m/ttl", "application/octet-stream", b"");
+        req.headers.push(("stream-closed".into(), "true".into()));
+        let resp = handle(Arc::clone(&store), req).await;
+        assert!((200..300).contains(&resp.status), "close: {}", resp.status);
+
+        let last_access = st.shared.read().unwrap().last_access;
+        assert!(
+            last_access > stale,
+            "a close-only POST is a successful write and must slide the TTL"
+        );
+        assert!(
+            SystemTime::now()
+                .duration_since(last_access)
+                .expect("last_access is in the past")
+                < Duration::from_secs(60),
+            "the TTL window must restart from the close, not from the last body append"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
