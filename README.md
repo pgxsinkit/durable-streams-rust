@@ -70,6 +70,12 @@ durable, single-node server on `127.0.0.1:4437` with its data dir under `$TMPDIR
 | `--data-dir`             | `$TMPDIR/durable-streams-rust` | storage directory. **Required with `--durability wal`** — the default is a temp dir, so wal would fsync every append and discard it on restart; the server refuses that combination at startup rather than let it look healthy. Optional in `memory` mode, which makes no durability claim. |
 | `--long-poll-timeout-ms` | `30000`                        | how long a `live=long-poll` request blocks before returning 204 |
 
+The data directory is owned by one process at a time: the server takes an exclusive
+`flock` on `<data-dir>/.durable-streams.lock` at startup and holds it until it exits.
+A second server pointed at the same directory refuses to start (exit 2) rather than
+interleave writes with the first. This applies in `memory` mode too — it opens no WAL,
+but it still writes the stream files and their meta sidecars under the data dir.
+
 **Durability** — controls how appends are made durable. See [ARCHITECTURE.md › Durability modes](ARCHITECTURE.md#durability-modes).
 
 | Flag                  | Default   | Description                                                                                                                                                                                                                                                                                                               |

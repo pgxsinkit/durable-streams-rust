@@ -1,5 +1,6 @@
 mod api;
 mod blobstore;
+mod data_dir_lock;
 mod engine_raw;
 mod handlers;
 mod http1;
@@ -354,6 +355,23 @@ fn main() {
         );
         std::process::exit(2);
     }
+
+    // Whatever the durability mode, a server owns its data directory for the
+    // whole of its life. Memory mode is not exempt: it still writes the stream
+    // files (and their meta sidecars) under the data dir, so two memory-mode
+    // processes pointed at one directory overwrite each other's state there
+    // exactly as two wal processes would.
+    //
+    // Declared before the runtime is built so that reverse drop order shuts the
+    // runtime down first — including joining the `spawn_blocking` persistence
+    // work — and only then releases the inter-process lock.
+    let _data_dir_lock = match data_dir_lock::DataDirLock::acquire(&data_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
 
     // S3 credentials come from env (never CLI flags), matching the OTEL_*/AWS
     // convention. Honour both the DS_* names and the standard AWS_* fallbacks.
