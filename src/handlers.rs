@@ -270,7 +270,12 @@ pub async fn handle(store: Arc<Store>, req: Req) -> Resp {
 
 async fn dispatch(store: Arc<Store>, req: Req) -> Resp {
     let path = req.path.clone();
-    if path == "/health" {
+    // Preflight is answered for every path, including /health: a browser sends
+    // OPTIONS before the real request, and the answer describes the protocol,
+    // not the resource.
+    if req.method == Method::Options {
+        cors_preflight()
+    } else if path == "/health" {
         text_response(200, "ok")
     } else {
         match req.method {
@@ -279,9 +284,49 @@ async fn dispatch(store: Arc<Store>, req: Req) -> Resp {
             Method::Get => handle_read(store, req, path).await,
             Method::Head => handle_head(store, path),
             Method::Delete => handle_delete(store, path).await,
-            Method::Options => ResponseBuilder::new(204).body(empty()),
+            Method::Options => unreachable!("OPTIONS handled before route dispatch"),
             Method::Other => text_response(405, "method not allowed"),
         }
+    }
+}
+
+/// Advertise the request headers understood by the protocol without granting
+/// cross-origin access. An operator that intentionally exposes browser access
+/// can add an origin policy at the authenticated edge; the storage process must
+/// not make every stream and control route readable with `allow-origin: *`.
+fn cors_preflight() -> Resp {
+    ResponseBuilder::new(204)
+        .hs(
+            "access-control-allow-methods",
+            "GET, POST, PUT, DELETE, HEAD, OPTIONS",
+        )
+        .hs(
+            "access-control-allow-headers",
+            "content-type, authorization, If-None-Match, Stream-Seq, Stream-TTL, Stream-Expires-At, Stream-Closed, Producer-Id, Producer-Epoch, Producer-Seq, Stream-Forked-From, Stream-Fork-Offset, Stream-Fork-Sub-Offset",
+        )
+        .body(empty())
+}
+
+#[cfg(test)]
+mod cors_policy_tests {
+    use super::*;
+
+    #[test]
+    fn preflight_advertises_headers_without_granting_cross_origin_reads() {
+        let response = cors_preflight();
+        assert_eq!(response.status, 204);
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| *name == "access-control-allow-headers"
+                && value.to_ascii_lowercase().contains("if-none-match")));
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(name, _)| *name == "access-control-allow-origin"));
+        assert!(!crate::api::SECURITY_HEADERS
+            .iter()
+            .any(|(name, _)| *name == "access-control-allow-origin"));
     }
 }
 
