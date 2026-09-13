@@ -2,15 +2,16 @@
  * Run the server conformance suite against the Rust server.
  *
  * Two modes:
- *   - CI / default: builds nothing, but spawns the release binary
- *     (packages/durable-streams-rust/target/release/durable-streams-server) itself,
- *     mirroring the Caddy harness. Run with: `pnpm vitest run --project server-rust`
- *     (build the binary first with `cargo build --release`).
+ *   - CI / default: builds nothing, but spawns the release binary itself,
+ *     mirroring the Caddy harness. Build it first with `cargo build --release`,
+ *     then run `bun run test:conformance`. The binary is located through
+ *     `cargo metadata` (honouring CARGO_TARGET_DIR and any workspace target
+ *     directory); RUST_SERVER_BIN overrides it outright, which is what a CI job
+ *     that downloads a prebuilt binary should use.
  *   - Manual: set RUST_SERVER_URL to point at an already-running server, e.g.
- *     RUST_SERVER_URL=http://localhost:4562 vitest run \
- *       --config packages/durable-streams-rust/conformance/vitest.config.ts
+ *     RUST_SERVER_URL=http://localhost:4562 bun run test:conformance
  */
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import * as path from 'node:path'
@@ -35,13 +36,7 @@ let server: ChildProcess | null = null
 
 beforeAll(async () => {
   if (!externalUrl) {
-    const binary = path.join(
-      __dirname,
-      `..`,
-      `target`,
-      `release`,
-      `durable-streams-server`
-    )
+    const binary = resolveServerBinary()
     const dataDir = mkdtempSync(path.join(tmpdir(), `ds-rust-conformance-`))
     // Extra server flags for the run-configuration matrix (CI runs the suite
     // once per config — see README "Run-configuration matrix" + ci.yml). E.g.
@@ -82,6 +77,21 @@ afterAll(async () => {
     await new Promise((resolve) => setTimeout(resolve, 300))
   }
 })
+
+function resolveServerBinary(): string {
+  if (process.env.RUST_SERVER_BIN) return process.env.RUST_SERVER_BIN
+  const metadata = JSON.parse(
+    execFileSync(`cargo`, [`metadata`, `--format-version=1`, `--no-deps`], {
+      cwd: path.join(__dirname, `..`),
+      encoding: `utf8`,
+    })
+  ) as { target_directory: string }
+  return path.join(
+    metadata.target_directory,
+    `release`,
+    `durable-streams-server`
+  )
+}
 
 describe(`Rust Server Implementation`, () => {
   runConformanceTests(config)
