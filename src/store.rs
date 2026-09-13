@@ -1005,7 +1005,29 @@ impl Store {
         };
         if soft {
             if durable {
-                write_meta_sync(st, true)?;
+                // Test-only: stand an I/O error in for the sidecar write, so
+                // that the rollback below is what the test actually exercises.
+                #[cfg(test)]
+                let written = if DELETE_FAULT.load(Ordering::Relaxed) == 1 {
+                    Err(std::io::Error::other(
+                        "injected soft-delete metadata failure",
+                    ))
+                } else {
+                    write_meta_sync(st, true)
+                };
+                #[cfg(not(test))]
+                let written = write_meta_sync(st, true);
+
+                // The `soft_deleted = true` above is already in memory. If the
+                // sidecar write fails the client gets a 500, so that in-memory
+                // mark has to be rolled back: otherwise the stream is deleted
+                // for every subsequent request in this process but comes back
+                // on the next restart, and the client's retry can no longer see
+                // the stream it is trying to delete.
+                if let Err(error) = written {
+                    st.shared.write().unwrap().soft_deleted = false;
+                    return Err(error);
+                }
             } else {
                 let st2 = st.clone();
                 tokio::task::spawn_blocking(move || {
@@ -1013,23 +1035,36 @@ impl Store {
                 });
             }
         } else {
-            self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
             // Reclaim this stream's offloaded segments (remote objects + any
             // staged local chunk files) — safe only here, on a true hard delete
             // with no remaining fork references.
             self.gc_remote_segments(st);
             let fp = st.file_path.clone();
+            // The map entry is dropped only once the removal has actually
+            // happened, never before. Dropping it first meant a failed
+            // `fsync_parent_dir` returned 500 to the client with the stream
+            // already gone from memory — it then reappeared at the next restart
+            // — and it left a window in which a concurrent PUT could recreate
+            // the path while the old files were still being unlinked.
             if durable {
+                #[cfg(test)]
+                if DELETE_FAULT.load(Ordering::Relaxed) == 2 {
+                    return Err(std::io::Error::other(
+                        "injected hard-delete durability failure",
+                    ));
+                }
                 // Both unlinks live in the same directory; one dir fsync makes
                 // them crash-durable together.
                 let _ = std::fs::remove_file(meta_path(&fp));
                 let _ = std::fs::remove_file(&fp);
                 fsync_parent_dir(&fp)?;
+                self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
             } else {
                 tokio::task::spawn_blocking(move || {
                     let _ = std::fs::remove_file(meta_path(&fp));
                     let _ = std::fs::remove_file(fp);
                 });
+                self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
             }
             self.release_parent(st);
         }
@@ -1195,6 +1230,12 @@ impl Store {
         }
     }
 }
+
+/// Test-only DELETE fault injection: 1 = fail the soft-delete sidecar write,
+/// 2 = fail the hard-delete durability step. The failure modes being pinned are
+/// I/O errors that cannot be provoked from a unit test any other way.
+#[cfg(test)]
+static DELETE_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 fn config_matches(existing: &StreamState, requested: &StreamConfig) -> bool {
     let ex = &existing.config;
@@ -2694,6 +2735,58 @@ mod meta_sweep_tests {
         assert!(
             !meta_path(&st.file_path).exists(),
             "sweep must not resurrect a deleted stream's sidecar"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A DELETE that fails is not a DELETE. Neither failure path may leave the
+    /// store in a state the client's retry cannot recover from: the soft path
+    /// must not leave the stream marked deleted in memory after returning an
+    /// error, and the hard path must not drop the map entry before the unlink
+    /// is durable (that made the stream vanish for a caller who got a 500, and
+    /// come back at the next restart).
+    #[tokio::test]
+    async fn a_failed_durable_delete_leaves_the_stream_intact() {
+        let dir = tmp_dir("delete-fault");
+        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+
+        // Soft delete: a live fork reference forces the soft path.
+        let soft = create(&store, "soft");
+        soft.shared.write().unwrap().ref_count = 1;
+        DELETE_FAULT.store(1, Ordering::Relaxed);
+        assert!(
+            store.delete_or_soft_delete_durable(&soft).is_err(),
+            "the injected sidecar failure must surface"
+        );
+        DELETE_FAULT.store(0, Ordering::Relaxed);
+        assert!(
+            !soft.shared.read().unwrap().soft_deleted,
+            "a failed soft delete must roll the in-memory mark back"
+        );
+        assert!(
+            store.streams.contains_key("soft"),
+            "the stream must still be reachable"
+        );
+
+        // Hard delete: no references, so the unlink path runs.
+        let hard = create(&store, "hard");
+        DELETE_FAULT.store(2, Ordering::Relaxed);
+        assert!(
+            store.delete_or_soft_delete_durable(&hard).is_err(),
+            "the injected durability failure must surface"
+        );
+        assert!(
+            store.streams.contains_key("hard"),
+            "a hard delete that never became durable must not remove the stream"
+        );
+
+        // The retry, with the fault cleared, completes it.
+        DELETE_FAULT.store(0, Ordering::Relaxed);
+        store.delete_or_soft_delete_durable(&hard).unwrap();
+        assert!(
+            !store.streams.contains_key("hard"),
+            "a durable hard delete removes the stream"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
