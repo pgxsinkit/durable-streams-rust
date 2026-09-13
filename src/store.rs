@@ -1654,20 +1654,8 @@ pub fn compute_cursor(client_cursor: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tier_tests {
     use super::*;
+    use crate::handlers::test_support::temp_dir;
     use crate::tier::{TierConfig, TierKind};
-
-    fn tmp_dir(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "ds-tier-test-{tag}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        p
-    }
 
     fn local_tier(dir: &std::path::Path, segment_bytes: u64) -> TierConfig {
         TierConfig {
@@ -1729,9 +1717,11 @@ mod tier_tests {
 
     #[tokio::test]
     async fn round_trip_through_cold_storage() {
-        let dir = tmp_dir("roundtrip");
-        let store =
-            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        let dir = temp_dir("roundtrip");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), local_tier(dir.path(), 64 * 1024))
+                .unwrap(),
+        );
         let cfg = StreamConfig {
             content_type: "application/octet-stream".into(),
             ttl_seconds: None,
@@ -1784,8 +1774,6 @@ mod tier_tests {
         // tail is served entirely from the live data file → all-local.
         assert!(!all_local(&st, 0, sealed));
         assert!(all_local(&st, sealed, total as u64));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1793,10 +1781,10 @@ mod tier_tests {
         // With compaction on, once the reclaimable sealed prefix crosses
         // `compact_bytes` the live data file is rewritten to hold only the hot
         // tail `[sealed_offset, tail)`; reads of the full history stay exact.
-        let dir = tmp_dir("compact-reclaim");
-        let mut cfg = local_tier(&dir, 64 * 1024); // 64 KiB segments
+        let dir = temp_dir("compact-reclaim");
+        let mut cfg = local_tier(dir.path(), 64 * 1024); // 64 KiB segments
         cfg.compact_bytes = 128 * 1024; // compact once ≥128 KiB is reclaimable
-        let store = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg).unwrap());
         let scfg = StreamConfig {
             content_type: "application/octet-stream".into(),
             ttl_seconds: None,
@@ -1861,8 +1849,6 @@ mod tier_tests {
 
         // Compaction never touches the manifest.
         assert!(n_segs >= 1, "manifest still lists the sealed segments");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1870,10 +1856,10 @@ mod tier_tests {
         // Below `compact_bytes` the live file is left intact (file_base unmoved),
         // and reads remain exact — compaction is purely a reclaim, never required
         // for correctness.
-        let dir = tmp_dir("compact-threshold");
-        let mut cfg = local_tier(&dir, 64 * 1024);
+        let dir = temp_dir("compact-threshold");
+        let mut cfg = local_tier(dir.path(), 64 * 1024);
         cfg.compact_bytes = 10 * 1024 * 1024; // 10 MiB — far above this stream
-        let store = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg).unwrap());
         let scfg = StreamConfig {
             content_type: "application/octet-stream".into(),
             ttl_seconds: None,
@@ -1902,8 +1888,6 @@ mod tier_tests {
 
         let got = read_logical(&st, 0, total as u64).await;
         assert_eq!(got, payload, "reads exact without compaction");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn octet_cfg() -> StreamConfig {
@@ -1923,13 +1907,13 @@ mod tier_tests {
     async fn recovery_after_real_compaction() {
         // A cleanly-compacted stream reopens with the persisted file_base, the
         // compacted (small) live file, the right tail, and exact full read-back.
-        let dir = tmp_dir("compact-recover");
+        let dir = temp_dir("compact-recover");
         let total = 500 * 1024usize;
         let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
         let (sealed, tail) = {
-            let mut cfg = local_tier(&dir, 64 * 1024);
+            let mut cfg = local_tier(dir.path(), 64 * 1024);
             cfg.compact_bytes = 128 * 1024;
-            let store = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+            let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg).unwrap());
             let st = match store.create("s/cr", octet_cfg(), None, 0).unwrap() {
                 CreateResult::Created(s) => s,
                 _ => panic!("create failed"),
@@ -1943,9 +1927,9 @@ mod tier_tests {
             (sealed, tail)
         };
 
-        let mut cfg = local_tier(&dir, 64 * 1024);
+        let mut cfg = local_tier(dir.path(), 64 * 1024);
         cfg.compact_bytes = 128 * 1024;
-        let store2 = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+        let store2 = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg).unwrap());
         let st = store2.get("s/cr").expect("stream recovered");
         let (rtail, rfb) = {
             let s = st.shared.read().unwrap();
@@ -1957,8 +1941,6 @@ mod tier_tests {
         assert_eq!(live_size, tail - sealed, "compacted live file recovered");
         let got = read_logical(&st, 0, total as u64).await;
         assert_eq!(got, payload, "post-compaction-recovery read exact");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Simulate a crash mid-compaction: persist the `pending_compaction` intent,
@@ -1967,13 +1949,13 @@ mod tier_tests {
     /// (`true`, crash after the rename). Recovery must reconstruct the right
     /// `file_base` from `pending.tail - file_size` in both cases and read exact.
     async fn recover_with_pending_intent(tag: &str, simulate_renamed: bool) {
-        let dir = tmp_dir(tag);
+        let dir = temp_dir(tag);
         let total = 300 * 1024usize;
         let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
         let (sealed, tail, file_path) = {
-            let mut cfg = local_tier(&dir, 64 * 1024);
+            let mut cfg = local_tier(dir.path(), 64 * 1024);
             cfg.compact_bytes = 0; // no auto-compaction; we craft the crash state
-            let store = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+            let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg).unwrap());
             let st = match store.create("s/pend", octet_cfg(), None, 0).unwrap() {
                 CreateResult::Created(s) => s,
                 _ => panic!("create failed"),
@@ -2002,16 +1984,14 @@ mod tier_tests {
             std::fs::write(&file_path, &full[sealed as usize..]).unwrap();
         }
 
-        let mut cfg = local_tier(&dir, 64 * 1024);
+        let mut cfg = local_tier(dir.path(), 64 * 1024);
         cfg.compact_bytes = 0;
-        let store2 = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+        let store2 = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg).unwrap());
         let st = store2.get("s/pend").expect("stream recovered");
         let rtail = st.shared.read().unwrap().tail;
         assert_eq!(rtail, tail, "tail recovered to the frozen value ({tag})");
         let got = read_logical(&st, 0, total as u64).await;
         assert_eq!(got, payload, "pending-intent recovery read exact ({tag})");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -2033,13 +2013,13 @@ mod tier_tests {
     /// maps `[cut, tail)` exactly and the full logical range reads byte-identical.
     #[tokio::test]
     async fn recovery_pending_intent_prefers_fsynced_temp_when_old_file_short() {
-        let dir = tmp_dir("pend-fast-short");
+        let dir = temp_dir("pend-fast-short");
         let total = 300 * 1024usize;
         let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
         let (sealed, tail, file_path) = {
-            let mut cfg = local_tier(&dir, 64 * 1024);
+            let mut cfg = local_tier(dir.path(), 64 * 1024);
             cfg.compact_bytes = 0; // craft the crash state by hand
-            let store = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+            let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg).unwrap());
             let st = match store.create("s/pend", octet_cfg(), None, 0).unwrap() {
                 CreateResult::Created(s) => s,
                 _ => panic!("create failed"),
@@ -2081,9 +2061,9 @@ mod tier_tests {
             std::fs::write(&file_path, &full[..short]).unwrap();
         }
 
-        let mut cfg = local_tier(&dir, 64 * 1024);
+        let mut cfg = local_tier(dir.path(), 64 * 1024);
         cfg.compact_bytes = 0;
-        let store2 = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+        let store2 = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg).unwrap());
         let st = store2.get("s/pend").expect("stream recovered");
         let (rtail, rfb) = {
             let s = st.shared.read().unwrap();
@@ -2104,8 +2084,6 @@ mod tier_tests {
             got, payload,
             "full read exact after fast crash-before-rename"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -2114,12 +2092,12 @@ mod tier_tests {
         // parent is compacted (its sealed prefix dropped from the live file), the
         // fork must still read that history — resolve_range routes the parent's
         // sealed offsets to the manifest, not the (now-absent) live-file copy.
-        let dir = tmp_dir("fork-compact");
+        let dir = temp_dir("fork-compact");
         let total = 500 * 1024usize;
         let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
-        let mut cfg = local_tier(&dir, 64 * 1024);
+        let mut cfg = local_tier(dir.path(), 64 * 1024);
         cfg.compact_bytes = 128 * 1024;
-        let store = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg).unwrap());
 
         let parent = match store.create("s/parent", octet_cfg(), None, 0).unwrap() {
             CreateResult::Created(s) => s,
@@ -2161,8 +2139,6 @@ mod tier_tests {
             payload[100..sealed as usize],
             "fork sub-range in cold region"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression: sustained concurrent appends + sealing + compaction + meta
@@ -2175,10 +2151,10 @@ mod tier_tests {
     /// to reproduce the cross-thread lock cycle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_append_seal_compact_no_deadlock() {
-        let dir = tmp_dir("no-deadlock");
-        let mut cfg = local_tier(&dir, 64 * 1024);
+        let dir = temp_dir("no-deadlock");
+        let mut cfg = local_tier(dir.path(), 64 * 1024);
         cfg.compact_bytes = 128 * 1024; // compact often, to exercise the swap
-        let store = Arc::new(Store::new_with_tier(dir.clone(), cfg).unwrap());
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg).unwrap());
         let st = match store.create("s/cc", octet_cfg(), None, 0).unwrap() {
             CreateResult::Created(s) => s,
             _ => panic!("create failed"),
@@ -2227,8 +2203,6 @@ mod tier_tests {
             tail,
             "full read-back length after concurrent load"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A BlobStore whose uploads always fail — used to leave a sealed segment in
@@ -2271,8 +2245,10 @@ mod tier_tests {
         // remain fully readable from local fds — never erroring or reaching for a
         // remote object that was never written. resolve_range routes it to the
         // chunk file, so the range is all-local and reads back byte-identical.
-        let dir = tmp_dir("sealed-local");
-        let mut store = Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap();
+        let dir = temp_dir("sealed-local");
+        let mut store =
+            Store::new_with_tier(dir.path().to_path_buf(), local_tier(dir.path(), 64 * 1024))
+                .unwrap();
         store.blobstore = Some(Arc::new(FailingBlobStore)); // offload fails → stays Local
         let store = Arc::new(store);
         let cfg = StreamConfig {
@@ -2322,15 +2298,15 @@ mod tier_tests {
             got, payload,
             "sealed-Local read must return the staged bytes"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn json_seal_lands_on_value_boundary() {
-        let dir = tmp_dir("json");
+        let dir = temp_dir("json");
         // Small segment so a handful of values trigger a seal.
-        let store = Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 1024)).unwrap());
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), local_tier(dir.path(), 1024)).unwrap(),
+        );
         let cfg = StreamConfig {
             content_type: "application/json".into(),
             ttl_seconds: None,
@@ -2383,15 +2359,15 @@ mod tier_tests {
         // Full read is byte-identical.
         let full = read_logical(&st, 0, wire.len() as u64).await;
         assert_eq!(full, wire);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_reads_during_seal_are_consistent() {
-        let dir = tmp_dir("concurrent");
-        let store =
-            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 32 * 1024)).unwrap());
+        let dir = temp_dir("concurrent");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), local_tier(dir.path(), 32 * 1024))
+                .unwrap(),
+        );
         let cfg = StreamConfig {
             content_type: "application/octet-stream".into(),
             ttl_seconds: None,
@@ -2429,16 +2405,16 @@ mod tier_tests {
         // After seal, read again — fully served from cold + hot.
         let got = read_logical(&st, 0, total as u64).await;
         assert_eq!(got, payload);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn manifest_survives_recovery() {
-        let dir = tmp_dir("recovery");
+        let dir = temp_dir("recovery");
         {
-            let store =
-                Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+            let store = Arc::new(
+                Store::new_with_tier(dir.path().to_path_buf(), local_tier(dir.path(), 64 * 1024))
+                    .unwrap(),
+            );
             let cfg = StreamConfig {
                 content_type: "application/octet-stream".into(),
                 ttl_seconds: None,
@@ -2461,16 +2437,16 @@ mod tier_tests {
         }
         // Re-open the store; the manifest must rehydrate from the sidecar and
         // cold reads must still work.
-        let store2 =
-            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        let store2 = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), local_tier(dir.path(), 64 * 1024))
+                .unwrap(),
+        );
         let st = store2.get("s/rec").expect("stream recovered");
         let sealed = st.tier.manifest.lock().unwrap().sealed_offset;
         assert!(sealed >= 64 * 1024, "manifest not recovered");
         let payload: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
         let got = read_logical(&st, 0, payload.len() as u64).await;
         assert_eq!(got, payload, "post-recovery cold read mismatch");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression for the WAL read-before-durable bug: a reader (via `tail()`)
@@ -2482,9 +2458,11 @@ mod tier_tests {
     /// (PROTOCOL.md §4.1).
     #[tokio::test]
     async fn reader_tail_tracks_durable_not_writer_tail() {
-        let dir = tmp_dir("durable-tail");
-        let store =
-            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        let dir = temp_dir("durable-tail");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), local_tier(dir.path(), 64 * 1024))
+                .unwrap(),
+        );
         let st = match store.create("s/dur", octet_cfg(), None, 0).unwrap() {
             CreateResult::Created(st) => st,
             _ => panic!("expected created"),
@@ -2521,8 +2499,6 @@ mod tier_tests {
 
         // Durable now → reader-visible.
         assert_eq!(st.tail().bytes, wire.len() as u64);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression for the hard-delete GC race: after a hard delete, every
@@ -2546,9 +2522,11 @@ mod tier_tests {
             n
         }
 
-        let dir = tmp_dir("gc-reclaim");
-        let store =
-            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        let dir = temp_dir("gc-reclaim");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), local_tier(dir.path(), 64 * 1024))
+                .unwrap(),
+        );
         let st = match store.create("s/gc", octet_cfg(), None, 0).unwrap() {
             CreateResult::Created(s) => s,
             _ => panic!("create failed"),
@@ -2562,7 +2540,7 @@ mod tier_tests {
         }
         store.maybe_seal(&st).await;
 
-        let cold = dir.join("cold");
+        let cold = dir.path().join("cold");
         assert!(
             count_files(&cold) >= 1,
             "expected offloaded remote objects before delete"
@@ -2583,12 +2561,10 @@ mod tier_tests {
             "orphaned remote objects after hard delete"
         );
         assert_eq!(
-            count_files(&dir.join("segments")),
+            count_files(&dir.path().join("segments")),
             0,
             "leaked local chunk files after hard delete"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Once a stream is hard-deleted (`deleted` set), a seal pass must bail
@@ -2597,9 +2573,11 @@ mod tier_tests {
     /// flag, `maybe_seal` would proceed and stage segments here.)
     #[tokio::test]
     async fn seal_bails_after_hard_delete_flag() {
-        let dir = tmp_dir("gc-seal-bail");
-        let store =
-            Arc::new(Store::new_with_tier(dir.clone(), local_tier(&dir, 64 * 1024)).unwrap());
+        let dir = temp_dir("gc-seal-bail");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), local_tier(dir.path(), 64 * 1024))
+                .unwrap(),
+        );
         let st = match store.create("s/gcseal", octet_cfg(), None, 0).unwrap() {
             CreateResult::Created(s) => s,
             _ => panic!("create failed"),
@@ -2624,12 +2602,10 @@ mod tier_tests {
                 "seal advanced watermark despite deleted"
             );
         }
-        let seg_files = std::fs::read_dir(dir.join("segments"))
+        let seg_files = std::fs::read_dir(dir.path().join("segments"))
             .map(|rd| rd.count())
             .unwrap_or(0);
         assert_eq!(seg_files, 0, "seal staged chunk files despite deleted");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -2638,20 +2614,8 @@ mod tier_tests {
 #[cfg(test)]
 mod meta_sweep_tests {
     use super::*;
+    use crate::handlers::test_support::temp_dir;
     use crate::tier::TierConfig;
-
-    fn tmp_dir(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "ds-meta-sweep-{tag}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        p
-    }
 
     fn octet_cfg() -> StreamConfig {
         StreamConfig {
@@ -2682,8 +2646,8 @@ mod meta_sweep_tests {
     /// sweep is a no-op.
     #[tokio::test]
     async fn mark_dedupes_and_sweep_flushes() {
-        let dir = tmp_dir("flush");
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let dir = temp_dir("flush");
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         let st = create(&store, "s");
 
         st.shared.write().unwrap().producers.insert(
@@ -2712,16 +2676,14 @@ mod meta_sweep_tests {
             "sweep clears the dirty flag"
         );
         assert_eq!(store.sweep_meta_once(), 0, "nothing left to sweep");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A stream hard-deleted after being marked dirty must NOT get its sidecar
     /// resurrected by a later sweep (the file unlinks already happened).
     #[tokio::test]
     async fn sweep_skips_hard_deleted_stream() {
-        let dir = tmp_dir("deleted");
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let dir = temp_dir("deleted");
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         let st = create(&store, "s");
 
         store.mark_meta_dirty(&st);
@@ -2736,8 +2698,6 @@ mod meta_sweep_tests {
             !meta_path(&st.file_path).exists(),
             "sweep must not resurrect a deleted stream's sidecar"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A DELETE that fails is not a DELETE. Neither failure path may leave the
@@ -2748,8 +2708,8 @@ mod meta_sweep_tests {
     /// come back at the next restart).
     #[tokio::test]
     async fn a_failed_durable_delete_leaves_the_stream_intact() {
-        let dir = tmp_dir("delete-fault");
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let dir = temp_dir("delete-fault");
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
 
         // Soft delete: a live fork reference forces the soft path.
         let soft = create(&store, "soft");
@@ -2788,7 +2748,5 @@ mod meta_sweep_tests {
             !store.streams.contains_key("hard"),
             "a durable hard delete removes the stream"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

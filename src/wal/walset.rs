@@ -226,26 +226,12 @@ fn read_persisted_n(path: &Path) -> io::Result<Option<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn tmp(tag: &str) -> PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let p = std::env::temp_dir().join(format!(
-            "ds-wal-walset-test-{tag}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        p
-    }
+    use crate::handlers::test_support::temp_dir;
 
     #[tokio::test]
     async fn wal_shards_persisted_and_stable() {
-        let d = tmp("wset");
-        let w = WalSet::open(&d, Some(4), 16).unwrap(); // requested 4 → persisted 4 (default_n ignored)
+        let d = temp_dir("wset");
+        let w = WalSet::open(d.path(), Some(4), 16).unwrap(); // requested 4 → persisted 4 (default_n ignored)
         let s_id = 12345u64;
         let idx = w
             .shards
@@ -254,7 +240,7 @@ mod tests {
             .unwrap();
         drop(w);
         // None + a DIFFERENT default_n (8) → still uses the persisted N (4), NOT default_n:
-        let w2 = WalSet::open(&d, None, 8).unwrap();
+        let w2 = WalSet::open(d.path(), None, 8).unwrap();
         assert_eq!(w2.n, 4);
         let idx2 = w2
             .shards
@@ -263,7 +249,7 @@ mod tests {
             .unwrap();
         assert_eq!(idx, idx2, "stream resolves to the same shard across reopen");
         assert!(
-            WalSet::open(&d, Some(8), 8).is_err(),
+            WalSet::open(d.path(), Some(8), 8).is_err(),
             "mismatched --wal-shards rejected"
         );
     }

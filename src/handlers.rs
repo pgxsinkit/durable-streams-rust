@@ -141,6 +141,21 @@ pub(crate) mod test_support {
             set_max_chunk_bytes(DEFAULT_MAX_CHUNK_BYTES);
         }
     }
+
+    /// The data dir for one test: `<TMPDIR>/ds-test-<tag>-<random>`, removed
+    /// when the returned handle drops.
+    ///
+    /// Drop — not a trailing `remove_dir_all` — because the tail of a test body
+    /// runs only when every assertion passed, i.e. exactly the run where the
+    /// leftovers matter least; a panicking test cleans up too. The random
+    /// suffix also makes two concurrent `cargo test` processes safe (the
+    /// hand-rolled names this replaces were pid + nanos).
+    pub(crate) fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("ds-test-{tag}-"))
+            .tempdir()
+            .expect("create test temp dir")
+    }
 }
 
 fn long_poll_timeout_dur() -> Duration {
@@ -2558,16 +2573,9 @@ mod bug1_tests {
     /// Drive `stream_resolved_body` over a single 100-byte Remote slice backed by
     /// a `TestBlob` in `mode`; return (bytes delivered, failed-flag).
     async fn run(mode: Mode) -> (usize, bool) {
-        let dir = std::env::temp_dir().join(format!(
-            "ds-bug1-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let dir = test_support::temp_dir("bug1");
+        let mut store =
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.blobstore = Some(Arc::new(TestBlob(mode)));
         let store = Arc::new(store);
         let st = match store.create("s", stream_cfg(), None, 0).unwrap() {
@@ -2591,7 +2599,6 @@ mod bug1_tests {
             }
             _ => panic!("expected a channel body"),
         };
-        let _ = std::fs::remove_dir_all(&dir);
         (n, failed)
     }
 
@@ -2628,16 +2635,9 @@ mod bug1_tests {
     /// truncated/errored cold read as `Err` — not silently return short bytes
     /// that a caller would treat as a complete (advanced) read.
     async fn run_buffered(mode: Mode) -> std::io::Result<bytes::Bytes> {
-        let dir = std::env::temp_dir().join(format!(
-            "ds-h4-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let dir = test_support::temp_dir("h4");
+        let mut store =
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.blobstore = Some(Arc::new(TestBlob(mode)));
         let store = Arc::new(store);
         let st = match store.create("s", stream_cfg(), None, 0).unwrap() {
@@ -2650,7 +2650,6 @@ mod bug1_tests {
             len: 100,
         }];
         let res = materialize_resolved(&st, slices, b"", b"").await;
-        let _ = std::fs::remove_dir_all(&dir);
         res
     }
 
@@ -2686,20 +2685,6 @@ mod memory_mode_tests {
     use crate::tier::TierConfig;
     use bytes::Bytes;
 
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let p = std::env::temp_dir().join(format!(
-            "ds-mem-{tag}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        p
-    }
-
     fn put_req(path: &str, content_type: &str) -> Req {
         Req {
             method: Method::Put,
@@ -2723,8 +2708,10 @@ mod memory_mode_tests {
     #[tokio::test]
     async fn memory_mode_append_acks_without_wal() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
-        let dir = tmp("mem-append");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("mem-append");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         // NOTE: no WAL attached (store.wal not set) — memory mode must not touch it.
 
         // Create the stream (PUT).
@@ -2758,8 +2745,6 @@ mod memory_mode_tests {
             b"hello-memory",
             "per-stream file must hold the appended bytes"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #4691: a memory-mode append must NOT flush the meta sidecar via a
@@ -2770,8 +2755,10 @@ mod memory_mode_tests {
     #[tokio::test]
     async fn memory_append_defers_sidecar_to_store_sweep() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
-        let dir = tmp("mem-sweep");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("mem-sweep");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
 
         let resp = handle(
             Arc::clone(&store),
@@ -2815,8 +2802,6 @@ mod memory_mode_tests {
             meta.producers.contains_key("p1"),
             "sweep must persist the pending producer state"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Cardinality-cliff fix (#1): a PLAIN append (no producer/seq, non-TTL
@@ -2829,8 +2814,10 @@ mod memory_mode_tests {
     #[tokio::test]
     async fn memory_plain_append_skips_sidecar_flush() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
-        let dir = tmp("mem-plain-noflush");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("mem-plain-noflush");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
 
         let resp = handle(
             Arc::clone(&store),
@@ -2862,8 +2849,6 @@ mod memory_mode_tests {
             flushed, 0,
             "a plain non-TTL memory-mode append must not queue a sidecar flush"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Long-poll deadline/data race (conformance flake root cause): a long-poll
@@ -2878,8 +2863,10 @@ mod memory_mode_tests {
     async fn long_poll_timeout_never_skips_observed_data() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
         crate::handlers::set_long_poll_timeout(20);
-        let dir = tmp("lp-race");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("lp-race");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
 
         let resp = handle(
             Arc::clone(&store),
@@ -2945,7 +2932,6 @@ mod memory_mode_tests {
         }
 
         crate::handlers::set_long_poll_timeout(30_000);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #1: PROTOCOL.md §6.2 — every successful write slides a `Stream-TTL`
@@ -2956,8 +2942,10 @@ mod memory_mode_tests {
     #[tokio::test]
     async fn close_only_post_slides_the_ttl() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
-        let dir = tmp("ttl-close");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("ttl-close");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
 
         let mut req = put_req("m/ttl", "application/octet-stream");
         req.headers.push(("stream-ttl".into(), "3600".into()));
@@ -2986,8 +2974,6 @@ mod memory_mode_tests {
                 < Duration::from_secs(60),
             "the TTL window must restart from the close, not from the last body append"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -3002,20 +2988,6 @@ mod chunk_cap_tests {
     use crate::store::Store;
     use crate::tier::TierConfig;
     use bytes::Bytes;
-
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let p = std::env::temp_dir().join(format!(
-            "ds-chunk-{tag}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        p
-    }
 
     fn put_req(path: &str, content_type: &str) -> Req {
         Req {
@@ -3138,8 +3110,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn json_pages_are_valid_arrays_and_resume_from_next_offset() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
-        let dir = tmp("json-pages");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("json-pages");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "c/json", "application/json").await;
         for i in 0..40 {
             append(
@@ -3200,8 +3174,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn byte_stream_is_cut_at_the_cap() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(256);
-        let dir = tmp("bytes-cut");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("bytes-cut");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "c/bytes", "application/octet-stream").await;
         let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
         append(&store, "c/bytes", "application/octet-stream", &payload).await;
@@ -3230,8 +3206,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn cap_zero_is_unlimited() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(0);
-        let dir = tmp("cap-zero");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("cap-zero");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "c/unlimited", "application/octet-stream").await;
         let payload = vec![b'x'; 100_000];
         append(&store, "c/unlimited", "application/octet-stream", &payload).await;
@@ -3247,8 +3225,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn oversize_json_value_is_served_whole() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(64);
-        let dir = tmp("oversize-json");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("oversize-json");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "c/big", "application/json").await;
         let big = json_item(0, 4000);
         append(&store, "c/big", "application/json", big.as_bytes()).await;
@@ -3279,8 +3259,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn closed_is_reported_only_on_the_final_page() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(128);
-        let dir = tmp("closed-pages");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("closed-pages");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "c/closed", "application/octet-stream").await;
         append(
             &store,
@@ -3321,8 +3303,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn conditional_request_matches_the_partial_page() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(128);
-        let dir = tmp("partial-etag");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("partial-etag");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "c/etag", "application/octet-stream").await;
         append(
             &store,
@@ -3392,8 +3376,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn fork_sub_offset_counts_top_level_values_not_raw_commas() {
         let _durability = test_support::DurabilityGuard::memory();
-        let dir = tmp("fork-sub-offset");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("fork-sub-offset");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "f/parent", "application/json").await;
         let first = r#"{"a":[1,2],"b":"x,y"}"#;
         append(&store, "f/parent", "application/json", first.as_bytes()).await;
@@ -3421,8 +3407,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn fork_reads_page_across_the_cap() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
-        let dir = tmp("fork-cap");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("fork-cap");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "f/src", "application/json").await;
         for i in 0..20 {
             append(
@@ -3462,14 +3450,14 @@ mod chunk_cap_tests {
     async fn cold_tier_pages_are_valid_json() {
         use crate::tier::TierKind;
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
-        let dir = tmp("cold-cap");
+        let dir = test_support::temp_dir("cold-cap");
         let tier = TierConfig {
             kind: TierKind::Local,
             segment_bytes: 1024,
-            local_dir: Some(dir.join("cold")),
+            local_dir: Some(dir.path().join("cold")),
             ..Default::default()
         };
-        let store = Arc::new(Store::new_with_tier(dir.clone(), tier).unwrap());
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), tier).unwrap());
         create(&store, "cold/json", "application/json").await;
         for i in 0..60 {
             append(
@@ -3501,8 +3489,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn mid_value_offset_fails_closed_instead_of_serving_the_tail() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(256);
-        let dir = tmp("mid-value");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("mid-value");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "c/strings", "application/json").await;
         // Comma-free string values: a scan starting inside one never sees a
         // top-level separator, so the range is provably not value-aligned.
@@ -3528,8 +3518,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn sse_catch_up_is_delivered_in_capped_frames() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
-        let dir = tmp("sse-cap");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("sse-cap");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "sse/json", "application/json").await;
         for i in 0..40 {
             append(
@@ -3595,8 +3587,10 @@ mod chunk_cap_tests {
         // 100 is not a multiple of 3, so an unaligned cut would land inside one
         // of the three-byte characters below.
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(100);
-        let dir = tmp("sse-utf8");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("sse-utf8");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "sse/text", "text/plain").await;
         let payload = "★".repeat(200);
         append(&store, "sse/text", "text/plain", payload.as_bytes()).await;
@@ -3655,8 +3649,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn capped_json_page_is_served_from_the_scanned_bytes() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
-        let dir = tmp("json-single-read");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("json-single-read");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "c/once", "application/json").await;
         for i in 0..40 {
             append(
@@ -3688,8 +3684,10 @@ mod chunk_cap_tests {
         use std::sync::atomic::Ordering;
         let cap = 1024;
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(cap);
-        let dir = tmp("no-reread");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("no-reread");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "c/reread", "application/json").await;
         let big = json_item(0, 20_000);
         append(&store, "c/reread", "application/json", big.as_bytes()).await;
@@ -3752,8 +3750,10 @@ mod chunk_cap_tests {
     #[tokio::test]
     async fn long_poll_backlog_is_capped() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(256);
-        let dir = tmp("long-poll-cap");
-        let store = Arc::new(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let dir = test_support::temp_dir("long-poll-cap");
+        let store = Arc::new(
+            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
+        );
         create(&store, "c/lp", "application/octet-stream").await;
         append(&store, "c/lp", "application/octet-stream", &vec![b'q'; 900]).await;
 

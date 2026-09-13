@@ -13,11 +13,14 @@ fn server() -> Command {
     Command::new(env!("CARGO_BIN_EXE_durable-streams-server"))
 }
 
-fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("ds-max-chunk-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create data dir");
-    dir
+/// The data dir for one server under test. The returned [`tempfile::TempDir`]
+/// deletes its tree on drop, so a panicking assertion cleans up too — a trailing
+/// `remove_dir_all` runs only when every assertion passed.
+fn tmp_dir(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("ds-test-max-chunk-{tag}-"))
+        .tempdir()
+        .expect("create test temp dir")
 }
 
 fn unused_local_port() -> u16 {
@@ -95,7 +98,7 @@ fn env_fallback_caps_reads() {
         .args(["--durability", "memory", "--port"])
         .arg(port.to_string())
         .arg("--data-dir")
-        .arg(&dir)
+        .arg(dir.path())
         .env("DS_MAX_CHUNK_BYTES", "64")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -103,7 +106,6 @@ fn env_fallback_caps_reads() {
         .expect("spawn");
 
     assert_eq!(first_page_end(&mut child, port, 2000), 64);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A flag and the environment fallback both present: the flag wins. The two
@@ -123,7 +125,7 @@ fn flag_overrides_the_environment_fallback() {
         ])
         .arg(port.to_string())
         .arg("--data-dir")
-        .arg(&dir)
+        .arg(dir.path())
         .env("DS_MAX_CHUNK_BYTES", "64")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -135,7 +137,6 @@ fn flag_overrides_the_environment_fallback() {
         1024,
         "the flag must win over DS_MAX_CHUNK_BYTES"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An unusable environment value is a misconfiguration, not something to ignore
@@ -146,7 +147,7 @@ fn invalid_env_value_refuses_to_start() {
     let out = server()
         .args(["--durability", "memory", "--port", "14991"])
         .arg("--data-dir")
-        .arg(&dir)
+        .arg(dir.path())
         .env("DS_MAX_CHUNK_BYTES", "4MiB")
         .output()
         .expect("spawn");
@@ -157,5 +158,4 @@ fn invalid_env_value_refuses_to_start() {
         stderr.contains("DS_MAX_CHUNK_BYTES"),
         "the refusal must name the variable that fixes it; got: {stderr}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

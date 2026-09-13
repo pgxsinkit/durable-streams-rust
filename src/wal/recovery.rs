@@ -414,25 +414,11 @@ fn open_rw(st: &StreamState) -> io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::test_support::temp_dir;
     use crate::store::{write_meta_sync, CreateResult, Store, StreamConfig};
     use crate::tier::TierConfig;
     use crate::wal::codec::{encode_into, Record};
     use crate::wal::segment::seg_path;
-    use std::path::PathBuf;
-
-    fn tmp(tag: &str) -> PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let p = std::env::temp_dir().join(format!(
-            "ds-wal-recovery-test-{tag}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        p
-    }
 
     fn cfg() -> StreamConfig {
         StreamConfig {
@@ -470,13 +456,13 @@ mod tests {
 
     #[tokio::test]
     async fn wal_recovery_repairs_tail_no_torn_no_loss() {
-        let dir = tmp("repair");
+        let dir = temp_dir("repair");
 
         // --- Build a 1-shard WAL + a store, create the stream, and lay down the
         //     per-stream file + a hand-built WAL segment so we control exactly
         //     what is durable vs torn. ---
-        let wal = WalSet::open(&dir, Some(1), 1).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
 
@@ -546,7 +532,7 @@ mod tests {
 
         // The WAL segment lives at <dir>/wal/0/1.wal. `WalSet::open` already created
         // the shard dir + an fallocate'd active 1.wal; overwrite it with our bytes.
-        let seg_file = seg_path(&dir.join("wal").join("0"), 1);
+        let seg_file = seg_path(&dir.path().join("wal").join("0"), 1);
         std::fs::write(&seg_file, &seg).unwrap();
 
         // Persist sidecars so the sidecar pass recovers both streams on reopen.
@@ -563,8 +549,8 @@ mod tests {
         drop(wal);
 
         // --- Reopen: sidecar pass + WAL recovery. ---
-        let wal = WalSet::open(&dir, Some(1), 1).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
 
@@ -628,8 +614,6 @@ mod tests {
             K + r_noloss.len() as u64,
             "st2 tail = file_base + restored len"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Write `checkpoint_lsn` into a 1-shard WAL's `<dir>/wal/0/checkpoint`.
@@ -654,10 +638,10 @@ mod tests {
     /// MUST fail before the fix (file keeps the torn tail) and pass after.
     #[tokio::test]
     async fn wal_recovery_truncates_torn_tail_when_durable_records_all_below_checkpoint() {
-        let dir = tmp("torn-below-ckpt");
+        let dir = temp_dir("torn-below-ckpt");
 
-        let wal = WalSet::open(&dir, Some(1), 1).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
 
@@ -692,7 +676,7 @@ mod tests {
         let mut seg = Vec::new();
         append_record(&mut seg, 1, id, 0, r1);
         append_record(&mut seg, 2, id, r1.len() as u64, r2);
-        let seg_file = seg_path(&dir.join("wal").join("0"), 1);
+        let seg_file = seg_path(&dir.path().join("wal").join("0"), 1);
         std::fs::write(&seg_file, &seg).unwrap();
 
         // Checkpoint fsynced the file up to AND INCLUDING r2: checkpoint_lsn = 2,
@@ -700,7 +684,7 @@ mod tests {
         // Make it strictly ABOVE both durable records (lsn 3) so the bounded replay
         // sees NOTHING for this stream — the frontier stays empty and the torn tail
         // survives. Replay-from-oldest still recovers r1‖r2 and truncates the tail.
-        write_checkpoint(&dir, 3);
+        write_checkpoint(dir.path(), 3);
 
         write_meta_sync(&st, true).unwrap();
         let st_file_path = st.file_path.clone();
@@ -709,8 +693,8 @@ mod tests {
         drop(store);
         drop(wal);
 
-        let wal = WalSet::open(&dir, Some(1), 1).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
 
@@ -743,8 +727,6 @@ mod tests {
             durable_len as u64,
             "Shared.tail reconciled to the durable frontier"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// HIGH: the repair (truncate / extend) must be fdatasync'd before `recover()`
@@ -755,10 +737,10 @@ mod tests {
     /// truncation actually hit the disk (not just the page cache).
     #[tokio::test]
     async fn wal_recovery_repair_is_fsynced_and_persists_across_reopen() {
-        let dir = tmp("fsync-repair");
+        let dir = temp_dir("fsync-repair");
 
-        let wal = WalSet::open(&dir, Some(1), 1).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
 
@@ -785,7 +767,7 @@ mod tests {
         let id = st.id;
         let mut seg = Vec::new();
         append_record(&mut seg, 1, id, 0, r1);
-        let seg_file = seg_path(&dir.join("wal").join("0"), 1);
+        let seg_file = seg_path(&dir.path().join("wal").join("0"), 1);
         std::fs::write(&seg_file, &seg).unwrap();
 
         write_meta_sync(&st, true).unwrap();
@@ -796,8 +778,8 @@ mod tests {
         drop(wal);
 
         // --- First reopen: run recovery (which must truncate AND fsync). ---
-        let wal = WalSet::open(&dir, Some(1), 1).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
 
@@ -820,7 +802,7 @@ mod tests {
         // --- Second reopen: sidecar pass ONLY, NO WAL recovery. The seeded tail is
         //     file_base + on-disk file size. If the truncation only hit the page
         //     cache it would be lost here; persistence proves the fsync. ---
-        let store2 = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let store2 = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         let store2 = std::sync::Arc::new(store2);
         // (No store2.wal / no recover() call — pure on-disk observation.)
         let st2 = store2
@@ -840,8 +822,6 @@ mod tests {
             r1,
             "on-disk bytes are exactly the durable record; the torn tail is gone for good"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Bug #1 regression at the recovery level: an un-acked **buffered**
@@ -858,10 +838,10 @@ mod tests {
     async fn wal_recovery_rejects_torn_checksummed_payload_bug1() {
         use crate::wal::codec::{encode_header_into, PAYLOAD_CHECKSUMMED};
 
-        let dir = tmp("torn-checksummed");
+        let dir = temp_dir("torn-checksummed");
 
-        let wal = WalSet::open(&dir, Some(1), 1).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
 
@@ -911,7 +891,7 @@ mod tests {
         seg.extend_from_slice(&vec![0xCDu8; r2_written]); // written prefix
                                                           // (No more payload bytes: the segment is fallocate'd zeros from here.)
 
-        let seg_file = seg_path(&dir.join("wal").join("0"), 1);
+        let seg_file = seg_path(&dir.path().join("wal").join("0"), 1);
         std::fs::write(&seg_file, &seg).unwrap();
         write_meta_sync(&st, true).unwrap();
 
@@ -920,8 +900,8 @@ mod tests {
         drop(wal);
 
         // --- Reopen: sidecar pass + WAL recovery. ---
-        let wal = WalSet::open(&dir, Some(1), 1).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
 
@@ -951,8 +931,6 @@ mod tests {
             durable_len as u64,
             "Shared.tail == durable frontier (did not advance over torn r2)"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Drive a real shard so the committer makes records durable. Used by the 11b
@@ -980,10 +958,10 @@ mod tests {
     async fn wal_recovery_truncates_torn_tail_of_fully_recycled_stream() {
         // Tiny segments so a handful of filler appends roll + recycle X's segment.
         const SEG: u64 = 4096;
-        let dir = tmp("torn-recycled");
+        let dir = temp_dir("torn-recycled");
 
-        let wal = WalSet::open_with_segment_size(&dir, Some(1), 1, SEG).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open_with_segment_size(dir.path(), Some(1), 1, SEG).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
 
@@ -1095,8 +1073,8 @@ mod tests {
         drop(wal);
 
         // --- Reopen: sidecar pass + WAL recovery. ---
-        let wal = WalSet::open_with_segment_size(&dir, Some(1), 1, SEG).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open_with_segment_size(dir.path(), Some(1), 1, SEG).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
 
@@ -1129,8 +1107,6 @@ mod tests {
             x_durable_len as u64,
             "X.tail reconciled to the persisted durable frontier"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression: the NORMAL case — a stream whose durable records are STILL in
@@ -1140,10 +1116,10 @@ mod tests {
     #[tokio::test]
     async fn wal_recovery_max_picks_replayed_frontier_when_wal_retained() {
         const SEG: u64 = 4096;
-        let dir = tmp("max-replayed");
+        let dir = temp_dir("max-replayed");
 
-        let wal = WalSet::open_with_segment_size(&dir, Some(1), 1, SEG).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open_with_segment_size(dir.path(), Some(1), 1, SEG).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
 
@@ -1218,8 +1194,8 @@ mod tests {
         drop(store);
         drop(wal);
 
-        let wal = WalSet::open_with_segment_size(&dir, Some(1), 1, SEG).unwrap();
-        let store = Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap();
+        let wal = WalSet::open_with_segment_size(dir.path(), Some(1), 1, SEG).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.wal.set(std::sync::Arc::clone(&wal)).ok();
         let store = std::sync::Arc::new(store);
         recover(&store, &wal).unwrap();
@@ -1240,7 +1216,5 @@ mod tests {
             expect,
             "bytes are r1‖r2‖r3"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

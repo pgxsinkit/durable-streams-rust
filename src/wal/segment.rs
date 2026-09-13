@@ -231,30 +231,18 @@ impl SegmentWriter for FileSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmp(tag: &str) -> PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let p = std::env::temp_dir().join(format!(
-            "ds-wal-seg-test-{tag}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&p);
-        p
-    }
+    use crate::handlers::test_support::temp_dir;
 
     #[tokio::test]
     async fn segment_write_at_and_fdatasync() {
-        let dir = tmp("seg");
-        std::fs::create_dir_all(&dir).unwrap();
-        let s = FileSegment::create(seg_path(&dir, 0), 1 << 20).unwrap();
+        // `temp_dir` already created the directory, so the segment can be
+        // created straight into it.
+        let dir = temp_dir("seg");
+        let s = FileSegment::create(seg_path(dir.path(), 0), 1 << 20).unwrap();
         s.write_at(0, b"abc").unwrap();
         s.write_at(64, b"xyz").unwrap(); // disjoint offsets (concurrent-appender model)
         s.fdatasync().unwrap();
-        let raw = std::fs::read(seg_path(&dir, 0)).unwrap();
+        let raw = std::fs::read(seg_path(dir.path(), 0)).unwrap();
         assert_eq!(raw.len() as u64, 1 << 20, "fallocate'd to full size");
         assert_eq!(&raw[0..3], b"abc");
         assert_eq!(&raw[64..67], b"xyz");

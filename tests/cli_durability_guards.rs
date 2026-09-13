@@ -12,6 +12,16 @@ fn server() -> Command {
     Command::new(env!("CARGO_BIN_EXE_durable-streams-server"))
 }
 
+/// The data dir for one test. The returned [`tempfile::TempDir`] deletes its
+/// tree on drop, so a panicking assertion cleans up too — a trailing
+/// `remove_dir_all` runs only when every assertion passed.
+fn temp_data_dir(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("ds-test-cli-{tag}-"))
+        .tempdir()
+        .expect("create test temp dir")
+}
+
 /// Reserve an ephemeral port by binding it and reading the assignment back. The
 /// listener is dropped immediately, so this is a hint rather than a guarantee —
 /// but it beats hard-coding ports into a suite that runs its cases in parallel
@@ -46,18 +56,22 @@ fn wait_until_listening(port: u16) {
 /// every assertion passed, which is the run where it matters least. A panicking
 /// assertion would otherwise leak a process holding the data-dir lock and its
 /// port, breaking every later test and rerun.
+///
+/// `Drop::drop` runs before any field is dropped, so the kill + reap below
+/// always precedes the `TempDir` removing the data dir. Removing the tree under
+/// a live server would have it writing into unlinked paths on its way out.
 struct ServerUnderTest {
     child: Child,
-    dir: std::path::PathBuf,
+    dir: tempfile::TempDir,
 }
 
 impl Drop for ServerUnderTest {
     fn drop(&mut self) {
         let _ = self.child.kill();
         // Reap it: a killed-but-unwaited child stays a zombie, and on a
-        // panicking unwind nothing else will collect it.
+        // panicking unwind nothing else will collect it. The data dir is removed
+        // right after this, when the `TempDir` field drops.
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -115,13 +129,11 @@ fn wal_without_an_explicit_data_dir_refuses_to_start() {
 /// persistence. (The conformance harness relies on exactly this: it passes an explicit mkdtemp.)
 #[test]
 fn wal_with_an_explicit_data_dir_starts_even_under_tmp() {
-    let dir = std::env::temp_dir().join("ds-rust-cli-guard-wal-explicit");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
+    let dir = temp_data_dir("guard-wal-explicit");
 
     let child = server()
         .args(["--durability", "wal", "--port", "14972", "--data-dir"])
-        .arg(&dir)
+        .arg(dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -132,7 +144,6 @@ fn wal_with_an_explicit_data_dir_starts_even_under_tmp() {
         None,
         "an explicit --data-dir must satisfy the guard, even pointing at a temp path"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The guard is wal-only. Memory mode makes no durability claim, so a defaulted temp data dir is
@@ -140,8 +151,14 @@ fn wal_with_an_explicit_data_dir_starts_even_under_tmp() {
 /// conformance configuration take.
 #[test]
 fn memory_without_an_explicit_data_dir_still_starts() {
+    // No `--data-dir`: the server defaults to `<temp dir>/durable-streams-rust`,
+    // which it creates and would leave behind. Point the CHILD's TMPDIR at a
+    // self-removing directory — the defaulted path stays defaulted (that is what
+    // this test is about), it just lands somewhere that cleans itself up.
+    let tmp = temp_data_dir("memory-default-data-dir");
     let child = server()
         .args(["--durability", "memory", "--port", "14973"])
+        .env("TMPDIR", tmp.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -161,10 +178,7 @@ fn memory_without_an_explicit_data_dir_still_starts() {
 /// corrupts the first's state just as surely.
 #[test]
 fn a_second_server_on_the_same_data_dir_is_refused() {
-    let dir =
-        std::env::temp_dir().join(format!("ds-rust-cli-data-dir-lock-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
+    let dir = temp_data_dir("data-dir-lock");
 
     let owner_port = unused_local_port();
     let owner = ServerUnderTest {
@@ -172,12 +186,12 @@ fn a_second_server_on_the_same_data_dir_is_refused() {
             .args(["--durability", "memory", "--port"])
             .arg(owner_port.to_string())
             .arg("--data-dir")
-            .arg(&dir)
+            .arg(dir.path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn owner"),
-        dir: dir.clone(),
+        dir,
     };
     // The lock is taken during startup, so the contention assertion is only
     // meaningful once the first server is actually up.
@@ -190,7 +204,7 @@ fn a_second_server_on_the_same_data_dir_is_refused() {
         .args(["--durability", "memory", "--port"])
         .arg(unused_local_port().to_string())
         .arg("--data-dir")
-        .arg(&dir)
+        .arg(owner.dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

@@ -54,6 +54,12 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 # `--tier` is passed); only the S3 BlobStore adapter is behind this feature.
 object_store = { version = "0.11", optional = true, features = ["aws"] }
 
+[dev-dependencies]
+# Self-removing temp directories for tests. A `TempDir` deletes its tree when it
+# is dropped, so a test that panics half-way still cleans up after itself (a
+# trailing `remove_dir_all` only runs on the success path).
+tempfile = "3.27.0"
+
 [features]
 default = []
 # Enable OTLP span + metric export over gRPC (tonic). Endpoint/protocol/timeout

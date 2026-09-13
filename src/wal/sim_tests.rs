@@ -35,7 +35,7 @@ use bytes::Bytes;
 
 use crate::api::{Method, Req};
 use crate::handlers;
-use crate::handlers::test_support::DurabilityGuard;
+use crate::handlers::test_support::{temp_dir, DurabilityGuard};
 use crate::store::Store;
 use crate::tier::TierConfig;
 use crate::wal::codec::{decode_at, Decoded, RecordKind};
@@ -933,23 +933,19 @@ fn env_u64(name: &str, default: u64) -> u64 {
 }
 
 fn run_one_seed(seed: u64, gens: u64, steps: u64) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let dir = std::env::temp_dir().join(format!(
-        "ds-wal-sim-{seed}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
+    // Removed on drop, so a seed that trips the oracle (a panic) leaves nothing
+    // behind either. The run is reproducible from its seed, and `DS_SIM_SNAPSHOT`
+    // copies the pre-boot state to a SIBLING directory that outlives this one —
+    // so the forensic loop (`DS_DUMP_DIR=<snapshot> … wal_forensic_dump`) is
+    // unaffected.
+    let dir = temp_dir(&format!("sim-{seed}"));
 
     let mut rng = Rng::new(seed);
     let shards_n = 1 + (rng.below(3) as usize); // 1..=3 shards
     let mut sim = Sim {
         seed,
         rng,
-        dir: dir.clone(),
+        dir: dir.path().to_path_buf(),
         shards_n,
         models: Vec::new(),
         name_ctr: 0,
@@ -963,14 +959,14 @@ fn run_one_seed(seed: u64, gens: u64, steps: u64) {
         // Forensics: snapshot the pre-boot (post-crash, post-fault) disk state
         // so a violation can be inspected before recovery/reset mutate it.
         if std::env::var("DS_SIM_SNAPSHOT").is_ok() && g > 0 {
-            let snap = dir.with_file_name(format!(
+            let snap = dir.path().with_file_name(format!(
                 "{}-preboot-gen{g}",
-                dir.file_name().unwrap().to_str().unwrap()
+                dir.path().file_name().unwrap().to_str().unwrap()
             ));
             let _ = std::fs::remove_dir_all(&snap);
             let _ = std::process::Command::new("cp")
                 .arg("-R")
-                .arg(&dir)
+                .arg(dir.path())
                 .arg(&snap)
                 .status();
             eprintln!("[sim] snapshot: {}", snap.display());
@@ -982,9 +978,9 @@ fn run_one_seed(seed: u64, gens: u64, steps: u64) {
         let last = g == gens;
         let (store, walset, committers) = rt.block_on(async {
             let (store, walset, committers) = if g == 0 {
-                boot(&dir, Some(sim.shards_n), sim.shards_n)
+                boot(dir.path(), Some(sim.shards_n), sim.shards_n)
             } else {
-                boot(&dir, None, sim.shards_n)
+                boot(dir.path(), None, sim.shards_n)
             };
             // Oracle over the recovered state (trivially empty on gen 0).
             verify_recovery(&mut sim, &store);
@@ -1035,8 +1031,6 @@ fn run_one_seed(seed: u64, gens: u64, steps: u64) {
             inject_wal_faults(&mut sim, &durable);
         }
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Forensic helper: `DS_DUMP_DIR=<data-dir> cargo test wal_forensic_dump -- --ignored --nocapture`

@@ -258,9 +258,8 @@ mod tests {
 
     #[tokio::test]
     async fn local_blobstore_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("ds-blob-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let bs = LocalFsBlobStore::new(dir.clone()).unwrap();
+        let dir = crate::handlers::test_support::temp_dir("blob");
+        let bs = LocalFsBlobStore::new(dir.path().to_path_buf()).unwrap();
         let key = "stream-abc/0000000000000000";
         bs.put(key, Bytes::from_static(b"hello world payload"))
             .await
@@ -272,7 +271,6 @@ mod tests {
         assert_eq!(bs.head(key).await.unwrap(), None);
         // Idempotent delete.
         bs.delete(key).await.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // S3-compatible adapter integration test against a real MinIO server.
