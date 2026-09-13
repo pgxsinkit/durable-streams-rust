@@ -186,9 +186,10 @@ bun run test:conformance
 RUST_SERVER_URL=http://localhost:4562 bun run test:conformance
 ```
 
-The core protocol suite passes against conformance `0.3.5` (326 passed, 0 failed). Three tests added
-in `0.3.6` fail — a close-only `POST` does not slide the TTL window, and `OPTIONS` preflight returns
-no CORS headers. Both are inherited from upstream and tracked as issues; see PROVENANCE.md.
+The core protocol suite passes against conformance `0.3.6` (332 passed, 0 failed, 6 skipped). The
+six skipped tests are the reserved subscription suite, which this server does not implement. The two
+gaps inherited from upstream — a close-only `POST` not sliding the TTL window, and `OPTIONS`
+preflight advertising nothing — are fixed; see PROVENANCE.md.
 
 ## Releasing
 

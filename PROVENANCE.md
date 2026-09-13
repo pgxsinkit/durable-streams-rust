@@ -80,8 +80,13 @@ never ran the six tests it added. Three of them fail — inherited gaps upstream
 - **#2** — `OPTIONS` preflight returns no CORS headers at all (one test).
 
 The dependency is now pinned to an exact version rather than a caret range, so moving the contract
-is a visible commit rather than an install-time surprise. **CI is red on conformance until #1 and #2
-are closed**; that is the accurate state, not a broken pipeline.
+is a visible commit rather than an install-time surprise — currently `0.3.6`. Both gaps are closed on
+`develop`: a close-only `POST` slides the TTL window (#1), and `OPTIONS` preflight advertises the
+methods and request headers the protocol accepts (#2, still without an `Access-Control-Allow-Origin`
+— granting browser origins is an edge decision, not a storage one). The suite now measures
+**332 passed, 0 failed**, 6 skipped (the reserved subscription suite, not implemented here), measured locally in
+the default `wal`, `--durability memory` and `--max-chunk-bytes 4096` configurations; CI runs the full
+matrix.
 
 ## Open decisions
 

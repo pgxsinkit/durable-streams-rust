@@ -21,6 +21,29 @@
   data/control pairs instead of one event framing the whole remainder. Capped
   `text/*` frames are cut on UTF-8 character boundaries.
 
+### Patch Changes
+
+- A data directory is owned by one process at a time. The server takes an exclusive `flock`
+  on `<data-dir>/.durable-streams.lock` at startup and holds it until it exits; a second
+  server on the same directory exits 2 instead of quietly corrupting the first's stream
+  files, sidecars and WAL segments. The lock is taken in both durability modes.
+
+- A failed `DELETE` no longer leaves a stream half-deleted. A soft delete that cannot write
+  its sidecar rolls the in-memory mark back, and a hard delete removes the map entry only
+  after the unlinks and the parent-directory fsync have succeeded — so a 500 no longer hides
+  a stream from later requests in that process and then resurrects it on restart.
+
+- A close-only `POST` slides the TTL window (conformance issue #1). PROTOCOL.md refreshes a
+  stream's TTL on a successful write, and a close-only POST is one; it just carries no wire
+  bytes, so it never reached the only place `last_access` was refreshed. A stream closed near
+  the end of its window could expire immediately afterwards.
+
+- `OPTIONS` preflight advertises the methods and request headers the protocol accepts
+  (conformance issue #2), and is answered before route dispatch so every path is covered. It
+  deliberately carries no `Access-Control-Allow-Origin`: the storage process does not grant
+  browser origins access to every stream it holds — that belongs to an origin policy at the
+  authenticated edge.
+
 ## 0.1.5
 
 ### Patch Changes
