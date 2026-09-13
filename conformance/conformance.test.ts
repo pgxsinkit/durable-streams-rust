@@ -12,7 +12,7 @@
  *     RUST_SERVER_URL=http://localhost:4562 bun run test:conformance
  */
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import * as path from 'node:path'
 import { afterAll, beforeAll, describe } from 'vitest'
@@ -33,11 +33,14 @@ const config = {
 }
 
 let server: ChildProcess | null = null
+// Hoisted so afterAll can remove it: a full suite run leaves up to ~1 GB of
+// stream data under this directory, and nothing else ever collects it.
+let dataDir: string | null = null
 
 beforeAll(async () => {
   if (!externalUrl) {
     const binary = resolveServerBinary()
-    const dataDir = mkdtempSync(path.join(tmpdir(), `ds-rust-conformance-`))
+    dataDir = mkdtempSync(path.join(tmpdir(), `ds-rust-conformance-`))
     // Extra server flags for the run-configuration matrix (CI runs the suite
     // once per config — see README "Run-configuration matrix" + ci.yml). E.g.
     // RUST_SERVER_ARGS="--durability memory" or "--read-offload always" or
@@ -75,6 +78,14 @@ afterAll(async () => {
   if (server) {
     server.kill(`SIGTERM`)
     await new Promise((resolve) => setTimeout(resolve, 300))
+  }
+  // Only the directory this harness created: in manual mode the data dir
+  // belongs to the server the operator started, and is not ours to delete.
+  // Removal waits until after the grace period above, so the server has
+  // released the data-dir lock and finished its last writes.
+  if (dataDir) {
+    rmSync(dataDir, { recursive: true, force: true })
+    dataDir = null
   }
 })
 
