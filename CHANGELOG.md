@@ -1,5 +1,26 @@
 # @electric-ax/durable-streams-server-rust
 
+## Unreleased
+
+### Minor Changes
+
+- Bound read responses with a server-defined maximum chunk size (PROTOCOL.md §5.6).
+
+  New `--max-chunk-bytes <BYTES>` (env fallback `DS_MAX_CHUNK_BYTES`), default 4 MiB —
+  the same per-response budget the upstream reference server uses. A catch-up or
+  long-poll read of a larger backlog now returns one page instead of the whole
+  remainder: the response omits `Stream-Up-To-Date`, reports the page end as
+  `Stream-Next-Offset`, and defers `Stream-Closed` to the page that reaches the tail.
+  JSON pages are cut on a top-level value boundary so each page still parses as a JSON
+  array, and a single value larger than the cap is returned whole. `0` restores the
+  previous unlimited behaviour. New `ds.read.chunk_capped` counter reports capped
+  responses by live mode.
+
+  SSE catch-up is bounded by the same cap: a subscriber starting at `offset=0` or
+  reconnecting far behind the tail now receives the backlog as successive
+  data/control pairs instead of one event framing the whole remainder. Capped
+  `text/*` frames are cut on UTF-8 character boundaries.
+
 ## 0.1.5
 
 ### Patch Changes

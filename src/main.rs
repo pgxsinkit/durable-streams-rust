@@ -147,6 +147,11 @@ fn main() {
     // investigation, independent of the heavy `telemetry` OTLP feature.
     let mut wal_stats_secs: Option<u64> = None;
     let mut server_stats_secs: Option<u64> = None;
+    // `--max-chunk-bytes N` (env fallback `DS_MAX_CHUNK_BYTES`): the server-defined
+    // maximum chunk size a catch-up / long-poll read response may carry
+    // (PROTOCOL.md §5.6). `None` ⇒ the 4 MiB default; `0` ⇒ unlimited (one response
+    // per remaining byte range, the pre-cap behaviour).
+    let mut max_chunk_bytes: Option<u64> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -158,6 +163,12 @@ fn main() {
             }
             "--long-poll-timeout-ms" => {
                 handlers::set_long_poll_timeout(parse_val(args.next(), "--long-poll-timeout-ms"));
+            }
+            // Maximum bytes one read response may carry (PROTOCOL.md §5.6);
+            // `0` = unlimited. Applied after the loop so the flag wins over
+            // `DS_MAX_CHUNK_BYTES`.
+            "--max-chunk-bytes" => {
+                max_chunk_bytes = Some(parse_val(args.next(), "--max-chunk-bytes"));
             }
             // Resident tail-cache cap (bytes); 0 disables it (reads → sendfile/pread).
             // Default is platform-dependent (off on Linux, 64 KiB on macOS).
@@ -302,6 +313,19 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+
+    // Flag wins; otherwise honour the env fallback. An unparseable env value is a
+    // misconfiguration, not something to silently ignore.
+    let max_chunk_bytes = max_chunk_bytes.or_else(|| match std::env::var("DS_MAX_CHUNK_BYTES") {
+        Ok(raw) => Some(raw.parse::<u64>().unwrap_or_else(|_| {
+            eprintln!("error: DS_MAX_CHUNK_BYTES got an invalid value: {raw:?}");
+            std::process::exit(2);
+        })),
+        Err(_) => None,
+    });
+    if let Some(bytes) = max_chunk_bytes {
+        handlers::set_max_chunk_bytes(bytes);
     }
 
     // Apply --durability memory AFTER the arg loop. Memory mode is the buffered

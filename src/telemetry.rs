@@ -50,6 +50,7 @@ mod imp {
         append_duration: Histogram<f64>,
         read_duration: Histogram<f64>,
         read_tail_cache: Counter<u64>,
+        read_chunk_capped: Counter<u64>,
         // Recorded only from the Linux-only blocking-sendfile offload path.
         #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         read_offload_wait: Histogram<f64>,
@@ -89,6 +90,12 @@ mod imp {
                 read_tail_cache: meter
                     .u64_counter("ds.read.tail_cache")
                     .with_description("Resident tail-chunk cache hits / misses, by live mode.")
+                    .build(),
+                read_chunk_capped: meter
+                    .u64_counter("ds.read.chunk_capped")
+                    .with_description(
+                        "Read responses truncated by the maximum chunk size, by live mode.",
+                    )
                     .build(),
                 read_offload_wait: meter
                     .f64_histogram("ds.read.offload.wait")
@@ -325,6 +332,14 @@ mod imp {
         }
     }
 
+    /// One read response was cut short by `--max-chunk-bytes` (the client must
+    /// come back from `Stream-Next-Offset` for the rest).
+    pub fn record_chunk_capped(live: &'static str) {
+        if let Some(m) = metrics() {
+            m.read_chunk_capped.add(1, &[KeyValue::new("live", live)]);
+        }
+    }
+
     // Called only from the Linux-only blocking-sendfile offload path.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn record_offload_wait(secs: f64) {
@@ -385,6 +400,8 @@ mod imp {
     #[inline(always)]
     pub fn record_tail_cache(_hit: bool, _live: &'static str) {}
     #[inline(always)]
+    pub fn record_chunk_capped(_live: &'static str) {}
+    #[inline(always)]
     pub fn record_offload_wait(_secs: f64) {}
 
     /// Zero-sized no-op timer: `start`/`elapsed_secs` compile to nothing, so a
@@ -407,6 +424,6 @@ mod imp {
 // but are part of the stable public surface — keep the re-export complete.
 #[allow(unused_imports)]
 pub use imp::{
-    init, record_append, record_append_lock_wait, record_fsync, record_offload_wait, record_read,
-    record_request, record_tail_cache, Guard, Timer,
+    init, record_append, record_append_lock_wait, record_chunk_capped, record_fsync,
+    record_offload_wait, record_read, record_request, record_tail_cache, Guard, Timer,
 };
