@@ -1,0 +1,9 @@
+# The toolchain for `mise install`. Rust's version is rust-toolchain.toml's, the one pin
+# CI, the Dockerfile and electric-circuits share: the setting below makes mise read that
+# file rather than export a RUSTUP_TOOLCHAIN of its own.
+[settings]
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tools]
+bun = "1.4"  # the conformance harness: bun install, bun run test:conformance
+node = "26"  # vitest and scripts/sync-cargo-version.mjs run under node
