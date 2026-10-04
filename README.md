@@ -1,3 +1,5 @@
+Archived: future development in https://github.com/pgxsinkit/circuits/tree/main/apps/durable-streams
+
 # Durable Streams server (Rust)
 
 [Durable Streams](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md) is an open protocol for persistent, resumable event streams over plain HTTP — the data primitive for the agent loop.
